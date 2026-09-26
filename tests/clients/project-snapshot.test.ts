@@ -1937,6 +1937,60 @@ describe("project snapshot worker persist (#958)", () => {
 			}
 		}));
 
+	/**
+	 * Recurrence: #3560. Forcing the sync writer's gate
+	 * (`pendingSnapshotIsCurrent`) to true left both snapshot suites green.
+	 * It is the only guard when a held cache lock kept the newer save's
+	 * admission meta write out, so the promotion compare-and-set still finds
+	 * the older seq on disk and would let the superseded body land.
+	 */
+	it("the sync writer drops a superseded save whose newer admission skipped its meta write (#3560)", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC = "1";
+			const parked: Array<() => void> = [];
+			setProjectSnapshotPromotionSeamForTests(
+				() => new Promise<void>((resolve) => parked.push(resolve)),
+			);
+			const at = (seq: number) => {
+				const runtime = new RuntimeCoordinator();
+				runtime.seedProjectSequence(seq);
+				return buildProjectSnapshotFromRuntime({ cwd, runtime });
+			};
+			try {
+				saveProjectSnapshot(cwd, at(3));
+				expect(parked).toHaveLength(1);
+				const hold = tryAcquireGeneration(
+					`${getProjectSnapshotPath(cwd)}.locks`,
+					5_000,
+				);
+				expect(hold).toBeDefined();
+				try {
+					saveProjectSnapshot(cwd, at(4));
+				} finally {
+					if (hold) releaseGeneration(hold);
+				}
+				expect(readProjectSnapshotMeta(cwd)?.seq).toBe(3);
+
+				// The seq-3 write runs; the queued seq-4 write then parks.
+				parked.shift()?.();
+				await waitFor(
+					() => parked.length,
+					(count) => count === 1,
+				);
+				expect(fs.existsSync(getProjectSnapshotPath(cwd))).toBe(false);
+				expect(loadProjectSnapshot(cwd)?.seq).toBe(4);
+
+				parked.shift()?.();
+				await waitForProjectSnapshotPersistsForTests();
+				_resetProjectSnapshotParseCacheForTests();
+				expect(loadProjectSnapshot(cwd)?.seq).toBe(4);
+			} finally {
+				delete process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC;
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				for (const release of parked.splice(0)) release();
+			}
+		}));
+
 	it("read-your-writes across the legacy-upgrade window: an in-flight write shadows a stale legacy .json (#958)", async () =>
 		withProjectDataDirAsync(async (cwd) => {
 			resetProjectSnapshotPersistWorkerForTests();
