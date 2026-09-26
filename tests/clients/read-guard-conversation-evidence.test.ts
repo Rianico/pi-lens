@@ -110,6 +110,8 @@ function resultDeps(
 		biome?: BiomeClient;
 		getFlag?: (name: string) => boolean;
 		attachmentBudget?: { remaining: number };
+		/** Runs where the handler renders behavior warnings, after the pipeline. */
+		afterPipeline?: () => void;
 	} = {},
 ) {
 	return {
@@ -129,8 +131,11 @@ function resultDeps(
 		metricsClient: {},
 		resetLSPService: () => {},
 		readGuard: runtime.readGuard,
-		agentBehaviorRecord: () => [],
-		formatBehaviorWarnings: () => "",
+		agentBehaviorRecord: () => (extra.afterPipeline ? ["warning"] : []),
+		formatBehaviorWarnings: () => {
+			extra.afterPipeline?.();
+			return "";
+		},
 		...(extra.attachmentBudget
 			? { _attachmentBudget: extra.attachmentBudget }
 			: {}),
@@ -262,6 +267,7 @@ async function writeWithAutofix(
 	extra: {
 		getFlag?: (name: string) => boolean;
 		attachmentBudget?: { remaining: number };
+		afterPipeline?: () => void;
 	} = {},
 ) {
 	const biome = {
@@ -423,6 +429,35 @@ describe("#3519: the attached post-autofix bytes are a read", () => {
 			]);
 			expect(edit.blocked).toBe(true);
 			expect(edit.reason).toContain("Edit range changed since read");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("leaves FileTime to recordWritten, so a write after it stays visible on an unhashed attachment", async () => {
+		const env = setupTestEnvironment("rg-3519-unhashed-");
+		try {
+			biomeProject(env.tmpDir);
+			const file = fixture(env.tmpDir, "big.ts", "old\n");
+			const runtime = newRuntime(env.tmpDir);
+			// 3001 post-fix lines: past READ_HASH_MAX_LINES, so FileTime is the
+			// attachment record's only staleness check.
+			const big = ["import unused;", ...lines(3001, "const v")].join("\n");
+			await writeWithAutofix(runtime, file, big, {
+				// Another writer lands after recordWritten stamped the fixed file
+				// and before the attachment is recorded.
+				afterPipeline: () => {
+					const v = diskLines(file);
+					v[4] = "EXTERNAL5";
+					writeNow(file, v.join("\n"));
+				},
+			});
+			const record = runtime.readGuard.getReadHistory(file).at(-1);
+			expect(record?.source).toBe("autofix-attachment");
+			expect(record?.lineHashes).toBeUndefined();
+			const edit = await positionalEdit(runtime, file, [[5, 5, "agent5"]]);
+			expect(edit.blocked).toBe(true);
+			expect(edit.reason).toContain("File modified since read");
 		} finally {
 			env.cleanup();
 		}

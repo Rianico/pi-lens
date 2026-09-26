@@ -2129,31 +2129,29 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// #3523: an edit the guard allowed at the agent's own line numbers is the
 	// agent's view of the lines it wrote, so its next edit of them is judged
 	// against its `newText`, not the read that predates it. One positional
-	// edit only: a batch's later ranges shift by the earlier ones' growth.
+	// edit only: in a batch, each range's lines shift by the others' growth.
 	// Per event, so before the debounce keeps only the latest. The mark is
 	// only ever set by the guard's own check, so `--no-read-guard` never
-	// reaches here.
+	// reaches here. recordWritten re-stamps FileTime after this, so the
+	// record's own stamp is always superseded.
 	const ownEdit = attribution?.editInPlace
 		? singlePositionalEdit(event.input)
 		: undefined;
 	if (ownEdit) {
 		const evidence = deliveredLineEvidence(ownEdit.newText, ownEdit.start);
-		deps.readGuard?.recordRead(
-			{
-				filePath,
-				requestedOffset: ownEdit.start,
-				requestedLimit: evidence.lineCount,
-				effectiveOffset: ownEdit.start,
-				effectiveLimit: evidence.lineCount,
-				expandedByLsp: false,
-				lineHashes: evidence.lineHashes,
-				turnIndex: runtime.turnIndex,
-				writeIndex: runtime.peekWriteIndex(),
-				timestamp: Date.now(),
-				source: "own-edit",
-			},
-			{ stampFileTime: false },
-		);
+		deps.readGuard?.recordRead({
+			filePath,
+			requestedOffset: ownEdit.start,
+			requestedLimit: evidence.lineCount,
+			effectiveOffset: ownEdit.start,
+			effectiveLimit: evidence.lineCount,
+			expandedByLsp: false,
+			lineHashes: evidence.lineHashes,
+			turnIndex: runtime.turnIndex,
+			writeIndex: runtime.peekWriteIndex(),
+			timestamp: Date.now(),
+			source: "own-edit",
+		});
 	}
 
 	// Must happen before debounce admission: latestDeps intentionally retains only
