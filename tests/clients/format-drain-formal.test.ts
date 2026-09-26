@@ -1167,6 +1167,25 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 			expect(quickfixRows()).toEqual([]);
 		});
 
+		it("the actionable-warnings quickfix pass does not start after a /new that left the LSP service in place", async () => {
+			// session_start retires the service only without --no-lsp; the pass's
+			// edits and bookkeeping belong to the drain's session either way.
+			lsp.realService = getLSPService;
+			writeQuickfixReport(0);
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			runtime.resetForSession(Date.now());
+			const spawnsBefore = spawns();
+			c.openWrite();
+			await drain;
+			expect(spawns() - spawnsBefore).toBe(0);
+			expect(quickfixRows()).toEqual([]);
+			expect(staleWriteSubjects()).toContain(
+				`runtime-session:actionable-warnings:${env.tmpDir}`,
+			);
+		});
+
 		it("the actionable-warnings quickfix pass does not start after session_shutdown retired the LSP service", async () => {
 			lsp.realService = getLSPService;
 			// The session is not bumped: the drain's own format still records.
