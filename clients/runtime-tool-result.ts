@@ -1845,16 +1845,24 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							deliveredText.lineCount === capturedLines)
 						? deliveredText
 						: undefined;
+				// The capture's limit can exceed the lines it hashed (a limit past
+				// the end of the file); hashes past the clip would still be a
+				// relocation target for lines pi never showed.
 				const shownLimit = capture
 					? Math.min(
 							capture.effectiveLimit,
 							truncation?.outputLines ?? Number.POSITIVE_INFINITY,
+							capturedLines,
 						)
 					: 0;
 				const captureEvidence = capture?.lineHashes && {
 					effectiveOffset: capture.effectiveOffset,
 					effectiveLimit: shownLimit,
-					lineHashes: capture.lineHashes,
+					lineHashes: Object.fromEntries(
+						Object.entries(capture.lineHashes).filter(
+							([line]) => Number(line) < capture.effectiveOffset + shownLimit,
+						),
+					),
 				};
 				if (raced) {
 					incrementDegradationCount({
