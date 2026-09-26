@@ -42,6 +42,13 @@ vi.mock("../../clients/recent-touches.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/recent-touches.js")>()),
 	appendRecentTouches: vi.fn().mockResolvedValue(undefined),
 }));
+// The real logger, observed (rows are dropped in test mode).
+vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/latency-logger.js")>();
+	return { ...actual, logLatency: vi.fn(actual.logLatency) };
+});
+import { logLatency } from "../../clients/latency-logger.js";
 
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
 import { getLSPService } from "../../clients/lsp/index.js";
@@ -322,6 +329,7 @@ const WRITTEN = [
 
 beforeEach(() => {
 	resetDegradationLedger();
+	vi.mocked(logLatency).mockClear();
 	vi.mocked(getLSPService).mockReturnValue(
 		makeLspServiceDouble({
 			supportsLSP: () => false,
@@ -376,6 +384,17 @@ describe("#3519: the attached post-autofix bytes are a read", () => {
 			const record = runtime.readGuard.getReadHistory(file).at(-1);
 			expect(record?.source).toBe("autofix-attachment");
 			expect([record?.effectiveOffset, record?.effectiveLimit]).toEqual([1, 4]);
+			expect(logLatency).toHaveBeenCalledWith(
+				expect.objectContaining({
+					phase: "read_guard_conversation_read",
+					metadata: {
+						source: "autofix-attachment",
+						offset: 1,
+						lineCount: 4,
+						hashed: true,
+					},
+				}),
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -500,6 +519,17 @@ describe("#3523: the agent's own positional edit is a read", () => {
 			const record = runtime.readGuard.getReadHistory(file).at(-1);
 			expect(record?.source).toBe("own-edit");
 			expect(record?.lineHashes).toEqual({ 2: lineContentHash("agent2") });
+			expect(logLatency).toHaveBeenCalledWith(
+				expect.objectContaining({
+					phase: "read_guard_conversation_read",
+					metadata: {
+						source: "own-edit",
+						offset: 2,
+						lineCount: 1,
+						hashed: true,
+					},
+				}),
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -666,6 +696,42 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 					(g) => g.kind === "native-read-raced-writer",
 				),
 			).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps disk evidence for a raced read whose delivered text another producer decorated", async () => {
+		const env = setupTestEnvironment("rg-3524-decorated-race-");
+		try {
+			const file = fixture(env.tmpDir, "t.ts", `${lines(12).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 12 },
+				{
+					rewrite: (text) =>
+						text
+							.split("\n")
+							.map((line, i) => `${i + 1}│${line}`)
+							.join("\n"),
+					gate: () => {
+						const v = lines(12);
+						v[10] = "EXTERNAL11";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			// Line 3 did not change: an edit of it must not be refused.
+			const edit = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(edit.reason).toBeUndefined();
+			expect(edit.blocked).toBe(false);
+			expect(
+				getDegradationSummary()
+					.find((g) => g.kind === "native-read-raced-writer")
+					?.latestReasons.at(-1)?.reason,
+			).toContain("the disk is the evidence");
 		} finally {
 			env.cleanup();
 		}

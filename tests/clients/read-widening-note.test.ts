@@ -22,7 +22,18 @@ vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
 	getLSPService: vi.fn(),
 }));
+// The real logger, observed: rows are dropped in test mode after the
+// in-process last-phase ring is updated.
+vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/latency-logger.js")>();
+	return { ...actual, logLatency: vi.fn(actual.logLatency) };
+});
 
+import {
+	getLastLoggedPhase,
+	logLatency,
+} from "../../clients/latency-logger.js";
 import { getLSPService } from "../../clients/lsp/index.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
@@ -76,6 +87,31 @@ function stubTreeSitter(startRow: number, endRow: number, name: string) {
 
 let seq = 0;
 
+/** A read's tool_call alone (pi-lens may widen `input` in place). */
+async function readToolCall(
+	runtime: RuntimeCoordinator,
+	toolCallId: string | undefined,
+	input: { path: string; offset?: number; limit?: number },
+	opts: {
+		getFlag?: (name: string) => boolean;
+		treeSitter?: ReturnType<typeof stubTreeSitter>;
+	} = {},
+) {
+	await handleToolCall({
+		event: { toolName: "read", toolCallId, input },
+		ctx: { cwd: runtime.projectRoot },
+		lensEnabled: true,
+		getFlag: opts.getFlag ?? guardOn,
+		dbg: () => {},
+		runtime,
+		cacheManager: new CacheManager(false),
+		ensureLSPConfigInitialized: async () => {},
+		updateLspStatus: () => {},
+		resetLSPService: () => {},
+		...(opts.treeSitter ? { getTreeSitterClient: () => opts.treeSitter } : {}),
+	} as never);
+}
+
 /**
  * pi's read with pi-lens around it: tool_call (which may widen `input` in
  * place), pi's real read tool on the input as executed, tool_result.
@@ -88,24 +124,18 @@ async function piRead(
 		treeSitter?: ReturnType<typeof stubTreeSitter>;
 		toolCallId?: string | null;
 		isError?: boolean;
+		/** A later tool_call handler re-targeting the read after pi-lens. */
+		afterCall?: (input: { offset?: number; limit?: number }) => void;
 	} = {},
 ) {
 	const toolCallId =
 		opts.toolCallId === null ? undefined : (opts.toolCallId ?? `read-${++seq}`);
 	const getFlag = opts.getFlag ?? guardOn;
-	await handleToolCall({
-		event: { toolName: "read", toolCallId, input },
-		ctx: { cwd: runtime.projectRoot },
-		lensEnabled: true,
+	await readToolCall(runtime, toolCallId, input, {
 		getFlag,
-		dbg: () => {},
-		runtime,
-		cacheManager: new CacheManager(false),
-		ensureLSPConfigInitialized: async () => {},
-		updateLspStatus: () => {},
-		resetLSPService: () => {},
-		...(opts.treeSitter ? { getTreeSitterClient: () => opts.treeSitter } : {}),
-	} as never);
+		treeSitter: opts.treeSitter,
+	});
+	opts.afterCall?.(input);
 	const tool = createReadToolDefinition(runtime.projectRoot);
 	const executed = await tool.execute(
 		toolCallId ?? "no-id",
@@ -151,6 +181,7 @@ const lines = (n: number, prefix = "line") =>
 	Array.from({ length: n }, (_, i) => `${prefix}${i + 1}`);
 
 beforeEach(() => {
+	vi.mocked(logLatency).mockClear();
 	vi.mocked(getLSPService).mockReturnValue(
 		makeLspServiceDouble({
 			supportsLSP: () => false,
@@ -179,6 +210,19 @@ describe("#3555: a widened read is labelled", () => {
 				text: '[pi-lens: read widened to the enclosing function_declaration "handler" (symbol boundary): you asked for lines 12-14, this shows lines 10-20. Re-request with limit > 100 for the exact range.]',
 			});
 			expect(read.content.slice(1)).toEqual(read.host);
+			// The pushed record of the disclosure, kept out of stall attribution.
+			expect(logLatency).toHaveBeenCalledWith(
+				expect.objectContaining({
+					type: "phase",
+					phase: "read_widening_note",
+					metadata: {
+						requested: { offset: 12, limit: 3 },
+						shown: { offset: 10, limit: 11 },
+						boundary: "symbol",
+					},
+				}),
+			);
+			expect(getLastLoggedPhase()?.phase).not.toBe("read_widening_note");
 		} finally {
 			env.cleanup();
 		}
@@ -328,6 +372,81 @@ describe("#3555: an unwidened read carries no note", () => {
 				formatBehaviorWarnings: () => "",
 			} as never)) as { content: Content } | undefined;
 			expect(again?.content ?? widened.host).toEqual(widened.host);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not label a later read that reuses the id of a widening whose tool_result never came", async () => {
+		const env = setupTestEnvironment("rw-3555-orphan-");
+		try {
+			const a = path.join(env.tmpDir, "a.ts");
+			fs.writeFileSync(a, lines(40).join("\n"));
+			const b = path.join(env.tmpDir, "b.txt");
+			fs.writeFileSync(b, lines(300, "bee").join("\n"));
+			const runtime = newRuntime(env.tmpDir);
+			const widened = { path: a, offset: 12, limit: 3 };
+			// A later extension blocks the call (or the batch aborts): no tool_result.
+			await readToolCall(runtime, "call_0", widened, {
+				treeSitter: stubTreeSitter(9, 19, "handler"),
+			});
+			expect([widened.offset, widened.limit]).toEqual([10, 11]);
+			const later = await piRead(
+				runtime,
+				{ path: b, offset: 1, limit: 200 },
+				{ toolCallId: "call_0" },
+			);
+			expect(later.content).toEqual(later.host);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not label a reused id's read even when it happens to ask for the widened range", async () => {
+		const env = setupTestEnvironment("rw-3555-orphan-same-range-");
+		try {
+			const a = path.join(env.tmpDir, "a.ts");
+			fs.writeFileSync(a, lines(40).join("\n"));
+			const b = path.join(env.tmpDir, "b.txt");
+			fs.writeFileSync(b, lines(40, "bee").join("\n"));
+			const runtime = newRuntime(env.tmpDir);
+			await readToolCall(
+				runtime,
+				"call_1",
+				{ path: a, offset: 12, limit: 3 },
+				{ treeSitter: stubTreeSitter(9, 19, "handler") },
+			);
+			// Lines 10-20 of a file expansion does not understand: not widened.
+			const later = await piRead(
+				runtime,
+				{ path: b, offset: 10, limit: 11 },
+				{ toolCallId: "call_1" },
+			);
+			expect([later.input.offset, later.input.limit]).toEqual([10, 11]);
+			expect(later.content).toEqual(later.host);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not label a widened read that a later handler re-targeted", async () => {
+		const env = setupTestEnvironment("rw-3555-retargeted-");
+		try {
+			const file = path.join(env.tmpDir, "notes.md");
+			fs.writeFileSync(file, ["## Tareas", ...lines(30)].join("\n"));
+			const runtime = newRuntime(env.tmpDir);
+			const read = await piRead(
+				runtime,
+				{ path: file, offset: 10, limit: 2 },
+				{
+					afterCall: (input) => {
+						input.offset = 5;
+						input.limit = 3;
+					},
+				},
+			);
+			expect([read.input.offset, read.input.limit]).toEqual([5, 3]);
+			expect(read.content).toEqual(read.host);
 		} finally {
 			env.cleanup();
 		}
