@@ -7,7 +7,7 @@ verdict on its first line (see `formal/file-locks/README.md`), and the
 `TLA+ models` CI job (`node scripts/check-tla-models.mjs`) checks them all.
 
 Issues: #3499 (the quiet-window fix), #3512 (the overflow admission path and
-session-1 strays).
+session-1 strays), #3568 (the handler's capture at entry).
 
 ## What the model covers
 
@@ -50,6 +50,10 @@ session-1 strays).
   aborts only the agent's active run, so once the turn has ended nothing stops
   a handler still awaiting its pipeline. The handler can resume after the
   replacement's reset and admit its compute (`Admit1`, `Fire1`).
+- **The late dispatch** (`EarlyAbandon`, #3568). The same bound can abandon
+  the handler BEFORE its dispatch: during bash recovery, its clients bound or
+  its claim join. It then dispatches in any phase (`Dispatch1`), and its
+  compute, admission and stray touch follow the dispatch.
 - **Session 2's own tier-3 touches**, split into the dispatch, which captures
   the generation, and the record (`integration.ts:2045`). Session 2's own quiet window reconciles them. That
   window cannot start while session 1's is still in progress
@@ -85,10 +89,15 @@ session-1 strays).
 - Mutants of the #3512 captures: `admissionHoist` and `dispatchHoist` reuse
   session 1's handle for later admissions or dispatches; `strayRecordCapture`
   stamps a touch with the generation current when it is recorded.
+- `entryCapture` (#3568): the session-1 handler's dispatch holds the
+  generation it captured at handler entry, before its first await
+  (`runtime-tool-result.ts` `handleToolResult`). Without it, the dispatch
+  captures when it dispatches, as the code before #3568 did.
 
 The shipped code is
-`{"settle","reconcile","reconcileTaskCapture","admission","stray"}`, and `{}`
-is the code before #3499.
+`{"settle","reconcile","reconcileTaskCapture","admission","stray","entryCapture"}`,
+and `{}` is the code before #3499. `entryCapture` matters only under
+`EarlyAbandon`; the configs that predate #3568 leave it out.
 
 ## Invariants
 
@@ -116,6 +125,9 @@ at its first counterexample.
 | `OverflowAdmission` (shipped code, overflow and strays, #3512) | pass | 1234 |
 | `LateAdmissionParked` (shipped code, late session-1 admission, #3512 r1) | pass | 1029 |
 | `LateAdmissionOverflow` (the same past the cap) | pass | 2957 |
+| `LateDispatch` (shipped code, handler abandoned before its dispatch, #3568) | pass | 1110 |
+| `LateDispatchOverflow` (the same past the cap) | pass | 3228 |
+| `FixDispatchCaptureLate` (captured at dispatch, the code before #3568) | violated `NoCrossSessionState` | 71 |
 | `FixNoStartCheck` (window-start capture, the round-0 code) | violated `NoDropFreshTouch` | 125 |
 | `FixWindowCaptureStartCheck` (round-1 design, see below) | pass | 135 |
 | `FixSettleOnly` (only the settle is guarded) | violated `NoCrossSessionState` | 75 |
@@ -174,6 +186,10 @@ What each config proves:
 - Each #3512 capture is per admission and per dispatch. A handle reused from
   session 1 drops session 2's own compute or touch (`FixAdmissionHoist`,
   `FixDispatchHoist`), so both no-drop invariants can fail.
+- The dispatch's capture must be taken at handler entry (`LateDispatch*`
+  against `FixDispatchCaptureLate`). A handler that resumes after the reset
+  and only then dispatches captures session 2's generation, and the #3512
+  guards, which compare against that capture, pass its compute.
 
 What the model cannot see: it has no clock. `FixWindowCaptureStartCheck`, the
 round-1 design, passes every invariant here, yet it cost real behaviour. A
@@ -212,6 +228,14 @@ branches (`LateAdmission*` against `FixAdmitCapture*`).
 `tests/clients/pipeline.test.ts` pins that the pipeline hands the handle to
 the compute.
 
+The #3568 entry capture is replayed through the real `handleToolResult`:
+`tests/clients/dispatch-pipeline-formal.test.ts` parks a handler on its
+clients bound, replaces the session and releases it (`LateDispatch` against
+`FixDispatchCaptureLate`); `tests/clients/runtime-tool-result.test.ts` and
+`tests/clients/observed-mutation-integration.test.ts` pin that a bash
+handler's synthetic writes and every observed path carry the handler's
+entry capture.
+
 ## Scope
 
 Not modelled:
@@ -221,11 +245,7 @@ Not modelled:
 - the pre-handler resets in `index.ts` (latency brackets, telemetry,
   once-per-session phases) against late session-1 writers;
 - the cross-cwd replacement. There the module is re-evaluated and the old
-  `runtime` is a different object, so this straddle cannot occur;
-- a handler abandoned BEFORE its dispatch (during its client or join
-  bounds) that resumes after the reset. It captures session 2's generation
-  at dispatch, and only a capture at handler entry would close that; it is
-  tracked as a follow-up.
+  `runtime` is a different object, so this straddle cannot occur.
 
 ## Duplicate start (#2890)
 
