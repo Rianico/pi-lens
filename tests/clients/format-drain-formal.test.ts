@@ -52,6 +52,7 @@ function gate() {
  */
 const child = vi.hoisted(() => ({
 	command: "format-drain-child",
+	resolving: undefined as undefined | (() => void),
 	resolved: undefined as undefined | Promise<void>,
 	spawned: undefined as undefined | (() => void),
 	read: undefined as undefined | Promise<void>,
@@ -102,6 +103,7 @@ vi.mock("../../clients/formatters-lazy.js", async (importOriginal) => {
 				extensions: [".ts"],
 				detect: async () => true,
 				resolveCommand: async (fp: string) => {
+					child.resolving?.();
 					await child.resolved;
 					return [child.command, fp];
 				},
@@ -264,6 +266,7 @@ beforeEach(() => {
 	resetDegradationLedger();
 	notices = [];
 	flags = new Set(["no-lsp"]);
+	child.resolving = undefined;
 	child.resolved = undefined;
 	child.removeAfterWrite = false;
 	env = setupTestEnvironment("pi-lens-format-drain-");
@@ -671,11 +674,16 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 
 	it("OrphanLsp (#3529): the child the writer's own 30 s aggregate gave up on is synced after it writes, not before", async () => {
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const resolving = gate();
 		const resolution = gate();
+		child.resolving = resolving.open;
 		child.resolved = resolution.p;
 		const c = armChild();
 		const drain = handleAgentEnd(drainDeps());
-		// Both bounds give up while the command resolution is in flight.
+		// The service's own bound is armed once the formatter run starts (the
+		// hold's queue entry is real I/O); both bounds then give up while the
+		// command resolution is in flight.
+		await resolving.p;
 		await vi.advanceTimersByTimeAsync(30_000);
 		await drain;
 		resolution.open();
