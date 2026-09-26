@@ -2191,9 +2191,9 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 		includeGenerated?: boolean;
 	},
 ): Promise<ProjectDiagnosticsSnapshot | undefined> {
-	let snapshot: ProjectDiagnosticsSnapshot | undefined;
+	let loaded: ProjectDiagnosticsSnapshot | undefined;
 	if (shouldRefreshProjectDiagnostics(options.refreshRunners)) {
-		snapshot = await scanProjectDiagnostics({
+		loaded = await scanProjectDiagnostics({
 			cwd,
 			tier: "cheap",
 			maxFiles: options.maxProjectFiles,
@@ -2204,15 +2204,15 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 	} else if (shouldUseCachedProjectDiagnostics(options.refreshRunners)) {
 		// The cached snapshot is a cross-session cache; drop diagnostics for files
 		// edited/deleted since the scan so a stale entry isn't replayed (#298).
-		snapshot = loadProjectDiagnosticsSnapshot(cwd);
+		loaded = loadProjectDiagnosticsSnapshot(cwd);
 	}
-	if (!snapshot) return undefined;
+	if (!loaded) return undefined;
 	// #3573: a fresh scan is reconciled too. Its `scannedAt` is taken after the
 	// whole file loop, and it becomes the widget row's `observedAt`, so a file
 	// rewritten while the scan was still running reads as older than its row and
 	// no widget gate would ever drop it. The fingerprint of the bytes the rules
 	// read settles it before the rows reach the widget.
-	const reconciled = reconcileProjectDiagnosticsSnapshot(snapshot);
+	const reconciled = reconcileProjectDiagnosticsSnapshot(loaded);
 	// #2154: what this gate DROPS was invisible — the count was computed and
 	// thrown away, so a session that silently retired another session's rows
 	// (the whole point of the content axis added this round) left no record
@@ -2229,10 +2229,10 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 			metadata: {
 				files: reconciled.staleDropped,
 				rows:
-					snapshot.diagnostics.length - reconciled.snapshot.diagnostics.length,
-				scannedAt: snapshot.scannedAt,
+					loaded.diagnostics.length - reconciled.snapshot.diagnostics.length,
+				scannedAt: loaded.scannedAt,
 				// #3573: which arm retired them, now that both are reconciled.
-				snapshot: shouldRefreshProjectDiagnostics(options.refreshRunners)
+				arm: shouldRefreshProjectDiagnostics(options.refreshRunners)
 					? "fresh"
 					: "cached",
 			},

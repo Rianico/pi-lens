@@ -359,7 +359,7 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 						metadata: expect.objectContaining({
 							files: 1,
 							rows: 1,
-							snapshot: "fresh",
+							arm: "fresh",
 						}),
 					}),
 				]);
@@ -401,7 +401,7 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 						.filter((row) => row.phase === "project_snapshot_rows_retired"),
 				).toEqual([
 					expect.objectContaining({
-						metadata: expect.objectContaining({ files: 1, snapshot: "cached" }),
+						metadata: expect.objectContaining({ files: 1, arm: "cached" }),
 					}),
 				]);
 			},

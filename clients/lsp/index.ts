@@ -9948,7 +9948,7 @@ export class LSPService {
 		// #3573: a fresh result is observed at its read, the same stamp its cache
 		// entry carries, so a write that landed while the sweep was still
 		// analysing the file is newer than the widget row it reconciles into.
-		const freshResults = results.filter(Boolean).map((result) => ({
+		const freshResults = results.map((result) => ({
 			...result,
 			observedAt: scannedAtByFile.get(result.filePath),
 		}));

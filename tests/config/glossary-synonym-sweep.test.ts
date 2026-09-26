@@ -1210,7 +1210,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/installer/managed-tool-refresh.ts": 24,
 		"clients/knip-client.ts": 8,
 		"clients/lens-events.ts": 4,
-		"clients/lsp/client.ts": 35,
+		// #3505 (b): the workspace pull binds an item by the LSP report's own
+		// `version` field (35 -> 38), a protocol name that cannot be renamed.
+		"clients/lsp/client.ts": 38,
 		"clients/lsp/diagnostic-binding.ts": 1,
 		"clients/lsp/edits.ts": 24,
 		"clients/lsp/index.ts": 6,
