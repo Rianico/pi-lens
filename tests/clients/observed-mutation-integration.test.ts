@@ -588,8 +588,9 @@ describe("#2430 item 3 — the settled sweep is wired ahead of the deferred drai
 			"await runObservedSettledSweepSafely(ctx)",
 		);
 		const drainAt = indexSource.indexOf("await runDeferredMutationDrain(ctx)");
+		// #3576: the refresh runs through the settle's session guard.
 		const refreshAt = indexSource.indexOf(
-			"await refreshObservedLedgerSafely(ctx)",
+			"() => refreshObservedLedgerSafely(ctx)",
 		);
 		expect(sweepAt).toBeGreaterThan(-1);
 		expect(drainAt).toBeGreaterThan(sweepAt);
