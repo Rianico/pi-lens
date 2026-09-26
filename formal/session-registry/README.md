@@ -25,19 +25,32 @@ the `TLA+ models` CI job checks them all.
   from the quiet window. Under the lock it notes whether the entry is missing.
   After the lock it re-registers from the intent with a queued
   `registerInstance`.
+- **An LSP spawn** per session: `void recordLspChild(...)`
+  (`clients/lsp/client.ts`), queued on the tail. With no entry it synthesizes
+  one carrying the session's root as a service cwd.
+- **A declined secondary's shutdown** per session: `deregisterInstanceRoot`,
+  queued on the tail. While the entry still holds the session's root it
+  re-arms the intent to that root. The secondary's own root is not modelled,
+  only this intent write.
 - **Another pi process** that can hold the machine-wide lock. A contender
   whose wait runs out drops its write (`instance-registry-lock-timeout`).
 
-`FixParts` switches on the two parts of the fix, which the code now has:
+`deregisterInstance` advances a process-wide registration generation
+(`createGenerationSource`, held in a process singleton), and each writer below
+captures it when it is called. `FixParts` switches on the parts of the fix,
+which the code now has:
 
-1. `generation`: `deregisterInstance` advances a process-wide registration
-   generation (`createGenerationSource`, held in a process singleton).
-   `registerInstance` captures it when it is called; a registration whose
-   generation moved drops itself before it sets the intent, and again under
-   the lock before it writes (`instance-registry-registration-superseded`).
-2. `retry`: when the sync removal cannot take the lock, it is queued on the
+1. `generation`: a registration whose generation moved drops itself before it
+   sets the intent, and again under the lock before it writes
+   (`instance-registry-registration-superseded`).
+2. `child`: `recordLspChild` synthesizes no entry once its generation moved
+   (review round 1, F2).
+3. `rootIntent`: `deregisterInstanceRoot` re-arms the intent only while its
+   generation holds (review round 1, F1).
+4. `retry`: when the sync removal cannot take the lock, it is queued on the
    tail (`instance-registry-deregister-queued`). It runs after the op holding
-   the lock and waits for the lock instead of dropping.
+   the lock, waits for the lock instead of dropping, and records
+   `instance-registry-deregister-landed` when it runs.
 
 ## Invariants
 
@@ -58,9 +71,11 @@ the `TLA+ models` CI job checks them all.
 | `Replacement` | pass | violated `NoGhostRoot` (own hold) |
 | `ReplacementContention` | pass | violated `NoGhostRoot` (late landing) |
 | `StaleIntent` | pass | violated `LiveRepairable` (stale intent) |
-| `FixGenerationOnly` (fix mutant) | violated `NoGhostRoot` | |
-| `FixRetryOnly` (fix mutant) | violated `NoGhostRoot` | |
-| `StaleIntentRetryOnly` (fix mutant) | violated `LiveRepairable` | |
+| `FixNoRetry` (fix mutant) | violated `NoGhostRoot` | |
+| `FixNoRegGate` (fix mutant) | violated `NoGhostRoot` | |
+| `StaleIntentNoRegGate` (fix mutant) | violated `LiveRepairable` | |
+| `FixNoChildGate` (fix mutant) | violated `NoGhostRoot` | |
+| `FixNoRootIntentGate` (fix mutant) | violated `NoGhostRoot` | |
 | `FixNoClearIntent` (guard mutant) | violated `NoGhostRoot` | |
 | `FixNoHbRepair` (guard mutant) | violated `LiveRepairable` | |
 
@@ -69,9 +84,16 @@ The counterexamples before the fix:
 - **Own hold (`Replacement`):** session 1's heartbeat or registration holds
   the lock, and `session_shutdown` runs. The sync removal meets this process's
   own hold and gives up. The entry keeps `A` after the session ended.
-- **Late landing (`ReplacementContention`, `FixRetryOnly`):** a queued
+- **Late landing (`ReplacementContention`, `FixNoRegGate`):** a queued
   registration is still waiting (a peer holds the lock) when shutdown removes
   the entry. It lands afterwards and re-creates the entry with `A`.
+- **LSP child (`FixNoChildGate`):** a child recorded in session 1 is still
+  queued at shutdown; it finds no entry and synthesizes one with `A`.
+- **Secondary's removal (`FixNoRootIntentGate`):** a peer holds the lock, so
+  shutdown's removal queues behind a secondary's removal that session 1
+  queued. That removal still finds `A` in the entry and re-arms the intent to
+  `A`; the queued removal lands; session 2's heartbeat finds no entry and
+  re-registers `A` with the current generation.
 - **`StaleIntent`:**
   1. Session 1's registration starts only after session 1 ended, so it sets
      the intent to `A`.
@@ -106,10 +128,10 @@ fix.
 
 Not modelled:
 
-- secondary (declined) sessions and `registerInstanceRoot` /
-  `deregisterInstanceRoot`;
-- `recordLspChild`'s entry synthesis. It is another writer that can
-  re-create the entry after shutdown, as `lsp-fallback`;
+- a secondary's own root: `registerInstanceRoot` never creates an entry,
+  and `deregisterInstanceRoot`'s only write that can outlive the session is
+  its intent re-arm, which is modelled;
+- `removeLspChild`, which never creates an entry or writes the intent;
 - the reaper and dead-pid pruning. A process that exits after the ghost write
   is pruned by readers, so the harm needs the process to live on, which is
   what a replacement does;
