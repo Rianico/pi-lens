@@ -31,7 +31,7 @@ import {
 	isPathIgnoredByProject,
 } from "./file-utils.js";
 import { invalidateFormatterCacheForPath } from "./formatters.js";
-import type { ReadGuard } from "./read-guard.js";
+import { deliveredLineEvidence, type ReadGuard } from "./read-guard.js";
 import { getFormatService } from "./format-service.js";
 import {
 	isExternalOrVendorFile,
@@ -1098,6 +1098,25 @@ async function dispatchPipelineAnalysis(args: {
 	return { crashed: false, result };
 }
 
+/**
+ * #3523: the one `edits[].range` replacement of a positional edit call, as
+ * executed. Its `newText` then occupies the lines from `range.start.line`.
+ */
+function singlePositionalEdit(
+	input: unknown,
+): { start: number; newText: string } | undefined {
+	const edits = (input as { edits?: unknown } | undefined)?.edits;
+	if (!Array.isArray(edits) || edits.length !== 1) return undefined;
+	const edit = edits[0] as {
+		range?: { start?: { line?: unknown } };
+		newText?: unknown;
+	};
+	const start = edit?.range?.start?.line;
+	return typeof start === "number" && typeof edit.newText === "string"
+		? { start, newText: edit.newText }
+		: undefined;
+}
+
 export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	content: Array<{ type: string; text?: string }>;
 	isError?: boolean;
@@ -1666,24 +1685,47 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						expandedByTs: false,
 					},
 				});
+				// #3524: another writer moved the file after the tool_call's stamp,
+				// so the disk may not be what pi delivered. The delivered text is
+				// then the evidence (at most `deliveredLimit` of its lines, which
+				// leaves out pi's trailing continuation notice), and the stamp stays
+				// where it was.
+				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
+				const delivered = raced
+					? deliveredLineEvidence(
+							event.content
+								.map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+								.join("\n"),
+							requestedOffset,
+							deliveredLimit,
+						)
+					: undefined;
+				if (raced) {
+					incrementDegradationCount({
+						kind: "native-read-raced-writer",
+						subject: deliveredFilePath,
+						reason:
+							"the file changed between pi's read and its tool_result; the read is recorded from the delivered text",
+					});
+				}
 				const deliveredRecord = {
 					filePath: deliveredFilePath,
 					requestedOffset,
 					requestedLimit: requestedLimit ?? deliveredLimit,
 					effectiveOffset: requestedOffset,
-					effectiveLimit: deliveredLimit,
+					effectiveLimit: delivered?.lineCount ?? deliveredLimit,
 					expandedByLsp: false,
+					...(delivered && { lineHashes: delivered.lineHashes }),
 					turnIndex: runtime.turnIndex,
 					writeIndex: runtime.peekWriteIndex(),
 					timestamp: Date.now(),
 				};
-				if (nativeReadToolCallId) {
-					deps.readGuard.recordRead(deliveredRecord, {
+				deps.readGuard.recordRead(deliveredRecord, {
+					...(nativeReadToolCallId && {
 						supersedes: { toolCallId: nativeReadToolCallId },
-					});
-				} else {
-					deps.readGuard.recordRead(deliveredRecord);
-				}
+					}),
+					stampFileTime: !raced,
+				});
 			}
 		}
 	}
@@ -2083,6 +2125,36 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		filePath,
 		stateHash: postWriteStateHash,
 	});
+
+	// #3523: an edit the guard allowed at the agent's own line numbers is the
+	// agent's view of the lines it wrote, so its next edit of them is judged
+	// against its `newText`, not the read that predates it. One positional
+	// edit only: a batch's later ranges shift by the earlier ones' growth.
+	// Per event, so before the debounce keeps only the latest. The mark is
+	// only ever set by the guard's own check, so `--no-read-guard` never
+	// reaches here.
+	const ownEdit = attribution?.editInPlace
+		? singlePositionalEdit(event.input)
+		: undefined;
+	if (ownEdit) {
+		const evidence = deliveredLineEvidence(ownEdit.newText, ownEdit.start);
+		deps.readGuard?.recordRead(
+			{
+				filePath,
+				requestedOffset: ownEdit.start,
+				requestedLimit: evidence.lineCount,
+				effectiveOffset: ownEdit.start,
+				effectiveLimit: evidence.lineCount,
+				expandedByLsp: false,
+				lineHashes: evidence.lineHashes,
+				turnIndex: runtime.turnIndex,
+				writeIndex: runtime.peekWriteIndex(),
+				timestamp: Date.now(),
+				source: "own-edit",
+			},
+			{ stampFileTime: false },
+		);
+	}
 
 	// Must happen before debounce admission: latestDeps intentionally retains only
 	// the latest event, but write -> edit is a sticky turn transition.
@@ -2676,6 +2748,29 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			postMutation.filePath,
 			attachAuthoritativeContent,
 		);
+		// #3519: the attached bytes are "authoritative for subsequent edits",
+		// so they are the agent's whole-file view: hashed from the attachment,
+		// not from a disk another writer may have moved since the pipeline read
+		// it. Only when delivered: without it the agent's view is its own write.
+		if (attachAuthoritativeContent && !getFlag("no-read-guard")) {
+			const evidence = deliveredLineEvidence(postMutation.content, 1);
+			deps.readGuard?.recordRead(
+				{
+					filePath: postMutation.filePath,
+					requestedOffset: 1,
+					requestedLimit: evidence.lineCount,
+					effectiveOffset: 1,
+					effectiveLimit: evidence.lineCount,
+					expandedByLsp: false,
+					lineHashes: evidence.lineHashes,
+					turnIndex: runtime.turnIndex,
+					writeIndex: runtime.peekWriteIndex(),
+					timestamp: Date.now(),
+					source: "autofix-attachment",
+				},
+				{ stampFileTime: false },
+			);
+		}
 	}
 	const returnedContent = attachAuthoritativeContent
 		? [...event.content, { type: "text", text: attachmentText }]

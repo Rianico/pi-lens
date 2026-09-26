@@ -1596,6 +1596,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					block: true,
 					reason: verdict.reason,
 				};
+			} else if (toolCallId !== undefined) {
+				// #3523: the edit lands at the agent's own line numbers, so its
+				// tool_result may record the written lines as read.
+				runtime.markToolCallEditInPlace(toolCallId);
 			}
 		}
 	}

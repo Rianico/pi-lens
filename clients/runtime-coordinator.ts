@@ -311,6 +311,12 @@ export interface ToolCallAttribution {
 	 * collapse.
 	 */
 	originCwd: string;
+	/**
+	 * #3523: the read guard allowed this call's edit at the agent's own line
+	 * numbers. Unset for a relocated or unchecked edit, whose written lines
+	 * are not where the agent believes they are.
+	 */
+	editInPlace?: true;
 	/** `Date.now()` when recorded — see `TOOL_CALL_ATTRIBUTION_TTL_MS`. */
 	recordedAt: number;
 }
@@ -1613,6 +1619,12 @@ export class RuntimeCoordinator {
 			...attribution,
 			recordedAt: Date.now(),
 		});
+	}
+
+	/** #3523: see {@link ToolCallAttribution.editInPlace}. */
+	markToolCallEditInPlace(toolCallId: string): void {
+		const attribution = this._toolCallAttributions.get(toolCallId);
+		if (attribution) attribution.editInPlace = true;
 	}
 
 	/**
