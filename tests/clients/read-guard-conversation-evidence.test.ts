@@ -1010,6 +1010,37 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
+	it("records nothing for a decorated raced read whose capture was too long to hash", async () => {
+		const env = setupTestEnvironment("rg-3524-unhashed-capture-");
+		try {
+			// 3500 lines: past the 3000-line hash bound, so the capture has no hashes.
+			const file = fixture(env.tmpDir, "u.ts", `${lines(3500).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(runtime, file, { offset: 1, limit: 4 });
+			await piRead(
+				runtime,
+				file,
+				{},
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => {
+						const v = lines(3500);
+						v[2399] = "EXTERNAL2400";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			// An own edit re-stamps FileTime; the line pi never showed stays refused.
+			const own = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(own.blocked).toBe(false);
+			await applyEdit(runtime, file, own);
+			const edit = await positionalEdit(runtime, file, [[2400, 2400, "blind"]]);
+			expect(edit.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	for (const limit of [100, 12, 13]) {
 		it(`refuses the shifted line of a decorated raced read with limit ${limit} on a 12-line file`, async () => {
 			const env = setupTestEnvironment("rg-3524-limit-past-end-");
