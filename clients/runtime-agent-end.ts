@@ -853,8 +853,18 @@ export async function handleAgentEnd({
 	// particular, never publish the autofix intermediate state before format.
 	for (const changedPath of deferredAutofixChanged) {
 		if (!nodeFs.existsSync(changedPath)) continue;
+		// #3529: stamped, like the format resync above.
+		const readStamp = performance.now();
 		const content = nodeFs.readFileSync(changedPath, "utf-8");
-		await resyncLspFile(changedPath, content, true, false, getFlag, dbg);
+		await resyncLspFile(
+			changedPath,
+			content,
+			true,
+			false,
+			getFlag,
+			dbg,
+			readStamp,
+		);
 	}
 
 	if (inspectActionableReport) {

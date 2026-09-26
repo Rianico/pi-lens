@@ -416,7 +416,7 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"own wait bound, the resync above it does not.",
 		owner: "#2523 slice 2",
 	},
-	"clients/runtime-agent-end.ts#e36d39b8~05b260ce": {
+	"clients/runtime-agent-end.ts#b2e21790~8c02cace": {
 		family: "hook-await",
 		site: "agent_settled",
 		reason:
