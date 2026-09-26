@@ -887,9 +887,12 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		  }
 		| undefined;
 
+	// #3555: the widening serves the read guard, so it is off with the guard
+	// (`--no-read-guard`, or `readGuard.enabled=false`, lens-flag-registry.ts).
 	const readExpansionClient =
 		toolName === "read" &&
 		!getFlag("no-lsp") &&
+		!getFlag("no-read-guard") &&
 		!isExternalOrVendor &&
 		filePath &&
 		readInput &&
@@ -952,6 +955,22 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					enriched = true;
 				} else {
 					enclosingSymbol = expansion.enclosingSymbol;
+				}
+				// #3555: the tool_result tells the agent it was shown more than
+				// it asked for. A Markdown section is named by its heading, as the
+				// fast path found it, whatever an LSP calls it.
+				if (toolCallId !== undefined) {
+					runtime.recordReadWidening(toolCallId, {
+						requested: {
+							offset: requestedReadOffset,
+							limit: requestedReadLimit,
+						},
+						shown: { offset: expansion.newOffset, limit: expansion.newLimit },
+						boundary:
+							expansion.enclosingSymbol.kind === "markdown_section"
+								? { heading: expansion.enclosingSymbol.name }
+								: { symbol: enclosingSymbol },
+					});
 				}
 				logToolReadGuardEvent({
 					event: "ts_range_expanded",

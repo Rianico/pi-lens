@@ -322,6 +322,16 @@ export interface ToolCallAttribution {
 }
 
 /**
+ * #3555: a read the tool_call widened to its enclosing symbol or Markdown
+ * section, carried by tool-call identity to its tool_result, which labels it.
+ */
+export interface ReadWidening {
+	requested: { offset: number; limit: number };
+	shown: { offset: number; limit: number };
+	boundary: { heading: string } | { symbol: { name: string; kind: string } };
+}
+
+/**
  * Bound on in-flight tool_call → tool_result correlations. A tool_result
  * follows its tool_call almost immediately, so this only needs to cover
  * calls genuinely in flight; sized generously above any realistic
@@ -412,6 +422,14 @@ export class RuntimeCoordinator {
 		string,
 		ToolCallAttribution
 	>(TOOL_CALL_ATTRIBUTION_CAPACITY);
+	/**
+	 * #3555: reads carry no {@link ToolCallAttribution} (it is recorded for
+	 * mutations, and its origin cwd would change how a read's path resolves),
+	 * so a widening rides its own correlation, with the same bound.
+	 */
+	private readonly _readWidenings = new BoundedLruCache<string, ReadWidening>(
+		TOOL_CALL_ATTRIBUTION_CAPACITY,
+	);
 	private readonly _lspReadWarmState = new Map<
 		string,
 		{ status: "warming" | "ready"; ts: number }
@@ -493,6 +511,7 @@ export class RuntimeCoordinator {
 		// per-session-numbered host reusing tool-call ids across sessions must
 		// not let a NEW session inherit a DEAD session's recorded skip verdict.
 		this._toolCallAttributions.clear();
+		this._readWidenings.clear();
 		this._lspReadWarmState.clear();
 		this._pendingInlineBlockers.clear();
 		this._inlineBlockerWriteOrder.clear();
@@ -1619,6 +1638,18 @@ export class RuntimeCoordinator {
 			...attribution,
 			recordedAt: Date.now(),
 		});
+	}
+
+	/** #3555: note the widening the tool_call applied to this read. */
+	recordReadWidening(toolCallId: string, widening: ReadWidening): void {
+		this._readWidenings.set(toolCallId, widening);
+	}
+
+	/** #3555: one-shot claim of a read's widening, as with an attribution. */
+	takeReadWidening(toolCallId: string): ReadWidening | undefined {
+		const widening = this._readWidenings.get(toolCallId);
+		this._readWidenings.delete(toolCallId);
+		return widening;
 	}
 
 	/** #3523: see {@link ToolCallAttribution.editInPlace}. */

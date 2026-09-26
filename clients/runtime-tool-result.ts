@@ -83,7 +83,11 @@ import {
 	type ProjectChangeSource,
 } from "./project-changes.js";
 import type { RuffClient } from "./ruff-client.js";
-import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import type {
+	ReadWidening,
+	RuntimeCoordinator,
+} from "./runtime-coordinator.js";
+import { EXPANSION_LIMIT_LINES } from "./read-expansion.js";
 import { syncGitGuardRecord } from "./git-guard.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -1117,6 +1121,16 @@ function singlePositionalEdit(
 		: undefined;
 }
 
+/** #3555: the leading note on a read the tool_call widened. */
+function readWideningNote(widening: ReadWidening): string {
+	const { requested, shown, boundary } = widening;
+	const reason =
+		"heading" in boundary
+			? `the Markdown section under the heading "${boundary.heading}" (heading boundary)`
+			: `the enclosing ${boundary.symbol.kind} "${boundary.symbol.name}" (symbol boundary)`;
+	return `[pi-lens: read widened to ${reason}: you asked for lines ${requested.offset}-${requested.offset + requested.limit - 1}, this shows lines ${shown.offset}-${shown.offset + shown.limit - 1}. Re-request with limit > ${EXPANSION_LIMIT_LINES} for the exact range.]`;
+}
+
 export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	content: Array<{ type: string; text?: string }>;
 	isError?: boolean;
@@ -1161,6 +1175,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		toolCallId !== undefined
 			? runtime.takeToolCallAttribution(toolCallId)
 			: undefined;
+	// #3555: claimed here, before any return, so it never outlives its call.
+	// A read reaches only the two returns that prepend it (the unattributed
+	// relative path below, and the not-a-mutation exit). The note is its own
+	// leading block, never spliced into the file text.
+	const readWidening =
+		event.toolName === "read" && toolCallId !== undefined
+			? runtime.takeReadWidening(toolCallId)
+			: undefined;
+	const readNote =
+		readWidening && event.isError !== true
+			? [{ type: "text", text: readWideningNote(readWidening) }]
+			: [];
 
 	let resolutionBasis: string;
 	if (attribution) {
@@ -1194,7 +1220,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			durationMs: 0,
 			metadata: { toolCallId, rawFilePath, guessedPath },
 		});
-		return;
+		return readNote.length > 0
+			? { content: [...readNote, ...event.content] }
+			: undefined;
 	} else {
 		// Either an ABSOLUTE path (bash-synthetic writes always pass one —
 		// unambiguous regardless of any basis, see the bash-write dispatch
@@ -2044,8 +2072,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		dbg(
 			`tool_result: skipped turn tracking - toolName="${event.toolName}" is not a classified mutation`,
 		);
-		return syntheticWriteContent.length > 0
-			? { content: [...event.content, ...syntheticWriteContent] }
+		return syntheticWriteContent.length > 0 || readNote.length > 0
+			? { content: [...readNote, ...event.content, ...syntheticWriteContent] }
 			: undefined;
 	}
 	if (!filePath) {
