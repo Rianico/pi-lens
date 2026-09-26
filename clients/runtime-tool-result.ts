@@ -1858,10 +1858,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				const captureEvidence = capture?.lineHashes && {
 					effectiveOffset: capture.effectiveOffset,
 					effectiveLimit: shownLimit,
+					// Integer keys enumerate in ascending order, from the offset.
 					lineHashes: Object.fromEntries(
-						Object.entries(capture.lineHashes).filter(
-							([line]) => Number(line) < capture.effectiveOffset + shownLimit,
-						),
+						Object.entries(capture.lineHashes).slice(0, shownLimit),
 					),
 				};
 				if (raced) {
