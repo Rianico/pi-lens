@@ -34,6 +34,7 @@ import {
 	admitWidgetDiagnosticsWrite,
 	recordDiagnostics,
 } from "./widget-state.js";
+import { writeOrderToken } from "./write-ordering-guard.js";
 import { getDiagnosticLogger } from "./diagnostic-logger.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { loadDispatchIntegration } from "./dispatch/lazy.js";
@@ -302,9 +303,11 @@ export interface PipelineContext {
 	sessionGeneration?: GenerationHandle;
 	/**
 	 * #3506: draws a fresh `telemetry.writeIndex` when the bytes this pipeline
-	 * analyses are not the bytes its handler's token was drawn for.
+	 * analyses are not the bytes its handler's token was drawn for. #3559: with
+	 * the turn it is drawn in, which is later than the handler's when the
+	 * pipeline outlived its turn.
 	 */
-	nextWriteIndex?: () => number;
+	nextWriteIndex?: () => { turnIndex: number; writeIndex: number };
 }
 
 export interface PipelineDeps {
@@ -336,6 +339,8 @@ export interface PipelineResult {
 	postWriteStateHash?: string;
 	/** #3506: the write token the analysis was recorded under. */
 	writeIndex?: number;
+	/** #3559: the turn `writeIndex` was drawn in. */
+	turnIndex?: number;
 	/** #3503: `Date.now()` taken before the bytes the analysis ran on were read. */
 	analysisReadAtMs?: number;
 	/** Files modified by pi-lens format/autofix, including side-effect files. */
@@ -1573,7 +1578,11 @@ async function analysePipeline(
 			reason: `observed mutation is not evidence of agent authorship (${filePath})`,
 		});
 	}
-	admitWidgetDiagnosticsWrite(filePath, ctx.telemetry?.writeIndex);
+	// #3540: the widget's order spans turns; read at each use, since the
+	// re-token below replaces the pair.
+	const widgetOrder = () =>
+		writeOrderToken(ctx.telemetry?.turnIndex, ctx.telemetry?.writeIndex);
+	admitWidgetDiagnosticsWrite(filePath, widgetOrder());
 
 	const phase = createPhaseTracker(toolName, filePath);
 	const pipelineStart = Date.now();
@@ -1760,7 +1769,7 @@ async function analysePipeline(
 	// ones first read (this pipeline's own write, or an edit queued ahead of
 	// it), draw a fresh one while the queue still holds the file.
 	if (fileContent !== readContent && ctx.telemetry && ctx.nextWriteIndex) {
-		ctx.telemetry = { ...ctx.telemetry, writeIndex: ctx.nextWriteIndex() };
+		ctx.telemetry = { ...ctx.telemetry, ...ctx.nextWriteIndex() };
 	}
 	writeHold?.release();
 
@@ -1820,7 +1829,8 @@ async function analysePipeline(
 		},
 		{
 			projectRoot: ctx.projectRoot,
-			writeIndex: ctx.telemetry?.writeIndex,
+			// The runners' widget order (#3540).
+			writeIndex: widgetOrder(),
 			telemetryModel: ctx.telemetry?.modelId,
 			telemetryProvider: ctx.telemetry?.provider,
 		},
@@ -1828,7 +1838,7 @@ async function analysePipeline(
 	recordDiagnostics(
 		filePath,
 		dispatchResult.diagnostics,
-		ctx.telemetry?.writeIndex,
+		widgetOrder(),
 		analysisReadAtMs,
 	);
 	// #502: emit the write batch's FINAL diagnostic state immediately after
@@ -2100,6 +2110,7 @@ async function analysePipeline(
 		fileModified,
 		postWriteStateHash,
 		writeIndex: ctx.telemetry?.writeIndex,
+		turnIndex: ctx.telemetry?.turnIndex,
 		analysisReadAtMs,
 		changedFiles,
 		// #3190: re-rendered from the GATED set with `formatDiagnostics(...,

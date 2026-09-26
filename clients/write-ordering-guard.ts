@@ -25,6 +25,22 @@
  * the existing, deliberate version-less-server tradeoff in the LSP client:
  * callers that can't supply an ordering token aren't penalized).
  */
+/**
+ * #3507, #3540: the `(turnIndex, writeIndex)` order of a write as one token.
+ * `RuntimeCoordinator.nextWriteIndex()` restarts at every `beginTurn` while
+ * the stores these tokens order live for the session, so the turn leads.
+ * Undefined when either half is unknown: such a write is unordered and always
+ * applies. At turn 0 the token equals the write index.
+ */
+export function writeOrderToken(
+	turnIndex: number | undefined,
+	writeIndex: number | undefined,
+): number | undefined {
+	return turnIndex === undefined || writeIndex === undefined
+		? undefined
+		: turnIndex * 2 ** 32 + writeIndex;
+}
+
 export class WriteOrderingGuard<K, T extends number = number> {
 	private readonly lastSeen = new Map<K, T>();
 

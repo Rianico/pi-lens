@@ -912,7 +912,11 @@ async function dispatchPipelineAnalysis(args: {
 				scheduleWordIndexPersist(dispatchCwd, index, dbg);
 			},
 			sessionGeneration,
-			nextWriteIndex: () => runtime.nextWriteIndex(),
+			// #3559: the re-token's turn, read when it is drawn.
+			nextWriteIndex: () => ({
+				turnIndex: runtime.turnIndex,
+				writeIndex: runtime.nextWriteIndex(),
+			}),
 		},
 		{
 			biomeClient: biomeClient!,
@@ -2817,7 +2821,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					// later `lens_diagnostic_mark` can be applied to this record at turn
 					// end instead of replaying pre-mark text.
 					result.inlineBlockerDiagnostics,
-					writeTurnIndex,
+					// #3559: a re-token's own turn.
+					result.turnIndex ?? writeTurnIndex,
 					// #3503: the freshness baseline is the analysis read.
 					result.analysisReadAtMs,
 				),
@@ -2828,7 +2833,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				runtime.clearInlineBlockers(
 					filePath,
 					result.writeIndex ?? writeIndex,
-					writeTurnIndex,
+					result.turnIndex ?? writeTurnIndex,
 				),
 			) ?? false;
 	}

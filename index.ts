@@ -1743,8 +1743,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// (widget-state's allDiagnostics) using the SAME write-ordering token
 			// source pipeline.ts's per-edit recordDiagnostics calls draw from, so
 			// a scan-originated write can't clobber a concurrent newer per-edit
-			// write (or vice versa).
-			() => runtime.nextWriteIndex(),
+			// write (or vice versa). #3540: ordered turn first, as the pipeline's.
+			() => runtime.nextWriteOrderToken(),
 			captureLspStatusRepaint,
 			() => runtime,
 			() => Boolean(getLensFlag("lens-guard")),

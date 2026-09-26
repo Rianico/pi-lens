@@ -458,6 +458,56 @@ describe("formal/dispatch-pipeline replays", () => {
 		}
 	});
 
+	// #3540: `writeIndex` restarts at every beginTurn, so the widget's guard
+	// must order a turn-2 write after every turn-1 write of the same file.
+	it("widget order (#3540): a file's first edit in turn 2 replaces its turn-1 widget verdict", async () => {
+		const env = setupTestEnvironment("tla-widget-turns-");
+		try {
+			const filePath = path.join(env.tmpDir, "a.ts");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			vi.mocked(dispatchLintWithResult).mockImplementation(
+				async (fp) =>
+					(revisionOf(fp as string) === "v3"
+						? blocking(fp as string, "v3")
+						: clean(revisionOf(fp as string))) as never,
+			);
+			for (const rev of ["v1", "v2", "v3"]) {
+				fs.writeFileSync(filePath, `export const x = '${rev}';\n`);
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, rev),
+				} as never);
+			}
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual(["BLOCKER-FROM-v3"]);
+			runtime.beginTurn();
+			fs.writeFileSync(filePath, "export const x = 'v4';\n");
+			await handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, "v4"),
+			} as never);
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("widget order (#3540): an older same-turn pipeline that settles last still does not replace the newer edit's widget verdict", async () => {
+		const run = await olderSettlesLast({ v1: "blocker", v2: "clean" });
+		try {
+			expect(
+				(getFileDiagnostics(run.filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+		} finally {
+			run.cleanup();
+		}
+	});
+
 	it("session straddle (#3506 r1 F8): an old session's handler that settles after session_start records nothing into the new session", async () => {
 		const env = setupTestEnvironment("tla-inline-session-");
 		try {
@@ -694,6 +744,78 @@ describe("formal/dispatch-pipeline replays", () => {
 				expect(inlineSummaries(runtime)).toEqual([
 					{ writeIndex: 3, blocker: "BLOCKER-FROM-v3" },
 				]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("FixerQueueNoReToken across turns (#3559): a pipeline that re-tokens after its turn ended records its fixed-bytes verdict under the new turn", async () => {
+			const env = setupTestEnvironment("tla-fixer-token-turn-");
+			try {
+				writeBiomeAgreement(env.tmpDir);
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+					const bytes = fs.readFileSync(fp as string, "utf8");
+					// v3: the fixer's output of edit B's bytes.
+					const rev = bytes.includes("const a")
+						? "v3"
+						: bytes.includes("E2")
+							? "v2"
+							: "v1";
+					return blocking(fp as string, rev) as never;
+				});
+				// Edit A's fixer is parked in its availability probe.
+				const probing = gate();
+				const probed = gate();
+				const fixer = {
+					isSupportedFile: () => true,
+					ensureAvailable: async () => {
+						probing.open();
+						await probed.p;
+						return true;
+					},
+					fixFileAsync: async (fp: string) => {
+						const before = fs.readFileSync(fp, "utf8");
+						fs.writeFileSync(fp, before.replace("var ", "const "));
+						const after = fs.readFileSync(fp, "utf8");
+						return {
+							success: true,
+							changed: before !== after,
+							fixed: before !== after ? 1 : 0,
+						};
+					},
+				} as unknown as BiomeClient;
+				fs.writeFileSync(filePath, "var a = 1;\n");
+				const write = handleToolResult({
+					...deps(runtime, fixer),
+					event: ev("write", filePath, "c1"),
+				} as never);
+				await probing.p;
+				// Edit B records at turn 1, w=2.
+				fs.writeFileSync(filePath, "var a = 1;\nexport const E2 = 2;\n");
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c2"),
+				} as never);
+				expect(inlineSummaries(runtime)).toEqual([
+					{ writeIndex: 2, blocker: "BLOCKER-FROM-v2" },
+				]);
+				// A outlives its turn; its fixer then fixes B's bytes and re-tokens.
+				runtime.beginTurn();
+				probed.open();
+				await write;
+				expect(fs.readFileSync(filePath, "utf8")).toBe(
+					"const a = 1;\nexport const E2 = 2;\n",
+				);
+				expect(inlineSummaries(runtime)).toEqual([
+					{ writeIndex: 1, blocker: "BLOCKER-FROM-v3" },
+				]);
+				expect(
+					(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+				).toEqual(["BLOCKER-FROM-v3"]);
 			} finally {
 				env.cleanup();
 			}
