@@ -163,6 +163,35 @@ describe("formatFile", () => {
 		}
 	});
 
+	// #3558: `enter` returns once pi's queue has run every edit queued ahead of
+	// the formatter. The before-read comes after it, so such an edit is part of
+	// the "before" and is never reported as the formatter's change.
+	it("reads contentBefore after entering pi's queue, so an edit queued ahead is not claimed as the format (#3558)", async () => {
+		const env = setupTestEnvironment("pi-lens-format-file-");
+		try {
+			const filePath = path.join(env.tmpDir, "terragrunt.hcl");
+			fs.writeFileSync(filePath, "locals {}\n");
+			safeSpawnAsync.mockImplementation(async () => ({
+				status: 0,
+				stdout: "",
+				stderr: "",
+			}));
+
+			const { formatFile, formatter } = await loadFormatFile();
+			const result = await formatFile(filePath, formatter, async () => {
+				fs.appendFileSync(filePath, "# queued ahead\n");
+			});
+
+			expect(result).toEqual({
+				success: true,
+				changed: false,
+				outcome: "unchanged",
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	// The reason the strict default is opt-OUT-able: `rubocop -a` exits 1 when
 	// offenses remain after it has already rewritten the file. Failing that would
 	// surface a formatter error on every file with an unfixable offense.

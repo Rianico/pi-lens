@@ -4,12 +4,16 @@
  * run, and must say so once in the degradation ledger (AGENTS.md shape 10: a
  * lost safety property is never silent).
  */
+import * as path from "node:path";
+// pi's real per-file queue, the one its `edit`/`write` tools run under.
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import {
+	holdFileMutationQueue,
 	noteHostSessionManager,
 	setHostFileMutationQueueLoader,
 	withHostFileMutationQueue,
@@ -197,5 +201,34 @@ describe("withHostFileMutationQueue (#3506)", () => {
 				}),
 			]);
 		});
+	});
+});
+
+describe("holdFileMutationQueue: a writer's enter (#3558)", () => {
+	beforeEach(() => {
+		setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
+	});
+	afterEach(() => {
+		setHostFileMutationQueueLoader(undefined);
+	});
+
+	// The pipeline reads back and hashes a format write before it releases
+	// its hold; an edit that lands in between would be claimed as the format.
+	it("a writer that enters before release joins the hold, which stays held past the writer until release", async () => {
+		// Never created: pi keys a missing path by its resolved spelling.
+		const filePath = path.resolve("/pi-lens-3558-missing/f.ts");
+		const hold = holdFileMutationQueue(filePath);
+		const writer = Promise.resolve();
+		await hold?.enter(writer);
+		let edited = false;
+		const edit = withFileMutationQueue(filePath, async () => {
+			edited = true;
+		});
+		await writer;
+		await withFileMutationQueue(`${filePath}.barrier`, async () => {});
+		expect(edited).toBe(false);
+		hold?.release();
+		await edit;
+		expect(edited).toBe(true);
 	});
 });
