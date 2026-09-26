@@ -270,6 +270,94 @@ describe("#3541: applyWorkspaceEdit enters every path's queue", () => {
 		);
 	});
 
+	it("an edit enters, in key order, the queue of every path it names: a text edit, a create, both ends of a rename, a delete", async () => {
+		const entered: string[] = [];
+		setHostFileMutationQueueLoader(async () => ({
+			withFileMutationQueue: <T>(key: string, fn: () => Promise<T>) => {
+				entered.push(key);
+				return withFileMutationQueue(key, fn);
+			},
+		}));
+		const created = path.join(env.tmpDir, "created.ts");
+		const renamedFrom = path.join(env.tmpDir, "old.ts");
+		const renamedTo = path.join(env.tmpDir, "new.ts");
+		const deleted = path.join(env.tmpDir, "gone.ts");
+		fs.writeFileSync(renamedFrom, "");
+		fs.writeFileSync(deleted, "");
+		// pi's key: the realpath of an existing file, the resolved spelling of
+		// a missing one.
+		const expected = [
+			fs.realpathSync(filePath),
+			path.join(fs.realpathSync(env.tmpDir), "created.ts"),
+			fs.realpathSync(renamedFrom),
+			path.join(fs.realpathSync(env.tmpDir), "new.ts"),
+			fs.realpathSync(deleted),
+		].sort();
+		await applyWorkspaceEdit(
+			{
+				documentChanges: [
+					{
+						textDocument: { uri: pathToFileURL(filePath).href, version: null },
+						edits: valueEdit().changes[pathToFileURL(filePath).href],
+					},
+					{ kind: "create", uri: pathToFileURL(created).href },
+					{
+						kind: "rename",
+						oldUri: pathToFileURL(renamedFrom).href,
+						newUri: pathToFileURL(renamedTo).href,
+					},
+					{ kind: "delete", uri: pathToFileURL(deleted).href },
+				],
+			},
+			env.tmpDir,
+		);
+		expect(entered).toEqual(expected);
+		expect(fs.readFileSync(filePath, "utf8")).toBe("const = 1;\n");
+		expect(fs.existsSync(renamedTo) && !fs.existsSync(deleted)).toBe(true);
+	});
+
+	it("an edit checks its preconditions against the disk it writes: a create an agent write made ahead of it is skipped, not a mid-application failure", async () => {
+		const created = path.join(env.tmpDir, "c.ts");
+		// Missing when both are queued: pi keys it by its resolved spelling.
+		const key = path.join(fs.realpathSync(env.tmpDir), "c.ts");
+		const queued = gate();
+		setHostFileMutationQueueLoader(async () => ({
+			withFileMutationQueue: <T>(k: string, fn: () => Promise<T>) => {
+				if (k === key) queued.open();
+				return withFileMutationQueue(k, fn);
+			},
+		}));
+		// The agent's write of the new file holds its queue, parked.
+		const write = gate();
+		const agent = withFileMutationQueue(created, async () => {
+			await write.p;
+			fs.writeFileSync(created, "export const AGENT = 2;\n");
+		});
+		const edit = applyWorkspaceEdit(
+			{
+				documentChanges: [
+					{
+						textDocument: { uri: pathToFileURL(filePath).href, version: null },
+						edits: valueEdit().changes[pathToFileURL(filePath).href],
+					},
+					{
+						kind: "create",
+						uri: pathToFileURL(created).href,
+						options: { ignoreIfExists: true },
+					},
+				],
+			},
+			env.tmpDir,
+		);
+		// The edit now waits behind the agent's write.
+		await queued.p;
+		write.open();
+		await agent;
+		await edit;
+		expect(fs.readFileSync(filePath, "utf8")).toBe("const = 1;\n");
+		expect(fs.readFileSync(created, "utf8")).toBe("export const AGENT = 2;\n");
+	});
+
 	it("two edits that name the same two files in opposite orders both apply", async () => {
 		const other = path.join(env.tmpDir, "b.ts");
 		fs.writeFileSync(other, "value = 1;\n");
