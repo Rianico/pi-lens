@@ -446,6 +446,19 @@ describe("resyncLspFile — its outcome names what it did (#3528 r1 F1)", () => 
 		await expect(resync()).resolves.toBe("failed");
 	});
 
+	it("not-sent: the touch reached no client", async () => {
+		mockService(async () => undefined);
+		await expect(resync()).resolves.toBe("not-sent");
+	});
+
+	it("superseded: the notify queue dropped this read as older than one it sent", async () => {
+		mockService(async () => ({
+			diags: [],
+			supersededServerIds: ["typescript"],
+		}));
+		await expect(resync()).resolves.toBe("superseded");
+	});
+
 	it("failed: the touch rejected", async () => {
 		mockService(async () => {
 			throw new Error("server gone");

@@ -475,6 +475,54 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 			expect(staleWriteSubjects()).toContain(`runtime-session:${filePath}`);
 		});
 
+		it("every claimed file it did not start is named in summary.skipped (#3528 r2)", async () => {
+			const { fixer, parked, resume } = gatedBiome();
+			writeBiomeAgreement();
+			runtime.deferMutation(
+				filePath,
+				env.tmpDir,
+				"edit",
+				env.tmpDir,
+				"autofix",
+			);
+			const formatOnly = ["b.ts", "c.ts", "d.ts", "e.ts"].map((name) => {
+				const fp = path.join(env.tmpDir, name);
+				fs.writeFileSync(fp, "const z=3\n");
+				runtime.deferMutation(fp, env.tmpDir, "edit", env.tmpDir, "format");
+				return fp;
+			});
+			// Its own project, so Biome's project scope does not dedupe it.
+			const otherRoot = path.join(env.tmpDir, "other");
+			fs.mkdirSync(otherRoot);
+			writeBiomeAgreement(otherRoot);
+			const autofixOnly = path.join(otherRoot, "g.ts");
+			fs.writeFileSync(autofixOnly, "const y=2\n");
+			runtime.deferMutation(
+				autofixOnly,
+				otherRoot,
+				"edit",
+				otherRoot,
+				"autofix",
+			);
+			const drain = handleAgentEnd(
+				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+			);
+			await parked.p;
+			runtime.resetForSession(Date.now());
+			resume.open();
+			const summary = await drain;
+			// f.ts: its autofix ran, its format was never started. g.ts: its
+			// autofix was never started. b-e.ts: never formatted.
+			expect(
+				summary?.skipped
+					.filter((entry) => entry.reason === "session-replaced")
+					.map((entry) => path.basename(entry.filePath))
+					.sort(),
+			).toEqual(["b.ts", "c.ts", "d.ts", "e.ts", "f.ts", "g.ts"]);
+			for (const fp of formatOnly)
+				expect(fs.readFileSync(fp, "utf8")).toBe("const z=3\n");
+		});
+
 		it("the autofix loop does not start the next file after /new", async () => {
 			const { fixer, parked, resume } = gatedBiome();
 			const fixFileAsync = vi.spyOn(
@@ -869,6 +917,28 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		});
 		expect(disk()).toBe("const x = 1\nconst y=2\n");
 		expect(wire.at(-1)).toBe(disk());
+		// #3528 r2: the queue dropped the older read, so the row does not say synced.
+		expect(postExitRows()).toEqual([
+			expect.objectContaining({ metadata: { outcome: "superseded" } }),
+		]);
+	});
+
+	it("the post-exit row says not-sent when the language server could not start (#3528 r2)", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		lsp.realService = getLSPService;
+		resetLSPService({ reason: "session_shutdown" });
+		lsp.createLSPClient.mockRejectedValue(new Error("spawn failed"));
+		const c = armChild({ write: true });
+		const drain = handleAgentEnd(drainDeps());
+		await c.didRead;
+		await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.agent_settled + 1);
+		await drain;
+		c.openWrite();
+		await c.wrote;
+		await postExitSettled();
+		expect(postExitRows()).toEqual([
+			expect.objectContaining({ metadata: { outcome: "not-sent" } }),
+		]);
 	});
 
 	describe("a drain whose session was replaced touches no language server (#3528 r1 F1)", () => {
