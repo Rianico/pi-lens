@@ -146,20 +146,22 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
 vi.mock("../../clients/lsp-lazy.js", async (importOriginal) => {
 	const actual =
 		await importOriginal<typeof import("../../clients/lsp-lazy.js")>();
+	const { makeLspServiceDouble } =
+		await import("../support/lsp-service-double.js");
 	return {
 		...actual,
 		loadLspService: async () => ({
 			...(await actual.loadLspService()),
 			getLSPService: () => {
 				const service = lsp.service as LSPService;
-				return {
+				return makeLspServiceDouble({
 					supportsLSP: (fp: string) => service.supportsLSP(fp),
 					touchFile: async (...args: Parameters<LSPService["touchFile"]>) => {
 						lsp.drainTouchesWaiting++;
 						await lsp.drainTouch;
 						return service.touchFile(...args);
 					},
-				};
+				}) as unknown as LSPService;
 			},
 		}),
 	};
