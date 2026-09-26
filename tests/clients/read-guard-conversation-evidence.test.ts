@@ -954,6 +954,86 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
+	it("does not cover a line pi truncated from a decorated whole-file raced read", async () => {
+		const env = setupTestEnvironment("rg-3524-truncated-lines-");
+		try {
+			const file = fixture(env.tmpDir, "h.ts", `${lines(2500).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{},
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => {
+						const v = lines(2500);
+						v[4] = "EXTERNAL5";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			// pi showed lines 1-2000; line 2400 was never shown.
+			const edit = await positionalEdit(runtime, file, [[2400, 2400, "blind"]]);
+			expect(edit.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not cover a line pi cut at its byte limit from a decorated limited raced read", async () => {
+		const env = setupTestEnvironment("rg-3524-truncated-bytes-");
+		try {
+			const long = Array.from(
+				{ length: 600 },
+				(_, i) => `const v${i + 1} = "${"x".repeat(150)}";`,
+			);
+			const file = fixture(env.tmpDir, "h2.ts", `${long.join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			const shown = await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 600 },
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => {
+						const v = [...long];
+						v[4] = "EXTERNAL5";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			expect(shown).toMatch(/\[Showing lines 1-307 of 601 \(50\.0KB limit\)/);
+			const edit = await positionalEdit(runtime, file, [[550, 550, "blind"]]);
+			expect(edit.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	for (const limit of [100, 12, 13]) {
+		it(`refuses the shifted line of a decorated raced read with limit ${limit} on a 12-line file`, async () => {
+			const env = setupTestEnvironment("rg-3524-limit-past-end-");
+			try {
+				const file = fixture(env.tmpDir, "y.ts", `${lines(12).join("\n")}\n`);
+				const runtime = newRuntime(env.tmpDir);
+				await piRead(
+					runtime,
+					file,
+					{ offset: 1, limit },
+					{
+						rewrite: (text) => `[other-extension: header note]\n${text}`,
+						gate: () => writeNow(file, `INSERTED\n${lines(12).join("\n")}\n`),
+					},
+				);
+				// The agent saw "line5" at line 5; the disk now holds "line4".
+				const edit = await positionalEdit(runtime, file, [[5, 5, "agent5"]]);
+				expect(edit.blocked).toBe(true);
+			} finally {
+				env.cleanup();
+			}
+		});
+	}
+
 	it("refuses, until a re-read, a line a whole-file raced read showed when the write landed before pi's read", async () => {
 		const env = setupTestEnvironment("rg-3524-countless-before-read-");
 		try {
