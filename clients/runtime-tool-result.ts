@@ -1834,9 +1834,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 									`native-read:${nativeReadToolCallId}:provisional`,
 							)
 					: undefined;
-				const captureHashes = capture?.lineHashes;
-				const capturedLines = captureHashes
-					? Object.keys(captureHashes).length
+				const capturedLines = capture?.lineHashes
+					? Object.keys(capture.lineHashes).length
 					: 0;
 				const delivered =
 					deliveredText &&
@@ -1846,24 +1845,21 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							deliveredText.lineCount === capturedLines)
 						? deliveredText
 						: undefined;
-				const shownLimit =
-					capture &&
-					Math.min(
-						capture.effectiveLimit,
-						truncation?.outputLines ?? Number.POSITIVE_INFINITY,
-						capturedLines,
-					);
-				const captureEvidence = capture &&
-					captureHashes &&
-					shownLimit && {
-						effectiveOffset: capture.effectiveOffset,
-						effectiveLimit: shownLimit,
-						lineHashes: Object.fromEntries(
-							Object.entries(captureHashes).filter(
-								([line]) => Number(line) < capture.effectiveOffset + shownLimit,
-							),
+				const shownLimit = capture
+					? Math.min(
+							capture.effectiveLimit,
+							truncation?.outputLines ?? Number.POSITIVE_INFINITY,
+						)
+					: 0;
+				const captureEvidence = capture?.lineHashes && {
+					effectiveOffset: capture.effectiveOffset,
+					effectiveLimit: shownLimit,
+					lineHashes: Object.fromEntries(
+						Object.entries(capture.lineHashes).filter(
+							([line]) => Number(line) < capture.effectiveOffset + shownLimit,
 						),
-					};
+					),
+				};
 				if (raced) {
 					incrementDegradationCount({
 						kind: "native-read-raced-writer",
