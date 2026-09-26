@@ -1,0 +1,334 @@
+/**
+ * #3541: pi-lens' LSP writers run their read-modify-write inside pi's
+ * per-file mutation queue. Every one of them reaches the disk through
+ * `applyWorkspaceEdit` (clients/lsp/edits.ts): the agent_end actionable
+ * fix, `lsp_navigation`'s applied rename, and a server-initiated
+ * `workspace/applyEdit`. One case per writer drives it through its own
+ * entry point; the seam cases pin the multi-path queue entry.
+ *
+ * pi's queue is the real one. The interleaving is pinned with a gate in
+ * `node:fs/promises` `writeFile`: the writer has read the file and parks
+ * before it writes it back, and the agent's edit (pi's edit tool shape: a
+ * synchronous read-modify-write inside the queue) is made there.
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+// pi's real per-file queue, the one its `edit`/`write` tools run under.
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { createMockState } from "./lsp/mock-client-state.js";
+import { setupTestEnvironment } from "./test-utils.js";
+
+const writeGate = vi.hoisted(() => ({
+	target: undefined as string | undefined,
+	parked: undefined as undefined | (() => void),
+	resume: undefined as undefined | Promise<void>,
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	const writeFile = async (...args: Parameters<typeof actual.writeFile>) => {
+		if (writeGate.target !== undefined && args[0] === writeGate.target) {
+			writeGate.parked?.();
+			await writeGate.resume;
+		}
+		return actual.writeFile(...args);
+	};
+	return { ...actual, default: { ...actual, writeFile }, writeFile };
+});
+
+const lsp = vi.hoisted(() => ({ service: undefined as unknown }));
+vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
+	getLSPService: () => lsp.service,
+}));
+
+import {
+	applyConservativeActionableWarningFixes,
+	type ActionableWarningsReport,
+} from "../../clients/actionable-warnings.js";
+import { setHostFileMutationQueueLoader } from "../../clients/file-mutation-queue.js";
+import { setupIncomingHandlers } from "../../clients/lsp/client.js";
+import { applyWorkspaceEdit } from "../../clients/lsp/edits.js";
+import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
+
+function gate() {
+	let open!: () => void;
+	const p = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	return { p, open };
+}
+
+let env: ReturnType<typeof setupTestEnvironment>;
+let filePath: string;
+
+/** Parks the writer between its read of F and its write of F. */
+function parkWrite() {
+	const parked = gate();
+	const resume = gate();
+	writeGate.target = filePath;
+	writeGate.parked = parked.open;
+	writeGate.resume = resume.p;
+	return { parked: parked.p, resume: resume.open };
+}
+
+/** The agent's edit, the way pi's edit tool makes it: inside pi's queue. */
+function agentAppend(line: string) {
+	let wrote = false;
+	const done = withFileMutationQueue(filePath, async () => {
+		fs.writeFileSync(filePath, `${fs.readFileSync(filePath, "utf8")}${line}`);
+		wrote = true;
+	});
+	return { done, wrote: () => wrote };
+}
+
+/**
+ * Resolves once every queue call made before it has registered: pi chains
+ * registrations through one module-wide promise, so a call on another path
+ * registers after them. An earlier call whose file is free has run by then.
+ */
+function afterQueueRegistration(): Promise<void> {
+	return withFileMutationQueue(
+		path.join(env.tmpDir, "registration-barrier"),
+		async () => {},
+	);
+}
+
+/** Replaces `value` on line 1 with `const`. */
+function valueEdit(target = filePath) {
+	return {
+		changes: {
+			[pathToFileURL(target).href]: [
+				{
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 5 },
+					},
+					newText: "const",
+				},
+			],
+		},
+	};
+}
+
+/**
+ * The case body every writer shares: the writer parks between its read and
+ * its write, the agent edits F through pi's queue, and the agent's edit must
+ * wait for the writer and survive it.
+ */
+async function assertAgentEditSurvives(write: () => Promise<unknown>) {
+	const w = parkWrite();
+	const writer = write();
+	await w.parked;
+	const agent = agentAppend("export const AGENT = 2;\n");
+	await afterQueueRegistration();
+	expect(agent.wrote()).toBe(false);
+	w.resume();
+	await writer;
+	await agent.done;
+	expect(fs.readFileSync(filePath, "utf8")).toBe(
+		"const = 1;\nexport const AGENT = 2;\n",
+	);
+}
+
+beforeEach(() => {
+	env = setupTestEnvironment("pi-lens-lsp-writer-queue-");
+	filePath = path.join(env.tmpDir, "a.ts");
+	fs.writeFileSync(filePath, "value = 1;\n");
+	setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
+});
+
+afterEach(() => {
+	writeGate.target = undefined;
+	writeGate.parked = undefined;
+	writeGate.resume = undefined;
+	lsp.service = undefined;
+	setHostFileMutationQueueLoader(undefined);
+	env.cleanup();
+});
+
+describe("#3541: each LSP writer applies its edit inside pi's mutation queue", () => {
+	it("the agent_end actionable-warning fix does not erase an agent edit made while it applies", async () => {
+		// Project evidence for the eslint tool agreement (tool-agreement.ts).
+		fs.writeFileSync(
+			path.join(env.tmpDir, "package.json"),
+			JSON.stringify({ devDependencies: { eslint: "^9.0.0" } }),
+		);
+		fs.writeFileSync(
+			path.join(env.tmpDir, "package-lock.json"),
+			JSON.stringify({
+				packages: { "node_modules/eslint": { version: "9.0.0" } },
+			}),
+		);
+		lsp.service = makeLspServiceDouble({
+			supportsLSP: () => true,
+			openFile: async () => undefined,
+			codeAction: async () => [
+				{
+					title: "Fix it",
+					kind: "quickfix",
+					isPreferred: true,
+					edit: valueEdit(),
+				},
+			],
+		});
+		const report: ActionableWarningsReport = {
+			generatedAt: new Date().toISOString(),
+			scope: "turn_delta",
+			sessionId: "lsp-writer-queue",
+			turnIndex: 1,
+			projectSeqEnd: 1,
+			deltaOnly: true,
+			includeLspCodeActions: true,
+			files: [
+				{
+					filePath,
+					displayPath: "a.ts",
+					warnings: [
+						{
+							id: "eslint:fix",
+							filePath,
+							displayPath: "a.ts",
+							line: 1,
+							column: 1,
+							severity: "warning",
+							tool: "eslint",
+							message: "fixable warning",
+							actions: [
+								{
+									title: "Fix it",
+									hasEdit: true,
+									hasCommand: false,
+									autoFixEligible: true,
+								},
+							],
+							suppressed: false,
+							origin: "lsp",
+						},
+					],
+				},
+			],
+			summary: {} as ActionableWarningsReport["summary"],
+		};
+		await assertAgentEditSurvives(async () => {
+			const summary = await applyConservativeActionableWarningFixes({
+				cwd: env.tmpDir,
+				report,
+			});
+			expect(summary.applied).toBe(1);
+		});
+	});
+
+	it("lsp_navigation's applied rename does not erase an agent edit made while it applies", async () => {
+		lsp.service = makeLspServiceDouble({
+			supportsLSP: () => true,
+			hasLSP: async () => true,
+			rename: async () => valueEdit(),
+		});
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		await assertAgentEditSurvives(async () => {
+			const result = await tool.execute(
+				"rename-apply-3541",
+				{
+					operation: "rename",
+					path: filePath,
+					line: 1,
+					character: 1,
+					newName: "const",
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBeUndefined();
+		});
+	});
+
+	it("a server-initiated workspace/applyEdit does not erase an agent edit made while it applies", async () => {
+		const state = createMockState({ root: env.tmpDir });
+		// Inside an executeCommand's acceptance window.
+		state.serverEditsAllowed = 1;
+		setupIncomingHandlers(state, {});
+		const calls = vi.mocked(state.connection.onRequest).mock
+			.calls as unknown as Array<[string, (params: unknown) => unknown]>;
+		const applyEdit = calls.find((call) => call[0] === "workspace/applyEdit");
+		await assertAgentEditSurvives(async () => {
+			expect(await applyEdit?.[1]({ edit: valueEdit() })).toEqual({
+				applied: true,
+			});
+		});
+	});
+});
+
+describe("#3541: applyWorkspaceEdit enters every path's queue", () => {
+	it("a text edit does not erase an agent edit made between its read and its write", async () => {
+		await assertAgentEditSurvives(() =>
+			applyWorkspaceEdit(valueEdit(), env.tmpDir),
+		);
+	});
+
+	it("two edits that name the same two files in opposite orders both apply", async () => {
+		const other = path.join(env.tmpDir, "b.ts");
+		fs.writeFileSync(other, "value = 1;\n");
+		const edit = (first: string, second: string) => ({
+			changes: {
+				...valueEdit(first).changes,
+				[pathToFileURL(second).href]: [
+					{
+						range: {
+							start: { line: 0, character: 9 },
+							end: { line: 0, character: 10 },
+						},
+						newText: "; // edited",
+					},
+				],
+			},
+		});
+		const [ab, ba] = await Promise.allSettled([
+			applyWorkspaceEdit(edit(filePath, other), env.tmpDir),
+			applyWorkspaceEdit(edit(other, filePath), env.tmpDir),
+		]);
+		expect(ab.status).toBe("fulfilled");
+		expect(ba.status).toBe("fulfilled");
+	});
+
+	it("an edit that names a file and a symlink to it settles", async () => {
+		const alias = path.join(env.tmpDir, "alias.ts");
+		fs.symlinkSync(filePath, alias);
+		const settled = await Promise.allSettled([
+			applyWorkspaceEdit(
+				{
+					changes: {
+						...valueEdit(filePath).changes,
+						[pathToFileURL(alias).href]: [
+							{
+								range: {
+									start: { line: 0, character: 9 },
+									end: { line: 0, character: 10 },
+								},
+								newText: "; // alias",
+							},
+						],
+					},
+				},
+				env.tmpDir,
+			),
+		]);
+		expect(settled).toHaveLength(1);
+	});
+
+	it("an edit that creates a file applies inside the new path's queue", async () => {
+		const created = path.join(env.tmpDir, "created.ts");
+		const applied = await applyWorkspaceEdit(
+			{
+				documentChanges: [{ kind: "create", uri: pathToFileURL(created).href }],
+			},
+			env.tmpDir,
+		);
+		expect(fs.readFileSync(created, "utf8")).toBe("");
+		expect(applied.operationCounts.create).toBe(1);
+	});
+});

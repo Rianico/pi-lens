@@ -16,6 +16,7 @@ import {
 	type PositionEncoding,
 } from "./position-encoding.js";
 import { recordLspMutation, type LspMutationContext } from "../lsp-mutation.js";
+import { withHostFileMutationQueues } from "../file-mutation-queue.js";
 import {
 	detectLineEnding,
 	normalizeToLF,
@@ -1396,109 +1397,119 @@ export async function applyWorkspaceEdit(
 		fileDetails,
 	});
 	try {
-		prepared = await preflightWorkspaceEdit(planned, cwd, options);
-		for (const op of planned) {
-			const size = operationSize(op);
-			if (op.kind === "text") operationCounts.textEdits += size;
-			else operationCounts[op.kind]++;
-			operationTotal += size;
-		}
-		for (const op of planned) {
-			if (prepared.ignored.has(op)) {
-				skipOperation(op);
-				continue;
+		// #3541: the read-modify-write of every path runs inside pi's mutation
+		// queue, so an agent edit of one of them cannot land between this
+		// edit's read and its write (and be erased by it).
+		const queuePaths = planned.flatMap((op) =>
+			op.kind === "rename"
+				? [uriToDiskPath(op.oldUri), uriToDiskPath(op.newUri)]
+				: [uriToDiskPath(op.uri)],
+		);
+		await withHostFileMutationQueues(queuePaths, async () => {
+			prepared = await preflightWorkspaceEdit(planned, cwd, options);
+			for (const op of planned) {
+				const size = operationSize(op);
+				if (op.kind === "text") operationCounts.textEdits += size;
+				else operationCounts[op.kind]++;
+				operationTotal += size;
 			}
-			if (op.kind === "text") {
-				// Report/key on the normalized path (forward-slash, realpath-canonical),
-				// but read/write the decoded on-disk path so the URI's casing is honored
-				// on win32 (see uriToDiskPath).
-				const filePath = uriToPath(op.uri);
-				const diskPath = uriToDiskPath(op.uri);
-				const edits = prepared.text.get(op) ?? [];
-				if (edits.length === 0) {
+			for (const op of planned) {
+				if (prepared.ignored.has(op)) {
 					skipOperation(op);
 					continue;
 				}
-				const content = await fs.readFile(diskPath, "utf-8");
-				const updated = applyTextEditsToString(content, edits, "utf-16");
-				await fs.writeFile(diskPath, updated, "utf-8");
-				const start = Math.min(
-					...edits.map((item) => item.range.start.line + 1),
-				);
-				const end = Math.max(...edits.map((item) => item.range.end.line + 1));
-				touchedFiles.add(filePath);
-				fileDetails.push({
-					filePath,
-					range: { start, end },
-					importsChanged:
-						importsSignature(content) !== importsSignature(updated),
-				});
-				markApplied(op);
-				descriptions.push(
-					`Applied ${edits.length} edit(s) to ${relativeToCwd(filePath, cwd)}`,
-				);
-			} else if (op.kind === "create") {
-				// Create on the decoded path so `NewFile.txt` is not lowercased on win32;
-				// report/key on the normalized path.
-				const filePath = uriToPath(op.uri);
-				const diskPath = uriToDiskPath(op.uri);
-				await fs.mkdir(path.dirname(diskPath), { recursive: true });
-				if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
-				else await fs.writeFile(diskPath, "", { flag: "wx" });
-				touchedFiles.add(filePath);
-				fileDetails.push({
-					filePath,
-					range: { start: 1, end: 1 },
-					importsChanged: false,
-				});
-				markApplied(op);
-				descriptions.push(`Created ${relativeToCwd(filePath, cwd)}`);
-			} else if (op.kind === "rename") {
-				// Rename on the decoded paths so the destination casing is honored (and a
-				// case-only rename actually changes the name); report on normalized paths.
-				const oldPath = uriToPath(op.oldUri);
-				const newPath = uriToPath(op.newUri);
-				const oldDisk = uriToDiskPath(op.oldUri);
-				const newDisk = uriToDiskPath(op.newUri);
-				await fs.mkdir(path.dirname(newDisk), { recursive: true });
-				if (op.options?.overwrite)
-					await fs.rm(newDisk, { recursive: true, force: true });
-				await fs.rename(oldDisk, newDisk);
-				touchedFiles.add(oldPath);
-				touchedFiles.add(newPath);
-				fileDetails.push(
-					{
-						filePath: oldPath,
+				if (op.kind === "text") {
+					// Report/key on the normalized path (forward-slash, realpath-canonical),
+					// but read/write the decoded on-disk path so the URI's casing is honored
+					// on win32 (see uriToDiskPath).
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					const edits = prepared.text.get(op) ?? [];
+					if (edits.length === 0) {
+						skipOperation(op);
+						continue;
+					}
+					const content = await fs.readFile(diskPath, "utf-8");
+					const updated = applyTextEditsToString(content, edits, "utf-16");
+					await fs.writeFile(diskPath, updated, "utf-8");
+					const start = Math.min(
+						...edits.map((item) => item.range.start.line + 1),
+					);
+					const end = Math.max(...edits.map((item) => item.range.end.line + 1));
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
+						range: { start, end },
+						importsChanged:
+							importsSignature(content) !== importsSignature(updated),
+					});
+					markApplied(op);
+					descriptions.push(
+						`Applied ${edits.length} edit(s) to ${relativeToCwd(filePath, cwd)}`,
+					);
+				} else if (op.kind === "create") {
+					// Create on the decoded path so `NewFile.txt` is not lowercased on win32;
+					// report/key on the normalized path.
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					await fs.mkdir(path.dirname(diskPath), { recursive: true });
+					if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
+					else await fs.writeFile(diskPath, "", { flag: "wx" });
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
+						range: { start: 1, end: 1 },
+						importsChanged: false,
+					});
+					markApplied(op);
+					descriptions.push(`Created ${relativeToCwd(filePath, cwd)}`);
+				} else if (op.kind === "rename") {
+					// Rename on the decoded paths so the destination casing is honored (and a
+					// case-only rename actually changes the name); report on normalized paths.
+					const oldPath = uriToPath(op.oldUri);
+					const newPath = uriToPath(op.newUri);
+					const oldDisk = uriToDiskPath(op.oldUri);
+					const newDisk = uriToDiskPath(op.newUri);
+					await fs.mkdir(path.dirname(newDisk), { recursive: true });
+					if (op.options?.overwrite)
+						await fs.rm(newDisk, { recursive: true, force: true });
+					await fs.rename(oldDisk, newDisk);
+					touchedFiles.add(oldPath);
+					touchedFiles.add(newPath);
+					fileDetails.push(
+						{
+							filePath: oldPath,
+							range: { start: 1, end: 1 },
+							importsChanged: true,
+						},
+						{
+							filePath: newPath,
+							range: { start: 1, end: 1 },
+							importsChanged: true,
+						},
+					);
+					markApplied(op);
+					descriptions.push(
+						`Renamed ${relativeToCwd(oldPath, cwd)} → ${relativeToCwd(newPath, cwd)}`,
+					);
+				} else {
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					await fs.rm(diskPath, {
+						recursive: op.options?.recursive === true,
+						force: false,
+					});
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
 						range: { start: 1, end: 1 },
 						importsChanged: true,
-					},
-					{
-						filePath: newPath,
-						range: { start: 1, end: 1 },
-						importsChanged: true,
-					},
-				);
-				markApplied(op);
-				descriptions.push(
-					`Renamed ${relativeToCwd(oldPath, cwd)} → ${relativeToCwd(newPath, cwd)}`,
-				);
-			} else {
-				const filePath = uriToPath(op.uri);
-				const diskPath = uriToDiskPath(op.uri);
-				await fs.rm(diskPath, {
-					recursive: op.options?.recursive === true,
-					force: false,
-				});
-				touchedFiles.add(filePath);
-				fileDetails.push({
-					filePath,
-					range: { start: 1, end: 1 },
-					importsChanged: true,
-				});
-				markApplied(op);
-				descriptions.push(`Deleted ${relativeToCwd(filePath, cwd)}`);
+					});
+					markApplied(op);
+					descriptions.push(`Deleted ${relativeToCwd(filePath, cwd)}`);
+				}
 			}
-		}
+		});
 	} catch (err) {
 		const partial = makeResult();
 		if (options.mutationContext && options.observe !== false) {
