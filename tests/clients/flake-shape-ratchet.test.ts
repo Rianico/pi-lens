@@ -415,6 +415,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the real pinned npm child is required to reproduce lockfile optional-binding rewrites; a process double cannot validate npm behavior",
 	},
+	// 2026-09-26 (#3531): the CLI smoke test spawns a real node child to prove
+	// scripts/mutation-report.mjs's own argv parsing (--report/--out) and
+	// file I/O; an in-process call would just re-exercise the exported render
+	// function the other describe block already covers.
+	"real-process-spawn:scripts/mutation-report-render.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI entry script's own argv parsing and file I/O is the subject; an in-process call re-tests only the exported render function",
+	},
 	// 2026-09-07 (#2613 review S2/T3): --dry-run env-reading/report-building
 	// wiring is the subject; the real `gh` calls stay untested, same
 	// documented exception as the sibling scripts/notify-clean-signal-drift.mjs.

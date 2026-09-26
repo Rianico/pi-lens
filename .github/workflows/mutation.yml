@@ -36,10 +36,60 @@ jobs:
       # "no mutants evaluated" report never printed. The 30-minute margin covers
       # npm ci, npm run build, Stryker's in-place sandbox restore on SIGTERM, and
       # the report upload. tests/scripts/stryker-diff.test.ts pins the relation.
+      #
+      # #3531 rescope: the driver also mutates clients/**/*.ts, tools/**/*.ts,
+      # mcp/**/*.ts and index.ts (through their compiled .js -- see
+      # scripts/stryker-diff.mjs), building its own tsconfig.mutation.json
+      # source maps internally; no separate build step is needed here for that.
       - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6
+      # Always runs, even when the step above exited non-zero (a 0-mutant run
+      # is not a step failure by itself, but the driver still exits 1 for a
+      # genuine Stryker failure such as a budget timeout) -- #3531's "a 0-
+      # mutant run must never read as a clean pass" applies to a run that
+      # never got this far too, so the summary has to render regardless.
+      - name: Render job summary
+        if: always()
+        run: node scripts/mutation-report.mjs --out "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: mutation-report
           path: reports/mutation/mutation.json
           if-no-files-found: ignore
+
+  mutation-comment:
+    name: mutation comment (advisory)
+    needs: mutation
+    # Fork PRs: a fork PR's default GITHUB_TOKEN is read-only against this repo
+    # regardless of the `permissions:` block below, so `gh api` POST/PATCH
+    # below would just 403. Skip the whole job rather than let it fail loudly
+    # for something it cannot do; the mutation job's own job summary (written
+    # unconditionally, no token scope needed) still covers a fork PR.
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      # #3151 (install-smoke.yml): the comment target is a pull request;
+      # `issues: write` alone was refused with 403 "Resource not accessible
+      # by integration".
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: mutation-report
+          path: reports/mutation
+      - name: Post or update the sticky mutation comment
+        if: hashFiles('reports/mutation/mutation.json') != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/mutation-pr-comment.mjs --pr "${{ github.event.pull_request.number }}"

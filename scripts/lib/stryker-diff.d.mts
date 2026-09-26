@@ -1,4 +1,5 @@
 export declare const DEFAULT_MAX_FILES: 6;
+export declare const DEFAULT_MAX_RANGES: 40;
 export declare const MUTATION_BUDGET_MINUTES: 60;
 export declare function capMutationFiles(
 	files: string[],
@@ -10,6 +11,9 @@ export declare function formatCapNotice(
 	skipped: string[],
 ): string;
 export declare const isScriptMutationFile: (file: string) => boolean;
+export declare const isCompiledMutationSource: (file: string) => boolean;
+export declare const isMutationSourceFile: (file: string) => boolean;
+export declare const compiledJsPath: (file: string) => string;
 export declare function mapRelatedTests(
 	changedFiles: string[],
 	options?: {
@@ -37,3 +41,17 @@ export declare function describeStrykerFailure(
 	},
 	budgetMinutes: number,
 ): string;
+export declare function sampleRangesDeterministically(
+	patterns: string[],
+	limit: number,
+	seed: string,
+): { selected: string[]; sampled: boolean };
+export declare function extractSnippet(
+	sourceLines: string[],
+	location:
+		| {
+				start: { line: number; column: number };
+				end: { line: number; column: number };
+		  }
+		| undefined,
+): string | undefined;

@@ -121,6 +121,19 @@ can trip, and say in your report which you ran and what each returned.
   in your worktree, leave the new test in place, rebuild, and confirm the test
   goes red. A guard whose removal keeps the suite green is vacuous and the test
   proves nothing (#1887).
+- **Read the PR's Stryker report first (#3531).** The `Mutation diff` workflow
+  posts a sticky PR comment listing survivors (file:line, mutator, original →
+  replacement) on the PR's changed lines under `scripts/**/*.mjs`,
+  `clients/**/*.ts`, `tools/**/*.ts`, `mcp/**/*.ts`, and `index.ts`. Read it
+  (or the `mutation-report` artifact via `node scripts/mutation-report.mjs
+  --report <downloaded mutation.json>`) before hand-mutation-probing anything
+  it already covers -- duplicating a probe Stryker already ran and reported is
+  wasted round time. Every survivor on the diff's own changed lines is either
+  killed by a new test in this round or named and justified in the PR body; an
+  unaddressed, unjustified survivor is a finding. A 0-mutant run (the comment
+  always states why) is not itself a finding, but it also buys the PR no
+  credit -- the standing hand-mutation probe above still applies to whatever
+  Stryker didn't evaluate.
 - **Changelog fragment front matter.** The fragment needs YAML front matter
   with a `section:` key set to one of Added, Changed, Deprecated, Removed,
   Fixed, or Security, followed by exactly one top-level entry. Title

@@ -66,6 +66,23 @@ the cost of not doing so.
    Quote the mutation TABLE, one row per direction per new conditional — a
    single quoted direction proves only that direction, not the guard (#3156
    r2 and #3168 r1 each shipped a one-directional pin under a ticked box).
+   **Read the PR's Stryker report first (#3531).** The `Mutation diff`
+   workflow mutates the PR's changed lines under `scripts/**/*.mjs`,
+   `clients/**/*.ts`, `tools/**/*.ts`, `mcp/**/*.ts`, and `index.ts` (the
+   last four through their compiled `.js`, mapped back to `.ts` file:line)
+   and posts a sticky PR comment listing every survivor. Before hand-mutating
+   anything yourself, read that comment (or the uploaded `mutation-report`
+   artifact locally via `node scripts/mutation-report.mjs --report
+   <downloaded mutation.json>`). Hand-mutate only what Stryker cannot express
+   at all: a seam the diff didn't touch, a multi-line or cross-statement
+   mutant, or a guard on a line the diff's own hunk doesn't cover. Every
+   survivor Stryker lists on your diff is either killed by a new test in this
+   round or named and justified in the PR body — a survivor left unaddressed
+   with no comment is a finding the next review round will raise. The lane is
+   advisory and can evaluate 0 mutants (over `--max-files`, no covering test,
+   a type-only/comment-only hunk, or a budget timeout) -- its comment always
+   says which, and a 0-mutant run is never grounds to skip the hand-mutation
+   table above.
    Platform rule: a test that asserts a Windows-only property runs ONLY on
    Windows dev boxes; the authoritative Unit tests lane is ubuntu. Every
    `skipIf(process.platform …)` names the lane that runs it or reads

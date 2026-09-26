@@ -3,13 +3,19 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
 	capMutationFiles,
+	compiledJsPath,
 	describeStrykerFailure,
+	DEFAULT_MAX_RANGES,
+	extractSnippet,
 	formatCapNotice,
+	isCompiledMutationSource,
+	isMutationSourceFile,
 	isScriptMutationFile,
 	mapRelatedTests,
 	MUTATION_BUDGET_MINUTES,
 	mutationRangePatterns,
 	parseChangedLineRanges,
+	sampleRangesDeterministically,
 } from "../../scripts/lib/stryker-diff.mjs";
 
 const config = readFileSync(
@@ -98,7 +104,7 @@ describe("stryker diff selection", () => {
 		expect(result.selected).toEqual(["scripts/a.mjs", "scripts/m.mjs"]);
 		expect(result.skipped).toEqual(["scripts/z.mjs"]);
 		expect(formatCapNotice(2, 3, result.skipped)).toBe(
-			"capped: 2 of 3 changed scripts mutated; skipped: scripts/z.mjs",
+			"capped: 2 of 3 changed files mutated; skipped: scripts/z.mjs",
 		);
 	});
 
@@ -273,5 +279,180 @@ describe("stryker diff wall-clock budget", () => {
 		expect(driver).toContain("--budget-minutes");
 		expect(driver).toContain("mutationRangePatterns");
 		expect(driver).toContain("describeStrykerFailure");
+	});
+
+	it("never lets a post-instrument buildCommand run (the #3531 clobber the fix guards against)", () => {
+		// Recurrence: Stryker writes the instrumented (mutation-switch-embedded)
+		// `.js` to disk during sandbox init, BEFORE buildCommand runs -- a real
+		// rebuild there would silently overwrite it before a single mutant test
+		// executes (verified against Stryker's own Sandbox/MutantInstrumenter
+		// source, 2026-09-26). The driver must never restore "npm run build" as
+		// buildCommand for this lane.
+		expect(driver).toContain("mutation-touch-build.mjs");
+		expect(driver).not.toContain('buildCommand: "npm run build"');
+	});
+});
+
+describe("compiled-source mutation targets (#3531 rescope)", () => {
+	it("classifies clients/tools/mcp .ts sources and the root index.ts, excluding tests and .d.ts", () => {
+		expect(isCompiledMutationSource("clients/atomic-write.ts")).toBe(true);
+		expect(isCompiledMutationSource("clients/lsp/inferred-project.ts")).toBe(
+			true,
+		);
+		expect(isCompiledMutationSource("tools/lens-diagnostics.ts")).toBe(true);
+		expect(isCompiledMutationSource("mcp/server.ts")).toBe(true);
+		expect(isCompiledMutationSource("index.ts")).toBe(true);
+
+		expect(isCompiledMutationSource("clients/atomic-write.test.ts")).toBe(
+			false,
+		);
+		expect(isCompiledMutationSource("clients/some-types.d.ts")).toBe(false);
+		expect(isCompiledMutationSource("scripts/lib/ci-checks.mjs")).toBe(false);
+		expect(isCompiledMutationSource("tests/clients/atomic-write.test.ts")).toBe(
+			false,
+		);
+		// Recurrence: mutating the .ts source directly (rather than the
+		// compiled .js the tests execute) produces vacuous mutants -- the
+		// scripts-only classifier must stay false for every compiled class.
+		expect(isScriptMutationFile("clients/atomic-write.ts")).toBe(false);
+	});
+
+	it("computes the compiled sibling with no outDir remap", () => {
+		// Recurrence: tsconfig.build.json has no outDir, so tsc writes .js next
+		// to .ts (verified against a real build, 2026-09-26) -- a compiledJsPath
+		// that assumed a dist/ prefix would point at a file that never exists.
+		expect(compiledJsPath("clients/atomic-write.ts")).toBe(
+			"clients/atomic-write.js",
+		);
+		expect(compiledJsPath("clients/lsp/inferred-project.ts")).toBe(
+			"clients/lsp/inferred-project.js",
+		);
+		expect(compiledJsPath("index.ts")).toBe("index.js");
+	});
+
+	it("is a mutation source file through the union, whether scripted or compiled", () => {
+		expect(isMutationSourceFile("scripts/lib/ci-checks.mjs")).toBe(true);
+		expect(isMutationSourceFile("clients/atomic-write.ts")).toBe(true);
+		expect(isMutationSourceFile("docs/pi-lens-monitor.md")).toBe(false);
+	});
+});
+
+describe("mapRelatedTests generalized to compiled sources", () => {
+	it("matches a compiled source's test import even though tests import the .js specifier", () => {
+		// Recurrence: TypeScript's nodenext resolution (and this repo's own
+		// tests, e.g. tests/index-wiring.test.ts importing "../index.js")
+		// import a compiled source by its .js specifier, never .ts -- the
+		// normalizer must strip both extensions to match them.
+		const result = mapRelatedTests(["clients/atomic-write.ts"], {
+			testFiles: ["tests/clients/gzip-stage-write.test.ts"],
+			readFile: () =>
+				'import { STAGE_TMP_PATTERN } from "../../clients/atomic-write.js";',
+		});
+
+		expect(result.related.get("clients/atomic-write.ts")).toEqual(
+			new Set(["tests/clients/gzip-stage-write.test.ts"]),
+		);
+		expect(result.covered).toEqual(["clients/atomic-write.ts"]);
+	});
+
+	it("matches the conventional tests/<dir>/<name>.test.ts sibling for a compiled source", () => {
+		const result = mapRelatedTests(["clients/atomic-write.ts"], {
+			testFiles: ["tests/clients/atomic-write.test.ts"],
+			readFile: () => "",
+		});
+
+		expect(result.related.get("clients/atomic-write.ts")).toEqual(
+			new Set(["tests/clients/atomic-write.test.ts"]),
+		);
+	});
+
+	it("reports a covered compiled source alongside an uncovered one in the same call", () => {
+		const result = mapRelatedTests(
+			["clients/atomic-write.ts", "clients/uncovered-thing.ts"],
+			{
+				testFiles: ["tests/clients/atomic-write.test.ts"],
+				readFile: () => "",
+			},
+		);
+
+		expect(result.covered).toEqual(["clients/atomic-write.ts"]);
+		expect(result.uncovered).toEqual(["clients/uncovered-thing.ts"]);
+	});
+});
+
+describe("sampleRangesDeterministically (#3531 budget sampling)", () => {
+	it("keeps every pattern unchanged, and reports no sampling, under the limit", () => {
+		const patterns = ["a.js:1-1", "b.js:2-2"];
+		expect(sampleRangesDeterministically(patterns, 5, "sha-1")).toEqual({
+			selected: patterns,
+			sampled: false,
+		});
+	});
+
+	it("is deterministic for the same seed: repeated calls select the identical subset", () => {
+		const patterns = Array.from({ length: 50 }, (_, i) => `f${i}.js:${i}-${i}`);
+		const first = sampleRangesDeterministically(patterns, 10, "head-sha-abc");
+		const second = sampleRangesDeterministically(patterns, 10, "head-sha-abc");
+
+		expect(first.sampled).toBe(true);
+		expect(first.selected).toHaveLength(10);
+		expect(second.selected).toEqual(first.selected);
+	});
+
+	it("samples a different subset for a different seed (a different head SHA)", () => {
+		// Recurrence: a sample that ignores the seed is either fixed (always
+		// the same slice, hiding whichever mutants sort last) or effectively
+		// random (Math.random()) -- neither is reproducible per-PR-head. This
+		// does not prove every seed differs, only that the seed is load-bearing
+		// for at least one representative pair.
+		const patterns = Array.from({ length: 50 }, (_, i) => `f${i}.js:${i}-${i}`);
+		const a = sampleRangesDeterministically(patterns, 10, "sha-aaaa");
+		const b = sampleRangesDeterministically(patterns, 10, "sha-bbbb");
+
+		expect(a.selected).not.toEqual(b.selected);
+	});
+
+	it("preserves the input order of the selected patterns", () => {
+		const patterns = Array.from({ length: 30 }, (_, i) => `f${i}.js:${i}-${i}`);
+		const { selected } = sampleRangesDeterministically(patterns, 10, "seed");
+		const indices = selected.map((pattern) => patterns.indexOf(pattern));
+		expect(indices).toEqual([...indices].sort((x, y) => x - y));
+	});
+
+	it("keeps the run's own default range budget positive and finite", () => {
+		expect(DEFAULT_MAX_RANGES).toBeGreaterThan(0);
+		expect(Number.isFinite(DEFAULT_MAX_RANGES)).toBe(true);
+	});
+});
+
+describe("extractSnippet (survivor original-text extraction)", () => {
+	const sourceLines = [
+		"\tif (!Number.isInteger(maxFiles) || maxFiles < 0) {",
+		'\t\tthrow new RangeError("x");',
+		"\t}",
+	];
+
+	it("slices the exact 1-based column span of a single-line mutant location", () => {
+		// Pinned against a real Stryker report (scripts/lib/stryker-diff.mjs:56,
+		// columns 6-49), 2026-09-26.
+		expect(
+			extractSnippet(sourceLines, {
+				start: { line: 1, column: 6 },
+				end: { line: 1, column: 49 },
+			}),
+		).toBe("!Number.isInteger(maxFiles) || maxFiles < 0");
+	});
+
+	it("truncates a multi-line span to its first line with a marker", () => {
+		expect(
+			extractSnippet(sourceLines, {
+				start: { line: 1, column: 51 },
+				end: { line: 3, column: 2 },
+			}),
+		).toBe("{ … (multi-line)");
+	});
+
+	it("returns undefined when the mutant carries no location", () => {
+		expect(extractSnippet(sourceLines, undefined)).toBeUndefined();
 	});
 });
