@@ -2212,6 +2212,12 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// the npm-shim rung beside them, and none can take a hook's signal until
 	// #2523 AC4 threads it through the deps types.
 	"clients/dispatch/runners/utils/runner-helpers.ts": 37,
+	// #3541: `withHostFileMutationQueues` awaits the realpath of each path an
+	// LSP workspace edit names, which keys it the way pi keys its queue. It
+	// runs inside `applyWorkspaceEdit`, which the agent_settled actionable fix
+	// already awaits without a bound (#2523 slice 2's row for
+	// `applyConservativeActionableWarningFixes`); no hook signal reaches it.
+	"clients/file-mutation-queue.ts": 1,
 	"clients/file-time.ts": 1,
 	"clients/file-utils.ts": 1,
 	"clients/format-service.ts": 4,
@@ -2234,7 +2240,12 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// the other 43 `await which(...)` sites in this module spend, which is
 	// exactly the "bound at the leaf, unreachable from the hook" shape this
 	// pin exists to keep visible rather than to bless.
-	"clients/formatters.ts": 115,
+	// then 115 → 116 (#3558): `formatFile` awaits entering pi's per-file
+	// mutation queue (`enter`) once the command is resolved, where
+	// `runFormatPhase` used to await it before the resolution (pipeline.ts
+	// below loses that await). The wait is the fix: an agent edit of the same
+	// file finishes first. The run is inside the format service's `bounded()`.
+	"clients/formatters.ts": 116,
 	"clients/gitleaks-client.ts": 4,
 	// #1892: the turn-end secrets LANE, extracted out of `runtime-turn.ts` with
 	// no behaviour change. Its one unbounded await is `collect`'s
@@ -2349,7 +2360,10 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// edits back). The queue wait is the fix (an agent edit of the same file
 	// must finish first); the pipeline itself stays inside the handler's
 	// bounded().
-	"clients/pipeline.ts": 61,
+	// 61 → 60 (#3558): `runFormatPhase` no longer enters the queue before the
+	// formatter; `formatters.formatFile` enters it after the command
+	// resolution (formatters.ts above gains that await).
+	"clients/pipeline.ts": 60,
 	"clients/project-changes.ts": 2,
 	"clients/project-snapshot.ts": 2,
 	"clients/quiet-window.ts": 6,
