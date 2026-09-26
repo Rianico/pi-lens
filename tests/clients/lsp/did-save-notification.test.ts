@@ -303,6 +303,46 @@ describe("textDocument/didSave on a declared save (#3405)", () => {
 		});
 	});
 
+	it.each([
+		["fallback didOpen", false, ["textDocument/didOpen"]],
+		["didChange", true, ["textDocument/didOpen", "textDocument/didChange"]],
+	] as const)(
+		"sends no didSave for a save a change carries when its %s never left the process",
+		async (_branch, openFirst, expected) => {
+			state.saveOptions = { includeText: false };
+			if (openFirst)
+				await handleNotifyOpen(
+					state,
+					TEST_FILE,
+					"const x = 0;\n",
+					"typescript",
+					false,
+					true,
+				);
+			vi.mocked(state.connection.sendNotification).mockRejectedValueOnce(
+				Object.assign(new Error("write after end"), {
+					code: "ERR_STREAM_WRITE_AFTER_END",
+				}),
+			);
+			const saved = handleNotifyOpen(
+				state,
+				TEST_FILE,
+				"const x = 1;\n",
+				"typescript",
+				false,
+				true,
+				true,
+			);
+			const superseding = handleNotifyChange(
+				state,
+				TEST_FILE,
+				"const x = 2;\n",
+			);
+			await Promise.all([saved, superseding]);
+			expect(sentMethods(state)).toEqual(expected);
+		},
+	);
+
 	it("sends no didSave after a change that carries no save", async () => {
 		state.saveOptions = { includeText: false };
 		await handleNotifyChange(state, TEST_FILE, "const x = 1;\n");
