@@ -459,7 +459,7 @@ describe("formal/store-freshness workspace-cache replays (#3505)", () => {
 		}
 
 		it(
-			"FixWorkspacePullBinding no-drop (#3505 b): an answer bound to the bytes pi-lens sent is served from cache on the next sweep",
+			"WorkspaceOwnPullPostHocHash no-drop (#3505 b): an answer bound to the bytes pi-lens sent is served from cache on the next sweep",
 			async () => {
 				process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
 				try {
