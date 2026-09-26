@@ -352,7 +352,7 @@ export interface ReadWidening {
 	/** The file the tool_call resolved (absolute), for the record. */
 	filePath: string;
 	/**
-	 * The read's `path` input as the tool_call left it. The tool_result
+	 * The read's raw file input as the tool_call left it. The tool_result
 	 * matches on this, since it resolves paths without the tool_call's host
 	 * variant ladder, and a reused id may name another file.
 	 */

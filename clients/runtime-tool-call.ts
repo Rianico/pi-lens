@@ -967,7 +967,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				if (toolCallId !== undefined) {
 					runtime.recordReadWidening(toolCallId, {
 						filePath,
-						inputPath: readInput.path ?? readInput.filePath,
+						inputPath: rawFilePath,
 						requested: {
 							offset: requestedReadOffset,
 							limit: requestedReadLimit,

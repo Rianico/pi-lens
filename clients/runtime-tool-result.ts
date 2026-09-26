@@ -1238,7 +1238,6 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// A read tool_call that returned early never dropped a stale entry for its
 	// id, so the file has to match too.
 	const executedRead = event.input as {
-		path?: unknown;
 		filePath?: unknown;
 		offset?: unknown;
 		limit?: unknown;
@@ -1246,7 +1245,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	const notedWidening =
 		readWidening &&
 		event.isError !== true &&
-		(executedRead.path ?? executedRead.filePath) === readWidening.inputPath &&
+		(rawFilePath ?? executedRead.filePath) === readWidening.inputPath &&
 		executedRead.offset === readWidening.shown.offset &&
 		executedRead.limit === readWidening.shown.limit
 			? readWidening
@@ -1829,8 +1828,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						? (deps.readGuard
 								.getReadHistory(deliveredFilePath)
 								.find(
-									(record) =>
-										record.source ===
+									(candidate) =>
+										candidate.source ===
 										`native-read:${nativeReadToolCallId}:provisional`,
 								)?.lineHashes ?? {})
 						: undefined;
