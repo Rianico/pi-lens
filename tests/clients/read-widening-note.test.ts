@@ -414,20 +414,19 @@ describe("#3555: an unwidened read carries no note", () => {
 		try {
 			const a = path.join(env.tmpDir, "a.ts");
 			fs.writeFileSync(a, lines(40).join("\n"));
-			const b = path.join(env.tmpDir, "b.txt");
-			fs.writeFileSync(b, lines(40, "bee").join("\n"));
 			const runtime = newRuntime(env.tmpDir);
+			const treeSitter = stubTreeSitter(9, 19, "handler");
 			await readToolCall(
 				runtime,
 				"call_1",
 				{ path: a, offset: 12, limit: 3 },
-				{ treeSitter: stubTreeSitter(9, 19, "handler") },
+				{ treeSitter },
 			);
-			// Lines 10-20 of a file expansion does not understand: not widened.
+			// The same file, asking for exactly the symbol: nothing to widen.
 			const later = await piRead(
 				runtime,
-				{ path: b, offset: 10, limit: 11 },
-				{ toolCallId: "call_1" },
+				{ path: a, offset: 10, limit: 11 },
+				{ toolCallId: "call_1", treeSitter },
 			);
 			expect([later.input.offset, later.input.limit]).toEqual([10, 11]);
 			expect(later.content).toEqual(later.host);
