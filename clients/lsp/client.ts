@@ -3853,6 +3853,8 @@ export async function clientRequestWorkspaceDiagnostics(
 		items?: Array<{
 			uri?: string;
 			kind?: string;
+			/** The document version the report is for; null when not open. */
+			version?: number | null;
 			resultId?: string;
 			items?: LSPDiagnostic[];
 		}>;
@@ -3964,15 +3966,21 @@ export async function clientRequestWorkspaceDiagnostics(
 			// "full" (or a non-conforming server omitting `kind`, per the LSP
 			// default) — recompute and re-fingerprint.
 			const diagnostics = normalizeLspDiagnostics(item.items ?? []);
-			// #1104: fingerprint the file bytes active AT REQUEST TIME. Best-effort —
-			// a read failure (deleted/unreadable mid-sweep) just leaves contentHash
-			// undefined, so the binding reads honestly "unknown", never fabricated.
-			let contentHash: string | undefined;
-			try {
-				contentHash = hashDiagnosticContent(await readFile(filePath, "utf-8"));
-			} catch {
-				contentHash = undefined;
-			}
+			// #3505 (b): bind the answer to the bytes pi-lens SENT the server, the
+			// same `documentContentHashes` record the push binding (#1095) uses.
+			// The #1104 disk read after the answer described the post-edit bytes
+			// whenever the file was written while the server was answering, so the
+			// pre-edit verdict was cached as bound to them. Only an open document
+			// whose reported version is the one pi-lens last sent is bound; any
+			// other answer (a file the server read itself, a lagging version) is
+			// unbound, and the sweep does not cache it.
+			const sent = state.openDocuments.has(normalizedPath)
+				? state.documentContentHashes.get(normalizedPath)
+				: undefined;
+			const contentHash =
+				sent !== undefined && sent.version === item.version
+					? sent.hash
+					: undefined;
 			if (item.resultId !== undefined) {
 				if (
 					state.workspacePullResultCache.size >= WORKSPACE_PULL_RESULT_CACHE_MAX

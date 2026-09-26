@@ -934,12 +934,13 @@ export interface LSPWorkspaceDiagnosticResult {
 	 * #1104: sha256 of the file bytes this result's diagnostics were computed
 	 * against, when known — from the pull path's server-answered `resultId`
 	 * flow (a "full" `workspace/diagnostic`/`textDocument/diagnostic` report is
-	 * fingerprinted at request time; an "unchanged" report inherits the prior
-	 * fingerprint) or, for a per-file touch, the SAME `contentHash` the #1095
-	 * push-path binding records. Absent means "no hash available" (never
-	 * fabricated) — the cache-record site below then honestly stores no
-	 * contentHash and a later `lookup()`'s binding reads "unknown", exactly the
-	 * pre-#1104 behavior for that entry.
+	 * bound to the content pi-lens last sent the server (#3505 b); an
+	 * "unchanged" report inherits the prior fingerprint) or, for a per-file
+	 * touch, the SAME `contentHash` the #1095 push-path binding records. Absent
+	 * means "no hash available" (never fabricated) — the cache-record site below
+	 * then honestly stores no contentHash and a later `lookup()`'s binding reads
+	 * "unknown", exactly the pre-#1104 behavior for that entry. A workspace
+	 * pull answer without one is not recorded at all (#3505 b).
 	 */
 	contentHash?: string;
 	/**
@@ -9207,6 +9208,10 @@ export class LSPService {
 			cachedResults.map((result) => normalizeMapKey(result.filePath)),
 		);
 		const supersededCacheKeys = new Set<string>();
+		// #3505 (b): files a workspace pull answered this sweep. Their answer is
+		// persisted only when it is bound to bytes pi-lens sent (see the record
+		// loop below).
+		const pullAnsweredFiles = new Set<string>();
 		// Per-file scan mtime captured as each file completes below, so a
 		// confirmed fresh result can be written back into the cache with the
 		// mtime it was ACTUALLY scanned at (not re-stat'd after the fact, which
@@ -9709,6 +9714,7 @@ export class LSPService {
 										normalizeMapKey(result.filePath),
 									),
 								});
+								pullAnsweredFiles.add(result.filePath);
 								// #671: a pull result is always confirmed (see
 								// `tryWorkspacePull`'s doc comment), so it's cache-eligible
 								// too — best-effort stat since the pull already resolved the
@@ -9894,6 +9900,19 @@ export class LSPService {
 				(result.unconfirmedServerIds?.length ?? 0) > 0 ||
 				scannedAt === undefined
 			) {
+				continue;
+			}
+			// #3505 (b): a pull answer is persisted only when it is bound to the
+			// bytes pi-lens sent the server. Its stat is taken after the answer, so
+			// without that binding a write that landed while the server answered
+			// is recorded as the entry's own state and the pre-edit verdict is
+			// served from cache. The answer still reaches this sweep's results;
+			// the entry it supersedes (#1782) is dropped rather than replayed.
+			if (
+				pullAnsweredFiles.has(result.filePath) &&
+				result.contentHash === undefined
+			) {
+				workspaceDiagnosticsCacheCtx.forget(result.filePath);
 				continue;
 			}
 			// #1104: thread the per-result `contentHash` (from either the
