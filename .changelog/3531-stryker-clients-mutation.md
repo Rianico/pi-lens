@@ -33,6 +33,11 @@ section: Changed
   sticky comment always show the "sampled N of M" note, even on that
   zero-mutant path). A partial run's reason no longer contradicts its own "N
   of M evaluated" banner by claiming no mutants were evaluated, and the stale
-  notice on a head that produced no report distinguishes a run the
-  workflow's own per-PR concurrency group cancelled from one that actually
-  crashed or hit its time cap, when GitHub says which. Still advisory.
+  notice on a head that produced no report names a `cancelled` upstream job
+  as either a newer push superseding it or the job hitting its own time
+  limit (GitHub reports both the same way, so the wording no longer picks
+  one), separate from a neutral crash/time-cap wording when the upstream
+  result says neither. The report renderer itself now backstops a 0-mutant,
+  non-partial result at the render seam, so it can never read as a clean
+  pass even if a future change to the driver's own branching slips past that
+  guard. Still advisory.

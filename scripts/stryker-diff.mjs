@@ -605,8 +605,24 @@ for (;;) {
 		strykerReport,
 		compiledIndexByJsFile,
 	);
+	// round 4 R3-1: computed ONCE, right after augmentAndSummarize, and every
+	// branch below reads ITS decision (`outcome.zeroMutants`) rather than
+	// re-deriving `mutants.length > 0` as an inline duplicate -- the review
+	// found that raw duplicate removable (mutated to `>= 0`) with all four
+	// mutation test files still green, since nothing but this one `if` ever
+	// looked at it. `renderMutationMarkdown` (`scripts/lib/mutation-report-
+	// render.mjs`) also backstops this at the render seam independent of the
+	// driver, in case a later branch reintroduces the same gap.
+	const outcome = decideMutationOutcome({
+		interrupted: false,
+		mutants,
+		sampled,
+		rangesEvaluated: triedPatterns.length,
+		rangesTotal: allPatterns.length,
+		totalMutants: costEstimate?.totalMutants ?? null,
+	});
 
-	if (mutants.length > 0) {
+	if (!outcome.zeroMutants) {
 		console.log(`mutation diff score: ${score}`);
 		console.log(`mutation diff counts: ${JSON.stringify(counts)}`);
 		logSurvivors(mutants);
@@ -648,14 +664,6 @@ for (;;) {
 	attempt += 1;
 
 	if (!plan.retry || remainingBudgetMs() <= 0) {
-		const outcome = decideMutationOutcome({
-			interrupted: false,
-			mutants,
-			sampled,
-			rangesEvaluated: triedPatterns.length,
-			rangesTotal: allPatterns.length,
-			totalMutants: costEstimate?.totalMutants ?? null,
-		});
 		console.log(
 			`mutation diff: no mutants evaluated; ${outcome.zeroMutants.reason}`,
 		);

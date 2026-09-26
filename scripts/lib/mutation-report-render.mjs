@@ -50,11 +50,36 @@ export function renderMutationMarkdown(report) {
 		? `_Sampled ${meta.rangesEvaluated ?? "?"} of ${meta.rangesTotal ?? "?"} changed-line ranges deterministically (seed \`${shortSha(meta.headSha)}\`)._`
 		: null;
 
-	if (meta.zeroMutants) {
+	const counts = meta.counts ?? {};
+	const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+
+	// round 4 R3-1: a backstop at the render seam, independent of which
+	// driver branch wrote the report. Every driver path that evaluates zero
+	// mutants is SUPPOSED to set `meta.zeroMutants`, and every interrupted
+	// path with a usable result is SUPPOSED to set `meta.partial` -- but the
+	// review found the driver's own success-vs-zero and partial-vs-zero `if`s
+	// still readable as removable duplicates: mutating either one (`if
+	// (mutants.length > 0)` to `>= 0`, or `if (outcome.partial)` to `false`)
+	// produced a report with NEITHER `zeroMutants` NOR `partial` set and 0
+	// total mutants -- the exact S1 clean-pass signature -- with all four
+	// mutation test files still 100/100 green, since nothing exercises the
+	// DRIVER's own branch, only the library functions it calls. This renders
+	// that same signature as "not a clean pass" regardless of which driver
+	// path (existing or one written later) produced it.
+	const zeroMutants =
+		meta.zeroMutants ??
+		(!meta.partial && total === 0
+			? {
+					reason:
+						"the report has no zeroMutants explanation and no partial result, but scored 0 total mutants -- rendered as unresolved rather than a clean pass",
+				}
+			: null);
+
+	if (zeroMutants) {
 		lines.push(
 			"**0 mutants evaluated.** This is not a clean pass -- it means the lane found nothing to mutate or could not finish.",
 			"",
-			`> ${meta.zeroMutants.reason}`,
+			`> ${zeroMutants.reason}`,
 			"",
 		);
 		if (samplingNote) lines.push(samplingNote, "");
@@ -62,8 +87,6 @@ export function renderMutationMarkdown(report) {
 		return lines.join("\n");
 	}
 
-	const counts = meta.counts ?? {};
-	const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
 	const survivors = Object.entries(report.files ?? {}).flatMap(
 		([fileName, file]) =>
 			(file.mutants ?? [])
@@ -132,10 +155,14 @@ export function renderMutationMarkdown(report) {
  *
  * `upstreamResult` (round 2 R2-4), when the caller can supply it (the
  * `mutation-comment` workflow job passes `needs.mutation.result`),
- * distinguishes a run the new per-PR concurrency group cancelled outright
- * from one that crashed or hit its own time cap -- neither of which it
- * actually did. With no reliable signal either way, the wording stays
- * neutral rather than guessing "crashed" for what may just be a cancellation.
+ * distinguishes a run GitHub reports as `cancelled` from one that failed
+ * outright. Round 4: `cancelled` itself is ambiguous -- GitHub reports a job
+ * that ran past its own `timeout-minutes` as `cancelled` too, the same
+ * result the new per-PR concurrency group produces when a newer push
+ * supersedes it, and this job has no way to tell those two apart -- so the
+ * `cancelled` wording names both possibilities rather than picking one. With
+ * no `cancelled` result at all, the wording stays neutral instead of
+ * guessing "crashed" for what may equally be either of those.
  *
  * @param {{headSha?: string, runUrl?: string, upstreamResult?: string}} [context]
  * @returns {string} markdown
@@ -143,8 +170,8 @@ export function renderMutationMarkdown(report) {
 export function renderStaleMarkdown({ headSha, runUrl, upstreamResult } = {}) {
 	const cause =
 		upstreamResult === "cancelled"
-			? "a newer push to this PR superseded it before it produced one"
-			: "it did not produce one (a crash, or hitting its overall time cap, are both possible; this cannot always be told apart from a cancellation)";
+			? "cancelled: a newer push superseded it, or the job hit its time limit"
+			: "a crash or hitting its overall time cap are both possible";
 	const lines = [
 		STICKY_MARKER,
 		"### Mutation diff (advisory)",

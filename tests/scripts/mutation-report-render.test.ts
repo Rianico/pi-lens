@@ -33,6 +33,74 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).not.toMatch(/score/i);
 	});
 
+	it("round 4 R3-1: renders 0/no-zeroMutants/no-partial as not a clean pass, backstopping a driver branch that failed to set either", () => {
+		// Recurrence: the round-4 review mutated the driver's OWN success/zero
+		// branch (`if (mutants.length > 0)` -> `>= 0`) and its partial branch
+		// (`if (outcome.partial)` -> `false`) directly, one at a time. BOTH
+		// produced a report with the exact same signature reproduced here --
+		// zeroMutants unset, partial unset, 0 total counts -- and all four
+		// mutation test files stayed green, because nothing but that one
+		// driver `if` ever looked at the raw `mutants.length`. This backstop
+		// operates on the WRITTEN REPORT alone, so it catches that signature
+		// regardless of which driver branch produced it.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234567890",
+				zeroMutants: null,
+				partial: null,
+				counts: {},
+				score: "n/a",
+			},
+		});
+
+		expect(markdown).toContain("0 mutants evaluated");
+		expect(markdown).toContain("not a clean pass");
+		expect(markdown).not.toContain("Score: n/a%");
+		expect(markdown).not.toContain("No survivors.");
+	});
+
+	it("round 4 R3-1: mutation 2's exact shape (no counts/score field at all, from the interrupted-else path)", () => {
+		// The interrupted branch's `else` (taken when `outcome.partial` is
+		// falsy) writes `baseMeta({ zeroMutants: outcome.zeroMutants, ... })`
+		// with NO `counts`/`score` fields at all -- distinct from the
+		// completed-run zero path above, which DOES set them (to `{}`/"n/a").
+		// Both must trip the same backstop.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234567890",
+				zeroMutants: null,
+			},
+		});
+
+		expect(markdown).toContain("0 mutants evaluated");
+		expect(markdown).toContain("not a clean pass");
+	});
+
+	it("round 4 R3-1: the backstop does not fire on a genuine partial run with a real (nonzero) evaluated count", () => {
+		// The backstop's condition is `!meta.partial && total === 0` -- a
+		// partial run with `partial` SET must still render as partial, not
+		// fall into the zero-mutant backstop text, even though its own
+		// `counts` can legitimately total more than zero mutants evaluated.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: { reason: "budget expired", evaluated: 3, total: 9 },
+				counts: { Killed: 3 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).toContain("Partial run");
+		expect(markdown).not.toContain("0 mutants evaluated");
+	});
+
 	it("names the --max-files cap and the uncovered files when either applies", () => {
 		const markdown = renderMutationMarkdown({
 			files: {},
@@ -253,7 +321,7 @@ describe("renderMutationMarkdown", () => {
 	});
 });
 
-describe("renderStaleMarkdown (#3531 round 2 T6, round 3 R2-4 wording)", () => {
+describe("renderStaleMarkdown (#3531 round 2 T6, round 3/4 R2-4 wording)", () => {
 	it("names the head that produced no report, and carries the sticky marker so a later run finds and updates it", () => {
 		const markdown = renderStaleMarkdown({
 			headSha: "deadbeef00001234",
@@ -268,6 +336,10 @@ describe("renderStaleMarkdown (#3531 round 2 T6, round 3 R2-4 wording)", () => {
 		// OVERWRITES the comment with this notice -- "left over" implied no
 		// action was taken, when the update is happening right now.
 		expect(markdown).not.toContain("left over");
+		// Recurrence (round 4, cosmetic): the neutral cause clause used to
+		// read "produced no mutation report -- it did not produce one (…)",
+		// a doubled sentence.
+		expect(markdown).not.toContain("it did not produce one");
 	});
 
 	it("links the job run when a run URL is given", () => {
@@ -286,20 +358,21 @@ describe("renderStaleMarkdown (#3531 round 2 T6, round 3 R2-4 wording)", () => {
 		expect(renderStaleMarkdown()).toContain(STICKY_MARKER);
 	});
 
-	it("names the concurrency group, not a crash or the time cap, when the upstream job was cancelled", () => {
-		// Recurrence: `mutation`'s own job can be cancelled by the workflow's
-		// per-PR concurrency group (a newer push superseding it), which is
-		// neither a crash nor hitting the 90-minute time cap -- the comment
-		// must not blame either when GitHub's own `needs.mutation.result`
-		// tells this job it was "cancelled".
+	it("names BOTH possible causes of a 'cancelled' upstream result -- a superseding push or the job's own time limit", () => {
+		// Recurrence (round 4): `needs.mutation.result` reads "cancelled" both
+		// when the workflow's own per-PR concurrency group supersedes a run
+		// AND when the job runs past its `timeout-minutes` -- this job cannot
+		// tell those two apart, so naming only "superseded" would misattribute
+		// a genuine timeout to a push that never happened.
 		const markdown = renderStaleMarkdown({
 			headSha: "abc123",
 			upstreamResult: "cancelled",
 		});
 
-		expect(markdown).toContain("superseded");
+		expect(markdown).toContain(
+			"cancelled: a newer push superseded it, or the job hit its time limit",
+		);
 		expect(markdown).not.toContain("crash");
-		expect(markdown).not.toContain("time cap outright");
 	});
 
 	it("words it neutrally (not a specific crash/cancellation claim) when the upstream result is unknown or a genuine failure", () => {
