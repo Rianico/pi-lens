@@ -1131,11 +1131,18 @@ export async function runAutofix(
 }
 
 /**
- * #3528 r1 F1: what `resyncLspFile` did. Only `synced` means a touch went out
- * and completed; every early return names its own reason.
+ * #3528 r1 F1: what `resyncLspFile` did; every early return names its own
+ * reason. `synced`: `touchFile` reached a client and every server's notify
+ * queue took this content (a write still in flight past its own timeout is
+ * named in that touch's `lsp_touch_file` row). `not-sent` (#3528 r2): it
+ * reached no client (none could start). `superseded` (#3528 r2): a server's
+ * queue did not send it, because a newer read was already sent, the path was
+ * closing, or the client was dead.
  */
 export type LspResyncOutcome =
 	| "synced"
+	| "not-sent"
+	| "superseded"
 	| "failed"
 	| "abandoned"
 	| "no-lsp"
@@ -1204,7 +1211,10 @@ export async function resyncLspFile(
 					saved: true,
 					readStamp,
 				})
-				.then(() => "synced" as const)
+				.then((result): LspResyncOutcome => {
+					if (result === undefined) return "not-sent";
+					return result.supersededServerIds?.length ? "superseded" : "synced";
+				})
 				.catch((err) => {
 					dbg(`LSP resync after autofix error: ${err}`);
 					return "failed" as const;

@@ -358,6 +358,17 @@ export async function handleAgentEnd({
 		kind: "autofix";
 	}> = [];
 	const deferredAutofixChanged = new Set<string>();
+	// #3528 r2: every claimed file a replaced session's drain does not start is
+	// named once, not only the first one each loop meets.
+	const skipReplaced = (filePath: string): void => {
+		if (
+			!summary.skipped.some(
+				(entry) =>
+					entry.filePath === filePath && entry.reason === "session-replaced",
+			)
+		)
+			summary.skipped.push({ filePath, reason: "session-replaced" });
+	};
 
 	// Mutation ordering is intentional: lint --write may disturb wrapping, so
 	// autofix reaches the final edited state first and formatting stabilizes it.
@@ -394,7 +405,10 @@ export async function handleAgentEnd({
 		// Its resync of that write is skipped, and the next session may already
 		// have the file open in its LSP (FormatDrain FixNoStartGen).
 		const filePath = path.resolve(record.filePath);
-		if (session.guardedWrite(filePath, () => true) === undefined) break;
+		if (session.guardedWrite(filePath, () => true) === undefined) {
+			skipReplaced(filePath);
+			continue;
+		}
 		if (!nodeFs.existsSync(filePath)) {
 			summary.skipped.push({ filePath, reason: "missing" });
 			continue;
@@ -580,7 +594,10 @@ export async function handleAgentEnd({
 				const fileStart = Date.now();
 				const filePath = path.resolve(record.filePath);
 				// #3528 r1 F1: as in the autofix loop, no new format after /new.
-				if (session.guardedWrite(filePath, () => true) === undefined) return;
+				if (session.guardedWrite(filePath, () => true) === undefined) {
+					skipReplaced(filePath);
+					continue;
+				}
 				started.add(index);
 				if (!nodeFs.existsSync(filePath)) {
 					work[index] = {
