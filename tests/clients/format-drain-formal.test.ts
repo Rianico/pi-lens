@@ -641,6 +641,42 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		expect(wire.at(-1)).toBe(disk());
 	});
 
+	it("OverlapLsp (#3529): the drain's autofix resync of bytes read before a next-run edit does not replace that edit's newer sync", async () => {
+		const drainTouch = gate();
+		lsp.drainTouch = drainTouch.p;
+		const { fixer, resume } = gatedBiome();
+		resume.open();
+		writeBiomeAgreement();
+		runtime.deferMutation(filePath, env.tmpDir, "edit", env.tmpDir, "autofix");
+		flags.add("no-autoformat");
+		const drain = handleAgentEnd(
+			drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+		);
+		// The drain has read the fixed bytes and issued its resync.
+		await waitFor(
+			() => lsp.drainTouchesWaiting,
+			(waiting) => waiting === 1,
+			{ yieldControl: tick, timeoutMs: 2_000 },
+		);
+		const agent = agentAppend("const y=2\n", service);
+		await agent.done;
+		drainTouch.open();
+		await drain;
+		expect(disk()).toBe("let x=1\nconst y=2\n");
+		expect(wire.at(-1)).toBe(disk());
+	});
+
+	it("no-drop (#3529, shape 54): with no newer edit, the drain's stamped autofix resync still sends its fixed bytes", async () => {
+		const { fixer, resume } = gatedBiome();
+		resume.open();
+		writeBiomeAgreement();
+		runtime.deferMutation(filePath, env.tmpDir, "edit", env.tmpDir, "autofix");
+		flags.add("no-autoformat");
+		await handleAgentEnd(drainDeps({ biomeClient: fixer, ruffClient: noRuff }));
+		expect(disk()).toBe("let x=1\n");
+		expect(wire.at(-1)).toBe(disk());
+	});
+
 	it("no-drop (#3529, shape 54): with no newer edit, the drain's stamped resync still sends its formatted bytes", async () => {
 		armChild();
 		await handleAgentEnd(drainDeps());
