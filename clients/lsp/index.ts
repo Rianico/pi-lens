@@ -919,13 +919,15 @@ export interface LSPWorkspaceDiagnosticResult {
 	 */
 	skippedWarmupFailure?: boolean;
 	/**
-	 * #1093: wall-clock time (ms) these diagnostics were actually OBSERVED, set
-	 * ONLY for results served from the workspace-diagnostics cache (a replay of
-	 * an older scan). Absent for freshly-touched results (observed now). Callers
-	 * reconciling this into the footer widget must pass it as the `observedAt`
-	 * stamp so a cache-hit replay doesn't re-arm the mtime-staleness gate
-	 * (`reconcileStaleWidgetFiles`) and keep a resolved finding on screen (the
-	 * #1092 touchedAt-re-arming defect).
+	 * #1093: wall-clock time (ms) these diagnostics were actually OBSERVED. For
+	 * a result served from the workspace-diagnostics cache (a replay of an older
+	 * scan) it is that entry's `scannedAt`; for a fresh result (#3573) it is the
+	 * stamp taken before the sweep read the file (a pull: before its request).
+	 * Callers reconciling this into the footer widget must pass it as the
+	 * `observedAt` stamp so a cache-hit replay doesn't re-arm the mtime-staleness
+	 * gate (`reconcileStaleWidgetFiles`) and keep a resolved finding on screen
+	 * (the #1092 touchedAt-re-arming defect), and so a write that landed while
+	 * the sweep was analysing the file is newer than the row.
 	 */
 	observedAt?: number;
 	/**
@@ -9924,7 +9926,14 @@ export class LSPService {
 						(result) =>
 							!supersededCacheKeys.has(normalizeMapKey(result.filePath)),
 					);
-		return [...servedCacheResults, ...results].filter(Boolean);
+		// #3573: a fresh result is observed at its read, the same stamp its cache
+		// entry carries, so a write that landed while the sweep was still
+		// analysing the file is newer than the widget row it reconciles into.
+		const freshResults = results.filter(Boolean).map((result) => ({
+			...result,
+			observedAt: scannedAtByFile.get(result.filePath),
+		}));
+		return [...servedCacheResults, ...freshResults].filter(Boolean);
 	}
 
 	/**

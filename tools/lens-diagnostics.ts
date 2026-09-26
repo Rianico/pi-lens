@@ -191,10 +191,10 @@ type WorkspaceLspDiagnosticResult = {
 	// Auxiliary lanes that did not answer. Other servers' diagnostics remain
 	// usable, but this result must not replace fully-covered cached/widget state.
 	unconfirmedServerIds?: string[];
-	// #1093: set only for cache-hit results (a replay of an older scan) — the
-	// wall-clock time the diagnostics were originally observed. Threaded into the
-	// footer reconcile so a cache-served mode=full doesn't re-arm the widget's
-	// mtime-staleness gate. See LSPWorkspaceDiagnosticResult.observedAt.
+	// #1093: the wall-clock time the diagnostics were observed — a cache hit's
+	// original scan, or (#3573) a fresh result's read. Threaded into the footer
+	// reconcile so neither a cache-served nor a fresh mode=full row is stamped
+	// after a write it never saw. See LSPWorkspaceDiagnosticResult.observedAt.
 	observedAt?: number;
 	contentHash?: string;
 	boundToCurrentDisk?: BoundToCurrentDisk;
@@ -2031,7 +2031,12 @@ function mergeDiagnosticsWithWidgetSummaries(
 	for (const result of lspResults) {
 		const filePath = path.resolve(result.filePath);
 		for (const diagnostic of result.diagnostics ?? []) {
-			addDiagnostic(filePath, lspDiagnosticToWidget(diagnostic));
+			// #3573: the row keeps its sweep read stamp through the correlated
+			// commit, which otherwise stamps it with the project scan's time or now.
+			addDiagnostic(filePath, {
+				...lspDiagnosticToWidget(diagnostic),
+				observedAt: result.observedAt,
+			});
 		}
 	}
 
@@ -2440,12 +2445,11 @@ async function formatFullMode(
 				// The service reserves this token when the file enters the scan. The
 				// fallback preserves compatibility with older test doubles/services.
 				result.writeIndex ?? nextWriteIndex?.(),
-				// #1093: `observedAt` is set only when this result was served from
-				// the workspace-diagnostics cache (a replay of an older scan) —
-				// stamp `touchedAt` with when it was scanned, not now(), so a
-				// mode=full that only re-serves the cache can't keep a resolved
-				// finding on screen by re-arming the mtime gate. Undefined for
-				// freshly-touched results (observed now).
+				// #1093: for a result served from the workspace-diagnostics cache,
+				// `observedAt` is when it was scanned, not now(), so a mode=full
+				// that only re-serves the cache can't keep a resolved finding on
+				// screen by re-arming the mtime gate. #3573: for a fresh result it
+				// is the sweep's read of the file.
 				result.observedAt,
 			);
 			// A result rejected by the shared ordering guard is not authoritative
