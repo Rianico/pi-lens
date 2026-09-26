@@ -64,10 +64,13 @@ import { setupTestEnvironment } from "./test-utils.js";
 
 /**
  * Budget: one run is a handful of synchronous appends and lock-file writes on
- * a temp dir, a few milliseconds. The seed is fixed so the lane is
- * deterministic; raise NUM_RUNS or drop SEED locally to explore.
+ * a temp dir, a few milliseconds; 400 runs took 1.8-2.7 s at load average
+ * 12-14 on 4 cores. PROPERTY_TIMEOUT_MS leaves headroom over that. The seed
+ * is fixed so the lane is deterministic; raise NUM_RUNS or drop SEED locally
+ * to explore. Edits and session starts weigh the same because the cursor
+ * regressions need a start, other runtimes' edits and a late read in one run.
  */
-const NUM_RUNS = 150;
+const NUM_RUNS = 400;
 const SEED = 3577;
 const PROPERTY_TIMEOUT_MS = 30_000;
 const RUNTIMES = 3;
@@ -82,7 +85,7 @@ type Command =
 const runtimeArb = fc.integer({ min: 0, max: RUNTIMES - 1 });
 const commandArb: fc.Arbitrary<Command> = fc.oneof(
 	{
-		weight: 6,
+		weight: 4,
 		arbitrary: fc.record({ t: fc.constant("edit" as const), r: runtimeArb }),
 	},
 	{
@@ -93,7 +96,7 @@ const commandArb: fc.Arbitrary<Command> = fc.oneof(
 		}),
 	},
 	{
-		weight: 3,
+		weight: 4,
 		arbitrary: fc.record({
 			t: fc.constant("start" as const),
 			r: runtimeArb,
@@ -402,4 +405,28 @@ describe("#3577 — change-log seq allocation over scheduled interleavings", () 
 			);
 		},
 	);
+
+	/**
+	 * The read cursor's regression, replayed over every ordering of its
+	 * commands: r1's session read captures the log early, r2's read folds
+	 * more of it, then r1's lands. The cursor must move back to the end of
+	 * r1's read. A cursor that never moves backwards keeps r2's end with r1's
+	 * max, hides the line between, and r1's next edit reuses its seq. The
+	 * property above finds that at 8 of seeds 1-20 at its budget; this pins it.
+	 */
+	it("a session read that captured the log early never hides lines a later read folded", async () => {
+		const commands: Command[] = [
+			{ t: "edit", r: 0 },
+			{ t: "start", r: 1, early: true },
+			{ t: "edit", r: 0 },
+			{ t: "start", r: 2, early: false },
+			{ t: "edit", r: 1 },
+		];
+		await fc.assert(
+			fc.asyncProperty(fc.scheduler(), async (s) => {
+				assertHolds(await execute(s, commands));
+			}),
+			{ numRuns: 100, seed: SEED },
+		);
+	});
 });
