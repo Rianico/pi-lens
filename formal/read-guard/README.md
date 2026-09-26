@@ -16,7 +16,7 @@ against the current code (`violated`).
 The model covers **positional** edits: `oldRange`, `edits[].range`, and the
 hashline adapters. The guard fully enforces only this class. An `oldText` edit
 is content-validated by the host, so `checkEdit` gets `skipSnapshotCheck` and
-`oldTextResolved` (`runtime-tool-call.ts` ~1573). For such an edit, FileTime and
+`oldTextResolved` (`runtime-tool-call.ts` ~1575). For such an edit, FileTime and
 the snapshot are skipped and out-of-range is only a warning. The only checks
 left are zero-read and the bridge content binding.
 
@@ -28,22 +28,22 @@ change.
 
 - **The agent**, one tool at a time (pi awaits each handler):
   - **read** (full or ranged): the tool_call provisional record, which takes
-    a FileTime stamp (`runtime-tool-call.ts` ~1052), the host read, then the
-    tool_result record that supersedes it (`runtime-tool-result.ts` ~1797).
+    a FileTime stamp (`runtime-tool-call.ts` ~1054), the host read, then the
+    tool_result record that supersedes it (`runtime-tool-result.ts` ~1805).
     Since #3524, when the file moved after the tool_call's stamp, that record
     is hashed and sized from the delivered text and keeps the stamp;
-  - **positional edit** of 1 or 2 lines: `checkEdit` at tool_call (~1570),
-    optional relocation (~1583), the host apply, then `recordWritten` at
-    tool_result (~2305). Since #3523, an edit the guard allowed unrelocated
-    (`markToolCallEditInPlace`, ~1626) is recorded as a read of the lines it
-    wrote, hashed from its `newText` (`runtime-tool-result.ts` ~2254);
+  - **positional edit** of 1 or 2 lines: `checkEdit` at tool_call (~1572),
+    optional relocation (~1585), the host apply, then `recordWritten` at
+    tool_result (~2324). Since #3523, an edit the guard allowed unrelocated
+    (`markToolCallEditInPlace`, ~1628) is recorded as a read of the lines it
+    wrote, hashed from its `newText` (`runtime-tool-result.ts` ~2273);
   - **write**: `noteCreatedFile` at tool_call, the host write, and
     `recordWritten`, which injects the creation read from disk
     (`read-guard.ts` `injectCreationRead`, ~1568). The turn's first write then
     runs the immediate autofix (`pipeline.ts`), calls `recordWritten` again
     (`runtime-tool-result.ts` ~1107), and attaches the post-fix bytes as
-    "authoritative" (~2814). Since #3519 the attachment, when delivered, is
-    recorded as a whole-file read hashed from the attached bytes (~2874).
+    "authoritative" (~2833). Since #3519 the attachment, when delivered, is
+    recorded as a whole-file read hashed from the attached bytes (~2893).
 - **Another writer** (an external editor, a second pi-lens instance, git):
   changes the file between any two steps. With `ExtPhases` it can land inside
   a tool call.
