@@ -485,15 +485,14 @@ function captureLineHashes(
  * A read's evidence taken from text the conversation showed the agent (an
  * attached autofix, the agent's own `newText`, a delivered read), not from
  * the disk at record time (#3519, #3523, #3524). `text` starts at file line
- * `offset`; at most `limit` of its lines count. `lineHashes` is undefined past
- * the same READ_HASH_MAX_LINES bound a disk capture has.
+ * `offset`. `lineHashes` is undefined past the same READ_HASH_MAX_LINES bound
+ * a disk capture has.
  */
 export function deliveredLineEvidence(
 	text: string,
 	offset: number,
-	limit = Number.POSITIVE_INFINITY,
 ): { lineCount: number; lineHashes: Record<number, string> | undefined } {
-	const lines = splitLines(text).slice(0, limit);
+	const lines = splitLines(text);
 	return {
 		lineCount: lines.length,
 		lineHashes:

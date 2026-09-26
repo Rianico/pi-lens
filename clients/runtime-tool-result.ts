@@ -1131,6 +1131,46 @@ function singlePositionalEdit(
 		: undefined;
 }
 
+/**
+ * pi's `read` output less the continuation notice pi appends after the
+ * delivered lines (`@earendil-works/pi-coding-agent` `dist/core/tools/read.js`:
+ * `[Showing lines A-B of T. …]`, `[Showing lines A-B of T (50.0KB limit). …]`,
+ * `[N more lines in file. …]`, each after a blank line).
+ */
+const PI_READ_NOTICE =
+	/\n\n\[(?:Showing lines \d+-\d+ of \d+(?: \([^)\]]+ limit\))?|\d+ more lines in file)\. Use offset=\d+ to continue\.\]$/;
+
+function piReadBody(text: string): string {
+	return text.replace(PI_READ_NOTICE, "");
+}
+
+/**
+ * #3519/#3523: the pushed record that the read guard took a read from text
+ * the conversation showed the agent (`read_recorded` is verbose-only).
+ */
+function logConversationRead(
+	source: "autofix-attachment" | "own-edit",
+	filePath: string,
+	offset: number,
+	evidence: {
+		lineCount: number;
+		lineHashes: Record<number, string> | undefined;
+	},
+): void {
+	logLatency({
+		type: "phase",
+		phase: "read_guard_conversation_read",
+		filePath,
+		durationMs: 0,
+		metadata: {
+			source,
+			offset,
+			lineCount: evidence.lineCount,
+			hashed: evidence.lineHashes !== undefined,
+		},
+	});
+}
+
 /** #3555: the leading note on a read the tool_call widened. */
 function readWideningNote(widening: ReadWidening): string {
 	const { requested, shown, boundary } = widening;
@@ -1193,10 +1233,34 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		event.toolName === "read" && toolCallId !== undefined
 			? runtime.takeReadWidening(toolCallId)
 			: undefined;
-	const readNote =
-		readWidening && event.isError !== true
-			? [{ type: "text", text: readWideningNote(readWidening) }]
-			: [];
+	// Only for the range that executed: a later handler may have re-targeted
+	// the read, or the id may belong to a different call.
+	const executedRead = event.input as { offset?: unknown; limit?: unknown };
+	const notedWidening =
+		readWidening &&
+		event.isError !== true &&
+		executedRead.offset === readWidening.shown.offset &&
+		executedRead.limit === readWidening.shown.limit
+			? readWidening
+			: undefined;
+	const readNote = notedWidening
+		? [{ type: "text", text: readWideningNote(notedWidening) }]
+		: [];
+	if (notedWidening) {
+		// #3555: the pushed record that a widening was disclosed.
+		logLatency({
+			type: "phase",
+			phase: "read_widening_note",
+			toolName: event.toolName,
+			filePath: rawFilePath ?? "",
+			durationMs: 0,
+			metadata: {
+				requested: notedWidening.requested,
+				shown: notedWidening.shown,
+				boundary: "heading" in notedWidening.boundary ? "heading" : "symbol",
+			},
+		});
+	}
 
 	let resolutionBasis: string;
 	if (attribution) {
@@ -1724,27 +1788,38 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					},
 				});
 				// #3524: another writer moved the file after the tool_call's stamp,
-				// so the disk may not be what pi delivered. The delivered text is
-				// then the evidence, and the stamp stays where it was. Its line
-				// count is pi's own (truncation, then the requested limit), which
-				// leaves out pi's trailing continuation notice and never consults
-				// the disk that moved.
+				// so the disk may not be what pi delivered. The delivered text (less
+				// pi's continuation notice) is then the evidence, and the stamp
+				// stays where it was. Text with more lines than pi's own count
+				// (truncation, then the requested limit) is not pi's raw output: a
+				// producer upstream decorated it, and its hashes would refuse lines
+				// that did not change, so the disk stays the evidence.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
-				const delivered = raced
+				const deliveredText = raced
 					? deliveredLineEvidence(
-							event.content
-								.map((part) => (part.type === "text" ? (part.text ?? "") : ""))
-								.join("\n"),
+							piReadBody(
+								event.content
+									.map((part) =>
+										part.type === "text" ? (part.text ?? "") : "",
+									)
+									.join("\n"),
+							),
 							requestedOffset,
-							truncation?.outputLines ?? requestedLimit,
 						)
 					: undefined;
+				const piLineCount = truncation?.outputLines ?? requestedLimit;
+				const delivered =
+					deliveredText &&
+					(piLineCount === undefined || deliveredText.lineCount <= piLineCount)
+						? deliveredText
+						: undefined;
 				if (raced) {
 					incrementDegradationCount({
 						kind: "native-read-raced-writer",
 						subject: deliveredFilePath,
-						reason:
-							"the file changed between pi's read and its tool_result; the read is recorded from the delivered text",
+						reason: delivered
+							? "the file changed between pi's read and its tool_result; the read is recorded from the delivered text"
+							: "the file changed between pi's read and its tool_result; the delivered text does not match pi's line count, so the disk is the evidence",
 					});
 				}
 				const deliveredRecord = {
@@ -2194,6 +2269,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			timestamp: Date.now(),
 			source: "own-edit",
 		});
+		logConversationRead("own-edit", filePath, ownEdit.start, evidence);
 	}
 
 	// Must happen before debounce admission: latestDeps intentionally retains only
@@ -2812,6 +2888,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					source: "autofix-attachment",
 				},
 				{ stampFileTime: false },
+			);
+			logConversationRead(
+				"autofix-attachment",
+				postMutation.filePath,
+				1,
+				evidence,
 			);
 		}
 	}

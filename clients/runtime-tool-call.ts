@@ -887,6 +887,11 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		  }
 		| undefined;
 
+	// #3555: a widening whose tool_result never came (a later extension
+	// blocked the call, a batch was aborted) must not label a new call that
+	// reuses its id.
+	if (toolName === "read" && toolCallId !== undefined)
+		runtime.takeReadWidening(toolCallId);
 	// #3555: the widening serves the read guard, so it is off with the guard
 	// (`--no-read-guard`, or `readGuard.enabled=false`, lens-flag-registry.ts).
 	const readExpansionClient =
