@@ -296,7 +296,7 @@ export function withGenerationLockSync<T>(
 	op: () => T,
 ): { held: true; value: T } | { held: false; cause?: unknown } {
 	const deadline = Date.now() + timing.waitMs;
-	let timedOutHolder = timedOutHolders.get(dir);
+	const timedOutHolder = timedOutHolders.get(dir);
 	for (;;) {
 		let hold: GenerationHold | undefined;
 		try {
@@ -312,16 +312,16 @@ export function withGenerationLockSync<T>(
 				releaseGeneration(hold);
 			}
 		}
-		if (timedOutHolder !== undefined) {
-			if (topGenerationHolder(dir) === timedOutHolder) {
-				recordDegradationOnce({
-					kind: "generation-lock-wait-skipped",
-					subject: dir,
-					reason: `did not wait: ${timedOutHolder} still holds the lock after an earlier wait ran out`,
-				});
-				return { held: false };
-			}
-			timedOutHolder = undefined;
+		if (
+			timedOutHolder !== undefined &&
+			topGenerationHolder(dir) === timedOutHolder
+		) {
+			recordDegradationOnce({
+				kind: "generation-lock-wait-skipped",
+				subject: dir,
+				reason: `did not wait: ${timedOutHolder} still holds the lock after an earlier wait ran out`,
+			});
+			return { held: false };
 		}
 		if (Date.now() >= deadline) {
 			timedOutHolders.set(dir, topGenerationHolder(dir));
