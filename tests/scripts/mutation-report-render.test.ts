@@ -101,6 +101,48 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).not.toContain("0 mutants evaluated");
 	});
 
+	it("round 5 R4-1: a raw Stryker report with no piLensMutationDiff meta at all still renders its real survivors", () => {
+		// Recurrence: round 4's backstop computed `total` from `meta.counts`
+		// only. A RAW `mutation.json` -- read directly, never through this
+		// driver's `writeReport` -- has no `piLensMutationDiff` key, so
+		// `meta.counts` is absent even though `report.files` holds real
+		// mutants: at fbb080105 this rendered "0 mutants evaluated" and
+		// dropped the survivor table for a report with 1 Survived + 1 Killed.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							original: "true",
+							status: "Survived",
+							location: {
+								start: { line: 1, column: 1 },
+								end: { line: 1, column: 5 },
+							},
+						},
+						{
+							id: "1",
+							mutatorName: "EqualityOperator",
+							replacement: "!==",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			// No `piLensMutationDiff` at all -- the raw shape Stryker itself
+			// writes.
+		});
+
+		expect(markdown).not.toContain("0 mutants evaluated");
+		expect(markdown).not.toContain("not a clean pass");
+		expect(markdown).toContain("#### Survivors (1)");
+		expect(markdown).toContain("clients/x.js:1");
+		expect(markdown).toContain("1 killed, 1 survived");
+	});
+
 	it("names the --max-files cap and the uncovered files when either applies", () => {
 		const markdown = renderMutationMarkdown({
 			files: {},

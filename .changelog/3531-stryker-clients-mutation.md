@@ -40,4 +40,7 @@ section: Changed
   result says neither. The report renderer itself now backstops a 0-mutant,
   non-partial result at the render seam, so it can never read as a clean
   pass even if a future change to the driver's own branching slips past that
-  guard. Still advisory.
+  guard -- computed from the mutants a report actually carries, not only
+  from this driver's own summary counts, so a raw `mutation.json` read
+  directly (never through this driver) still renders its real survivors
+  instead of a false "0 mutants evaluated". Still advisory.

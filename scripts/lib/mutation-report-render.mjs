@@ -50,7 +50,26 @@ export function renderMutationMarkdown(report) {
 		? `_Sampled ${meta.rangesEvaluated ?? "?"} of ${meta.rangesTotal ?? "?"} changed-line ranges deterministically (seed \`${shortSha(meta.headSha)}\`)._`
 		: null;
 
-	const counts = meta.counts ?? {};
+	// round 5 R4-1: `meta.counts` is only ever set by THIS driver's own
+	// completed/partial write paths. A raw Stryker `mutation.json` -- read
+	// directly, never through `scripts/stryker-diff.mjs`'s `writeReport` --
+	// carries no `piLensMutationDiff` at all, so `meta.counts` is absent even
+	// though `report.files` holds real mutants. Deriving the counts (and so
+	// the total the backstop below reads) from those mutants when `counts`
+	// itself is missing keeps the backstop from misreading a genuine result
+	// as 0 evaluated (verified: at `fbb080105`, a raw report with 1 Survived +
+	// 1 Killed and no meta rendered "0 mutants evaluated" instead of "####
+	// Survivors (1)") -- and keeps the score line's own killed/survived/…
+	// breakdown consistent with that total, rather than showing "(2 total)"
+	// against "0 killed, 0 survived".
+	const counts =
+		meta.counts ??
+		Object.values(report?.files ?? {}).reduce((out, file) => {
+			for (const mutant of file.mutants ?? []) {
+				out[mutant.status] = (out[mutant.status] ?? 0) + 1;
+			}
+			return out;
+		}, {});
 	const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
 
 	// round 4 R3-1: a backstop at the render seam, independent of which
