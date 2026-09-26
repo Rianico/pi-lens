@@ -141,6 +141,10 @@ export async function handleAgentEnd({
 	// session (e.g. a concurrent in-process secondary/subagent) stay queued
 	// for their owner's own agent_end, unless they've been stale long enough
 	// to fall back to "claim as orphaned" (see claimDeferredFormatFiles).
+	// #3528: the session these records are claimed in. `/new`, fork and resume
+	// run while the drain awaits its formatter, and nothing aborts the drain
+	// then, so every write into session state below goes through this handle.
+	const session = runtime.captureSessionGeneration();
 	const { claimed, staleClaimed, deferredToOwner, droppedOrphans } =
 		runtime.claimDeferredMutations(
 			currentSessionId,
@@ -167,30 +171,39 @@ export async function handleAgentEnd({
 			| "clients-unavailable",
 	): void => {
 		if (pending.length === 0) return;
-		const kinds = new Set<"autofix" | "format">();
-		const toolNames = new Set<string>();
-		for (const record of pending) {
-			for (const kind of record.kinds) {
-				requeuedKinds.add(kind);
-				kinds.add(kind);
-			}
-			for (const toolName of record.toolNames) toolNames.add(toolName);
-		}
-		logLatency({
-			type: "phase",
-			toolName: "agent_end",
-			filePath: ctxCwd ?? runtime.projectRoot,
-			phase: "agent_end_deferred_mutation_requeue",
-			turnId: pending[0]?.queuedTurnId,
-			durationMs: 0,
-			metadata: {
-				reason,
-				kinds: [...kinds].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
-				fileCount: pending.length,
-				toolNames: [...toolNames].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+		// #3528: a drain that outlived its session requeues nothing into the
+		// next session's cleared queue; the drop is one ledger row.
+		session.guardedWrite(
+			pending.map((record) => record.filePath).join(", "),
+			() => {
+				const kinds = new Set<"autofix" | "format">();
+				const toolNames = new Set<string>();
+				for (const record of pending) {
+					for (const kind of record.kinds) {
+						requeuedKinds.add(kind);
+						kinds.add(kind);
+					}
+					for (const toolName of record.toolNames) toolNames.add(toolName);
+				}
+				logLatency({
+					type: "phase",
+					toolName: "agent_end",
+					filePath: ctxCwd ?? runtime.projectRoot,
+					phase: "agent_end_deferred_mutation_requeue",
+					turnId: pending[0]?.queuedTurnId,
+					durationMs: 0,
+					metadata: {
+						reason,
+						kinds: [...kinds].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+						fileCount: pending.length,
+						toolNames: [...toolNames].sort((a, b) =>
+							a < b ? -1 : a > b ? 1 : 0,
+						),
+					},
+				});
+				runtime.requeueDeferredMutations(pending);
 			},
-		});
-		runtime.requeueDeferredMutations(pending);
+		);
 	};
 	const rootActionableAutofixEnabled = !!getFlag(
 		"lens-actionable-warning-autofix",
@@ -433,24 +446,27 @@ export async function handleAgentEnd({
 						kind: "autofix",
 					});
 				if (!nodeFs.existsSync(changedPath)) continue;
-				recordProjectChange({
-					runtime,
-					cwd: record.turnStateCwd,
-					filePath: changedPath,
-					source: "autofix",
-					dbg,
+				// #3528: this session's change log, read guard and turn state only.
+				session.guardedWrite(changedPath, () => {
+					recordProjectChange({
+						runtime,
+						cwd: record.turnStateCwd,
+						filePath: changedPath,
+						source: "autofix",
+						dbg,
+					});
+					if (!getFlag("no-read-guard"))
+						runtime.readGuard.recordWritten(changedPath);
+					const content = nodeFs.readFileSync(changedPath, "utf-8");
+					cacheManager.addModifiedRange(
+						changedPath,
+						{ start: 1, end: content.split("\n").length },
+						/^import\s/m.test(content),
+						record.turnStateCwd,
+						currentSessionId ?? runtime.telemetrySessionId,
+						"pi",
+					);
 				});
-				if (!getFlag("no-read-guard"))
-					runtime.readGuard.recordWritten(changedPath);
-				const content = nodeFs.readFileSync(changedPath, "utf-8");
-				cacheManager.addModifiedRange(
-					changedPath,
-					{ start: 1, end: content.split("\n").length },
-					/^import\s/m.test(content),
-					record.turnStateCwd,
-					currentSessionId ?? runtime.telemetrySessionId,
-					"pi",
-				);
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -571,28 +587,64 @@ export async function handleAgentEnd({
 				// child settles.
 				const formatHold = holdFileMutationQueue(filePath);
 				try {
+					const phase = runFormatPhase(
+						filePath,
+						getFormatService,
+						dbg,
+						ambientSignal,
+						30_000,
+						"agent_settled",
+						formatHold,
+					).finally(() => formatHold?.release());
 					work[index] = {
 						record,
 						filePath,
 						fileStart,
-						result: await bounded(
-							runFormatPhase(
-								filePath,
-								getFormatService,
-								dbg,
-								ambientSignal,
-								30_000,
-								"agent_settled",
-								formatHold,
-							).finally(() => formatHold?.release()),
-							{
-								ms: HOOK_WALL_BUDGET_MS.agent_settled,
-								signal: ambientSignal,
-								hook: "agent_settled",
-								label: "deferred-format",
-							},
-						),
+						result: await bounded(phase, {
+							ms: HOOK_WALL_BUDGET_MS.agent_settled,
+							signal: ambientSignal,
+							hook: "agent_settled",
+							label: "deferred-format",
+						}),
 					};
+					// #3529: the bound gave up on the phase, not on its formatter
+					// child, which writes F later. Once the phase and every formatter
+					// it gave up on have settled, sync a fresh stamped read of F, or
+					// the LSP keeps the bytes from before the format.
+					if (!work[index]?.result)
+						void (async () => {
+							let outcome: "synced" | "failed" = "synced";
+							try {
+								await (
+									await phase
+								).abandoned;
+								const readStamp = performance.now();
+								const content = nodeFs.readFileSync(filePath, "utf-8");
+								await resyncLspFile(
+									filePath,
+									content,
+									true,
+									false,
+									getFlag,
+									dbg,
+									readStamp,
+								);
+							} catch (err) {
+								outcome = "failed";
+								dbg(
+									`agent_end deferred_format post-exit resync failed for ${filePath}: ${err}`,
+								);
+							}
+							logLatency({
+								type: "phase",
+								toolName: "agent_end",
+								filePath,
+								phase: "deferred_format_post_exit_resync",
+								turnId: record.queuedTurnId,
+								durationMs: Date.now() - fileStart,
+								metadata: { outcome },
+							});
+						})();
 				} catch (err) {
 					work[index] = {
 						record,
@@ -712,43 +764,47 @@ export async function handleAgentEnd({
 				// previous fallback chain through ctxCwd / projectRoot / record.cwd
 				// could silently regress the monorepo cwd-mismatch fix from PR #105.
 				const bookkeepingCwd = record.turnStateCwd;
-				recordProjectChange({
-					runtime,
-					cwd: bookkeepingCwd,
-					filePath,
-					source: "format",
-					dbg,
-				});
-				if (!getFlag("no-read-guard")) {
-					runtime.readGuard.recordWritten(filePath);
-				}
-				try {
-					const content = nodeFs.readFileSync(filePath, "utf-8");
-					const lineCount = content.split("\n").length;
-					const hasImports = /^import\s/m.test(content);
-					cacheManager.addModifiedRange(
+				// #3528: this session's change log, read guard, turn state and turn
+				// summary only.
+				session.guardedWrite(filePath, () => {
+					recordProjectChange({
+						runtime,
+						cwd: bookkeepingCwd,
 						filePath,
-						{ start: 1, end: lineCount },
-						hasImports,
-						bookkeepingCwd,
-						currentSessionId ?? runtime.telemetrySessionId,
-						"pi",
-					);
-				} catch (err) {
-					dbg(
-						`agent_end deferred_format modified-range tracking failed for ${filePath}: ${err}`,
-					);
-				}
-
-				// #484: opt-in per-turn summary — deferred format is the OTHER
-				// half of the format signal (immediate-mode is recorded at the
-				// runtime-tool-result.ts seam); same result.formattersUsed the
-				// latency phase below already logs, no new plumbing.
-				if (getFlag("lens-turn-summary")) {
-					for (const tool of result.formattersUsed) {
-						runtime.turnSummary.recordFormat(filePath, { tool });
+						source: "format",
+						dbg,
+					});
+					if (!getFlag("no-read-guard")) {
+						runtime.readGuard.recordWritten(filePath);
 					}
-				}
+					try {
+						const content = nodeFs.readFileSync(filePath, "utf-8");
+						const lineCount = content.split("\n").length;
+						const hasImports = /^import\s/m.test(content);
+						cacheManager.addModifiedRange(
+							filePath,
+							{ start: 1, end: lineCount },
+							hasImports,
+							bookkeepingCwd,
+							currentSessionId ?? runtime.telemetrySessionId,
+							"pi",
+						);
+					} catch (err) {
+						dbg(
+							`agent_end deferred_format modified-range tracking failed for ${filePath}: ${err}`,
+						);
+					}
+
+					// #484: opt-in per-turn summary — deferred format is the OTHER
+					// half of the format signal (immediate-mode is recorded at the
+					// runtime-tool-result.ts seam); same result.formattersUsed the
+					// latency phase below already logs, no new plumbing.
+					if (getFlag("lens-turn-summary")) {
+						for (const tool of result.formattersUsed) {
+							runtime.turnSummary.recordFormat(filePath, { tool });
+						}
+					}
+				});
 			}
 
 			if (result.fileContent) {
@@ -759,6 +815,9 @@ export async function handleAgentEnd({
 					false,
 					getFlag,
 					dbg,
+					// #3529: the next run's edit can land once the hold is released,
+					// and its own stamped sync must not be replaced by this older read.
+					result.fileReadStamp,
 				);
 			}
 

@@ -1337,6 +1337,11 @@ export interface FormatPhaseResult {
 	fileContent: string | undefined;
 	/** #3481: `performance.now()` taken before `fileContent` was read. */
 	fileReadStamp: number;
+	/**
+	 * #3529: settles once every formatter the service's bound gave up on has
+	 * settled, so a caller can sync what that child wrote after `fileContent`.
+	 */
+	abandoned?: Promise<void>;
 }
 
 export async function runFormatPhase(
@@ -1353,6 +1358,7 @@ export async function runFormatPhase(
 	const formatFailures: string[] = [];
 	const formatUnavailable: Array<{ formatter: string; reason: string }> = [];
 	let fileContent: string | undefined;
+	let abandoned: Promise<void> | undefined;
 
 	const formatService = getFormatService();
 	try {
@@ -1367,6 +1373,7 @@ export async function runFormatPhase(
 		// #3506: a formatter the budget gave up on still runs, and its child
 		// writes later; the hold is released only once it has settled.
 		if (writeHold && result.abandoned) writeHold.outlive(result.abandoned);
+		abandoned = result.abandoned;
 		// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
 		// `formattersUsed` (which drives change bookkeeping / turn summaries) and
 		// out of `formatFailures` (which requeues). Record it once, distinctly.
@@ -1440,6 +1447,7 @@ export async function runFormatPhase(
 		formatUnavailable,
 		fileContent,
 		fileReadStamp,
+		abandoned,
 	};
 }
 
