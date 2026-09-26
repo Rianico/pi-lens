@@ -972,9 +972,11 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 					},
 				},
 			);
-			// pi showed lines 1-2000; line 2400 was never shown.
+			// pi showed lines 1-2000; lines 2001 and 2400 were never shown.
 			const edit = await positionalEdit(runtime, file, [[2400, 2400, "blind"]]);
 			expect(edit.blocked).toBe(true);
+			const next = await positionalEdit(runtime, file, [[2001, 2001, "blind"]]);
+			expect(next.blocked).toBe(true);
 		} finally {
 			env.cleanup();
 		}
@@ -1025,16 +1027,17 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 					rewrite: (text) => `[other-extension: header note]\n${text}`,
 					gate: () => {
 						const v = lines(3500);
-						v[2399] = "EXTERNAL2400";
+						v[1499] = "EXTERNAL1500";
 						writeNow(file, `${v.join("\n")}\n`);
 					},
 				},
 			);
-			// An own edit re-stamps FileTime; the line pi never showed stays refused.
+			// An own edit re-stamps FileTime; the line the other writer changed,
+			// which pi did show, stays refused: nothing vouches for it.
 			const own = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
 			expect(own.blocked).toBe(false);
 			await applyEdit(runtime, file, own);
-			const edit = await positionalEdit(runtime, file, [[2400, 2400, "blind"]]);
+			const edit = await positionalEdit(runtime, file, [[1500, 1500, "a1500"]]);
 			expect(edit.blocked).toBe(true);
 		} finally {
 			env.cleanup();
