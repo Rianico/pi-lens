@@ -1805,11 +1805,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// limit, no truncation) has nothing to vouch for it. The evidence
 				// is then the tool_call's own capture: the provisional record this
 				// result supersedes, the newest one, since an id can be reused,
-				// clipped to the lines pi showed. Where the capture equals the text,
-				// the two are the same evidence; where a write landed before pi's
-				// read, the capture refuses lines the agent was shown until it
-				// re-reads. With no hashed capture there is no evidence, and
-				// nothing is recorded.
+				// its range clipped to the lines pi showed. Where the capture
+				// equals the text, the two are the same evidence; where a write
+				// landed before pi's read, the capture refuses lines the agent was
+				// shown until it re-reads. With no hashed capture there is no
+				// evidence, and nothing is recorded.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
 				const deliveredText = raced
 					? deliveredLineEvidence(
@@ -1854,11 +1854,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				const captureEvidence = capture?.lineHashes && {
 					effectiveOffset: capture.effectiveOffset,
 					effectiveLimit: shownLimit,
-					lineHashes: Object.fromEntries(
-						Object.entries(capture.lineHashes).filter(
-							([line]) => Number(line) < capture.effectiveOffset + shownLimit,
-						),
-					),
+					lineHashes: capture.lineHashes,
 				};
 				if (raced) {
 					incrementDegradationCount({
