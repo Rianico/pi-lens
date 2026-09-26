@@ -326,6 +326,14 @@ export interface ToolCallAttribution {
  * section, carried by tool-call identity to its tool_result, which labels it.
  */
 export interface ReadWidening {
+	/** The file the tool_call resolved (absolute), for the record. */
+	filePath: string;
+	/**
+	 * The read's `path` input as the tool_call left it. The tool_result
+	 * matches on this, since it resolves paths without the tool_call's host
+	 * variant ladder, and a reused id may name another file.
+	 */
+	inputPath: string | undefined;
 	requested: { offset: number; limit: number };
 	shown: { offset: number; limit: number };
 	boundary: { heading: string } | { symbol: { name: string; kind: string } };

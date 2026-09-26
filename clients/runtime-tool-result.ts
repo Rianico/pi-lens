@@ -1235,10 +1235,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			: undefined;
 	// Only for the range that executed: a later handler may have re-targeted
 	// the read, or the id may belong to a different call.
-	const executedRead = event.input as { offset?: unknown; limit?: unknown };
+	// A read tool_call that returned early never dropped a stale entry for its
+	// id, so the file has to match too.
+	const executedRead = event.input as {
+		path?: unknown;
+		filePath?: unknown;
+		offset?: unknown;
+		limit?: unknown;
+	};
 	const notedWidening =
 		readWidening &&
 		event.isError !== true &&
+		(executedRead.path ?? executedRead.filePath) === readWidening.inputPath &&
 		executedRead.offset === readWidening.shown.offset &&
 		executedRead.limit === readWidening.shown.limit
 			? readWidening
@@ -1252,7 +1260,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			type: "phase",
 			phase: "read_widening_note",
 			toolName: event.toolName,
-			filePath: rawFilePath ?? "",
+			filePath: notedWidening.filePath,
 			durationMs: 0,
 			metadata: {
 				requested: notedWidening.requested,
@@ -1793,7 +1801,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// stays where it was. Text with more lines than pi's own count
 				// (truncation, then the requested limit) is not pi's raw output: a
 				// producer upstream decorated it, and its hashes would refuse lines
-				// that did not change, so the disk stays the evidence.
+				// that did not change. The disk now holds the racing write, so the
+				// evidence is then the tool_call's own capture, read before the
+				// racer (the provisional record this result supersedes), and no
+				// hashes at all when there is none.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
 				const deliveredText = raced
 					? deliveredLineEvidence(
@@ -1813,13 +1824,23 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					(piLineCount === undefined || deliveredText.lineCount <= piLineCount)
 						? deliveredText
 						: undefined;
+				const fallbackHashes =
+					raced && !delivered
+						? (deps.readGuard
+								.getReadHistory(deliveredFilePath)
+								.find(
+									(record) =>
+										record.source ===
+										`native-read:${nativeReadToolCallId}:provisional`,
+								)?.lineHashes ?? {})
+						: undefined;
 				if (raced) {
 					incrementDegradationCount({
 						kind: "native-read-raced-writer",
 						subject: deliveredFilePath,
 						reason: delivered
 							? "the file changed between pi's read and its tool_result; the read is recorded from the delivered text"
-							: "the file changed between pi's read and its tool_result; the delivered text does not match pi's line count, so the disk is the evidence",
+							: "the file changed between pi's read and its tool_result; the delivered text does not match pi's line count, so the tool_call's capture is the evidence",
 					});
 				}
 				const deliveredRecord = {
@@ -1830,6 +1851,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					effectiveLimit: delivered?.lineCount ?? deliveredLimit,
 					expandedByLsp: false,
 					...(delivered?.lineHashes && { lineHashes: delivered.lineHashes }),
+					...(fallbackHashes && { lineHashes: fallbackHashes }),
 					turnIndex: runtime.turnIndex,
 					writeIndex: runtime.peekWriteIndex(),
 					timestamp: Date.now(),

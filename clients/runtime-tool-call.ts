@@ -966,6 +966,8 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				// fast path found it, whatever an LSP calls it.
 				if (toolCallId !== undefined) {
 					runtime.recordReadWidening(toolCallId, {
+						filePath,
+						inputPath: readInput.path ?? readInput.filePath,
 						requested: {
 							offset: requestedReadOffset,
 							limit: requestedReadLimit,
