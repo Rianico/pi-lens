@@ -146,10 +146,23 @@ jobs:
     name: TLA+ models
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
-    # refs #3447: TLC over formal/*/*.cfg. Measured locally: 166s for 74
-    # configs on 4 cores (the largest, lsp-server-content's two-writer
-    # configs, about 19s each); timeout = floor of 10 min.
-    timeout-minutes: 10
+    # refs #3572, #3517: TLC over formal/*/*.cfg (320 configs as of this
+    # change), run through a CPU-sized concurrency pool instead of one at a
+    # time (scripts/check-tla-models.mjs). Master's serial run was cancelled
+    # at this job's old 10-minute cap on 551415b28 (job 108489017472, run
+    # 36272506689): the step ran 598s and every config it reached passed, so
+    # the serial approach had simply outgrown the budget as formal/ grew.
+    # Measured locally on a heavily loaded 4-core box (load average up to
+    # 45, so a dedicated CI runner should do at least this well): the
+    # unparallelized checker took 1099s (18m19s) for all 320 configs;
+    # the pooled checker took 530s (8m50s) for the same 320, 0 failures,
+    # confirming this is real parallelism and not just relabeled work (user
+    # time ~20m in both runs). 12 minutes (720s) gives >=20% headroom over
+    # that 530s worst-case measurement while still cutting the prior stopgap
+    # (#3591 raised this to 20 minutes) by almost half; re-tune from a real
+    # CI run once this lands, since a dedicated runner has no other tenants
+    # contending for its 4 cores.
+    timeout-minutes: 12
     permissions:
       contents: read
 

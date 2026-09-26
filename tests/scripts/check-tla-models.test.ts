@@ -210,6 +210,7 @@ describe("buildJavaArgs (#3572, #3517)", () => {
 	it("runs the config by its basename, from the module's own directory", () => {
 		const args = buildJavaArgs("/jar", "/meta", "X.cfg", "Mod", 3);
 		expect(args).toEqual([
+			"-Djava.io.tmpdir=/meta",
 			"-XX:+UseParallelGC",
 			"-cp",
 			"/jar",
@@ -222,6 +223,18 @@ describe("buildJavaArgs (#3572, #3517)", () => {
 			"X.cfg",
 			"Mod",
 		]);
+	});
+
+	it("pins the JVM temp dir to the run's own metadir, not the shared OS temp dir", () => {
+		// SANY extracts the TLA+ standard modules to java.io.tmpdir under a
+		// fixed filename, so two concurrent TLC processes sharing the OS temp
+		// dir can race there (#3572: reproduced running the pool over all of
+		// formal/, one `AbortException` in 320 configs). Each run must get its
+		// own tmpdir instead of the JVM default.
+		const args = buildJavaArgs("/jar", "/meta-a", "X.cfg", "Mod", 1);
+		expect(args[0]).toBe("-Djava.io.tmpdir=/meta-a");
+		const other = buildJavaArgs("/jar", "/meta-b", "X.cfg", "Mod", 1);
+		expect(other[0]).toBe("-Djava.io.tmpdir=/meta-b");
 	});
 });
 

@@ -164,9 +164,21 @@ export function computeWorkers(expect, sharedWorkers) {
 	return expect.status === "violated" ? 1 : sharedWorkers;
 }
 
-/** The `java` argv TLC runs with, as a pure function so tests need no JVM. */
+/**
+ * The `java` argv TLC runs with, as a pure function so tests need no JVM.
+ * `-Djava.io.tmpdir` is pinned to the run's own metadir: SANY extracts the
+ * TLA+ standard modules (Naturals.tla, Sequences.tla, ...) to the JVM's temp
+ * dir under a fixed name, not a unique one, so two TLC processes sharing the
+ * OS temp dir can race there and one sees the other's half-written copy
+ * (`tla2sany.semantic.AbortException`) — reproduced by running the pool at
+ * concurrency 4 over all of formal/ (#3572 PR body, "parallel-lane hazard").
+ * The pool makes this collision likelier by running several TLC processes
+ * at once, so it is this change's own job to isolate it, not a pre-existing
+ * risk merely inherited from the CI host.
+ */
 export function buildJavaArgs(jar, metadir, configBasename, module, workers) {
 	return [
+		`-Djava.io.tmpdir=${metadir}`,
 		"-XX:+UseParallelGC",
 		"-cp",
 		jar,
