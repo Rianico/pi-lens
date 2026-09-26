@@ -152,6 +152,7 @@
 		"@biomejs/biome": "^2.4.10",
 		"@earendil-works/pi-coding-agent": "^0.85.1",
 		"@earendil-works/pi-tui": "^0.85.1",
+		"@jridgewell/sourcemap-codec": "^1.6.0",
 		"@jridgewell/trace-mapping": "^0.3.31",
 		"@stryker-mutator/core": "10.0.0",
 		"@taplo/cli": "0.7.0",

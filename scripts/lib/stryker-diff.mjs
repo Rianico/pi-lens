@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { mapGeneratedLineToOriginal } from "./mutation-source-map.mjs";
 
 const IMPORT_SPECIFIER_RE =
 	/(?:from\s+|import\s*(?:\(\s*)?|require\(\s*)["']([^"']+)["']/g;
@@ -297,4 +298,177 @@ export function mapRelatedTests(
 		uncovered: sources.filter((file) => related.get(file).size === 0),
 		tests: [...new Set([...related.values()].flatMap((files) => [...files]))],
 	};
+}
+
+/**
+ * Build the per-run Stryker config object as PLAIN DATA (round 2 T1): every
+ * field on `stryker.config.mjs`'s default export is JSON-serializable
+ * (verified -- no functions, no `undefined`), so the driver writes this
+ * object straight to `.stryker/diff.config.mjs` via `JSON.stringify` rather
+ * than hand-building the file as a template-literal string. That makes the
+ * override itself directly testable: a test that only asserts the driver's
+ * SOURCE TEXT contains a string (`driver.toContain("mutation-touch-
+ * build.mjs")`) is satisfied by a comment mentioning that string and proves
+ * nothing about what Stryker actually runs (round-1 finding T1) -- this
+ * function's return value is exactly the config object Stryker reads.
+ *
+ * `buildCommand` is ALWAYS overridden, never inherited from `baseConfig`:
+ * Stryker writes the instrumented (mutation-switch-embedded) `.js` to disk
+ * during sandbox init, BEFORE `buildCommand` runs, so the base config's
+ * `"npm run build"` would silently discard every mutant for a compiled
+ * target before a single test executes (see scripts/lib/mutation-touch-
+ * build.mjs's own header). `force: true` keeps `incremental` enabled (so a
+ * budget-killed run still saves a partial report, round 2 S2) while never
+ * reading a STALE `.stryker/incremental.json` left by an earlier, unrelated
+ * local run (round 2 T4) -- `force` makes Stryker treat any existing
+ * incremental file as absent on the read side, without disabling the
+ * write-on-interrupt behavior that depends on `options.incremental` alone.
+ *
+ * @param {object} baseConfig stryker.config.mjs's default export
+ * @param {{command: string}} options the per-run test command
+ */
+export function buildRunConfig(baseConfig, { command }) {
+	return {
+		...baseConfig,
+		force: true,
+		buildCommand: "node scripts/lib/mutation-touch-build.mjs",
+		commandRunner: { ...baseConfig.commandRunner, command },
+	};
+}
+
+const INSTRUMENTED_MUTANT_COUNT_RE =
+	/Instrumented \d+ source file\(s\) with (\d+) mutant\(s\)/;
+const DRY_RUN_NET_MS_RE = /Ran \d+ tests? in .*?\(net (\d+) ms/;
+
+/**
+ * Parse the total mutant count and the dry run's net duration out of
+ * Stryker's own `--dryRunOnly` console output (round 2 S2). Neither number
+ * is in the JSON report -- `--dryRunOnly` produces no report at all, since
+ * no mutation testing occurred -- so the console text is the only source,
+ * matched against a real run's captured lines:
+ * `Instrumented 1 source file(s) with 39 mutant(s)` and `Initial test run
+ * succeeded. Ran 1 tests in 2 seconds (net 2758 ms, overhead 0 ms).`
+ * (2026-09-26, `clients/atomic-write.js:1-190`).
+ *
+ * @param {string} output combined stdout+stderr of a `--dryRunOnly` run
+ * @returns {{totalMutants: number, dryRunMs: number} | null} null when
+ *   either line is missing (a Stryker output format the driver cannot read)
+ */
+export function parseDryRunCost(output) {
+	const mutantMatch = INSTRUMENTED_MUTANT_COUNT_RE.exec(output);
+	const dryRunMatch = DRY_RUN_NET_MS_RE.exec(output);
+	if (!mutantMatch || !dryRunMatch) return null;
+	return {
+		totalMutants: Number(mutantMatch[1]),
+		dryRunMs: Number(dryRunMatch[1]),
+	};
+}
+
+/**
+ * How many mutants the remaining budget affords, from a real measured dry
+ * run (round 2 S2's arithmetic: `allowed = budget × concurrency ÷ dry-run
+ * seconds`, the command runner reruns the WHOLE related-test dry run for
+ * every mutant at the configured concurrency). `safetyFactor` (< 1) reserves
+ * headroom for the real run's own overhead the estimate cannot see (report
+ * writing, sandbox teardown, timing variance between runs) -- without it, a
+ * budget sized exactly to the point estimate still overruns in practice.
+ *
+ * @param {{remainingMs: number, concurrency: number, dryRunMs: number, safetyFactor?: number}} args
+ * @returns {number} at least 1
+ */
+export function estimateAffordableMutants({
+	remainingMs,
+	concurrency,
+	dryRunMs,
+	safetyFactor = 0.7,
+}) {
+	if (dryRunMs <= 0) return 1;
+	const affordable = Math.floor(
+		((remainingMs / 1000) * concurrency * safetyFactor) / (dryRunMs / 1000),
+	);
+	return Math.max(1, affordable);
+}
+
+/**
+ * Removes exact duplicate `--mutate` patterns (round 2 S3): the same
+ * collapsed generated range can be produced by two different `.ts` hunks
+ * mapping onto the SAME `.js` line span (verified on a real #3579 replay:
+ * `clients/instance-reaper.js:215-215` appeared twice), and each duplicate
+ * otherwise spends a slot in the range budget on a range Stryker would
+ * instrument and test identically the first time.
+ *
+ * @param {string[]} patterns
+ * @returns {string[]} in first-seen order
+ */
+export function dedupePatterns(patterns) {
+	return [...new Set(patterns)];
+}
+
+/**
+ * Augments each mutant of a Stryker-shaped report (the completed
+ * `reports/mutation/mutation.json`, or the `.stryker/incremental.json` a
+ * budget kill leaves behind -- both share the same
+ * `{files: {name: {mutants: [...]}}}` shape) IN PLACE with the pre-mutation
+ * source snippet and, for a compiled target, the `.ts` location the `.js`
+ * survivor maps back to (round 2 S3: column-aware via
+ * `mapGeneratedLineToOriginal`'s column argument). Returns the flattened
+ * mutant list (each carrying its own `fileName`) and the killed/survived/…
+ * counts, shared by both the normal-completion and partial-report paths in
+ * the driver so neither drifts from the other, and unit-testable here
+ * against literal report fixtures (an injectable `readFile` takes the place
+ * of the real filesystem read for the source snippet).
+ *
+ * @param {object} strykerReport
+ * @param {Map<string, {index: object, tsFile: string}>} compiledIndexByJsFile
+ * @param {{readFile?: (file: string) => string}} [options]
+ */
+export function augmentAndSummarize(
+	strykerReport,
+	compiledIndexByJsFile,
+	{ readFile = (file) => readFileSync(file, "utf8") } = {},
+) {
+	for (const [fileName, file] of Object.entries(strykerReport.files ?? {})) {
+		const compiled = compiledIndexByJsFile.get(fileName);
+		let sourceLines = null;
+		try {
+			sourceLines = readFile(fileName).split("\n");
+		} catch {
+			sourceLines = null;
+		}
+		for (const mutant of file.mutants ?? []) {
+			if (sourceLines)
+				mutant.original = extractSnippet(sourceLines, mutant.location);
+			if (compiled && mutant.location?.start?.line != null) {
+				const column =
+					mutant.location.start.column != null
+						? mutant.location.start.column - 1
+						: undefined;
+				const tsLine = mapGeneratedLineToOriginal(
+					compiled.index,
+					mutant.location.start.line,
+					column,
+				);
+				if (tsLine != null) {
+					mutant.tsLocation = { fileName: compiled.tsFile, line: tsLine };
+				}
+			}
+		}
+	}
+
+	const mutants = Object.entries(strykerReport.files ?? {}).flatMap(
+		([fileName, file]) =>
+			(file.mutants ?? []).map((mutant) => ({ ...mutant, fileName })),
+	);
+	const counts = mutants.reduce((out, mutant) => {
+		out[mutant.status] = (out[mutant.status] ?? 0) + 1;
+		return out;
+	}, {});
+	// The mutation-report schema stores no score; Stryker's definition is
+	// (killed + timeout) / (total - ignored - no coverage).
+	const killed = (counts.Killed ?? 0) + (counts.Timeout ?? 0);
+	const denominator =
+		mutants.length - (counts.Ignored ?? 0) - (counts.NoCoverage ?? 0);
+	const score =
+		denominator > 0 ? ((killed / denominator) * 100).toFixed(2) : "n/a";
+	return { mutants, counts, score };
 }

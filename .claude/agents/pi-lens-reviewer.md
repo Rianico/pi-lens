@@ -133,7 +133,12 @@ can trip, and say in your report which you ran and what each returned.
   unaddressed, unjustified survivor is a finding. A 0-mutant run (the comment
   always states why) is not itself a finding, but it also buys the PR no
   credit -- the standing hand-mutation probe above still applies to whatever
-  Stryker didn't evaluate.
+  Stryker didn't evaluate, including a **partial** run (a budget kill that
+  still reports the mutants it reached before the cutoff, labelled `Partial
+  run` in the comment): everything past the "N of M evaluated" line is
+  exactly as untested as a 0-mutant run's whole range, a range the
+  deterministic sampler dropped over budget, or a file skipped over
+  `--max-files` or with no covering test.
 - **Changelog fragment front matter.** The fragment needs YAML front matter
   with a `section:` key set to one of Added, Changed, Deprecated, Removed,
   Fixed, or Security, followed by exactly one top-level entry. Title

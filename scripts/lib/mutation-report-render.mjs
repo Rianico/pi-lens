@@ -61,6 +61,18 @@ export function renderMutationMarkdown(report) {
 				.map((mutant) => ({ ...mutant, fileName })),
 	);
 
+	// round 2 S2: a budget kill can still leave a real, partial result --
+	// labelled here so it is never confused with a run that evaluated every
+	// range it set out to.
+	if (meta.partial) {
+		lines.push(
+			`**Partial run** -- ${meta.partial.evaluated} of ${meta.partial.total ?? "an unknown total of"} mutant(s) evaluated before the budget expired.`,
+			"",
+			`> ${meta.partial.reason}`,
+			"",
+		);
+	}
+
 	lines.push(
 		`**Score: ${meta.score ?? "n/a"}%** -- ${counts.Killed ?? 0} killed, ${counts.Survived ?? 0} survived, ${counts.Timeout ?? 0} timeout, ${counts.NoCoverage ?? 0} no coverage (${total} total)`,
 		"",
@@ -100,6 +112,32 @@ export function renderMutationMarkdown(report) {
 		);
 	}
 
+	return lines.join("\n");
+}
+
+/**
+ * Renders the sticky comment's body when THIS head produced no artifact to
+ * download at all (round 2 T6): the driver crashed before `writeReport`, or
+ * the job hit its 90-minute `timeout-minutes` cap outright. Without this,
+ * the comment job's download step simply has nothing to post, and an
+ * earlier head's report -- now stale, about a commit this PR no longer is
+ * -- stays up with no indication it no longer applies to the current head.
+ * Carries the same `STICKY_MARKER` so a later successful run still finds
+ * and updates this same comment rather than posting a second one.
+ *
+ * @param {{headSha?: string, runUrl?: string}} [context]
+ * @returns {string} markdown
+ */
+export function renderStaleMarkdown({ headSha, runUrl } = {}) {
+	const lines = [
+		STICKY_MARKER,
+		"### Mutation diff (advisory)",
+		"",
+		`**Stale.** This head (\`${shortSha(headSha)}\`) produced no mutation report -- the job likely crashed before writing one, or hit its overall time cap outright (distinct from the driver's own, narrower Stryker budget, which always writes a report even when Stryker itself times out).`,
+		"",
+		"This comment is left over from an earlier, different commit and no longer reflects this PR's current head.",
+	];
+	if (runUrl) lines.push("", `[Job run](${runUrl})`);
 	return lines.join("\n");
 }
 

@@ -55,3 +55,22 @@ export declare function extractSnippet(
 		  }
 		| undefined,
 ): string | undefined;
+export declare function buildRunConfig(
+	baseConfig: Record<string, unknown> & { commandRunner?: object },
+	options: { command: string },
+): Record<string, unknown>;
+export declare function parseDryRunCost(
+	output: string,
+): { totalMutants: number; dryRunMs: number } | null;
+export declare function estimateAffordableMutants(args: {
+	remainingMs: number;
+	concurrency: number;
+	dryRunMs: number;
+	safetyFactor?: number;
+}): number;
+export declare function dedupePatterns(patterns: string[]): string[];
+export declare function augmentAndSummarize(
+	strykerReport: { files?: Record<string, { mutants?: any[] }> },
+	compiledIndexByJsFile: Map<string, { index: object; tsFile: string }>,
+	options?: { readFile?: (file: string) => string },
+): { mutants: any[]; counts: Record<string, number>; score: string };

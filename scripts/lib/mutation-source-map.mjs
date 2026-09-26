@@ -26,7 +26,25 @@
  * real decoded map from clients/atomic-write.ts confirms line-for-line
  * (js:100 -> ts:122, content-verified) against `eachMapping`'s raw segments.
  */
-import { TraceMap, eachMapping } from "@jridgewell/trace-mapping";
+import {
+	GREATEST_LOWER_BOUND,
+	originalPositionFor,
+	TraceMap,
+	eachMapping,
+} from "@jridgewell/trace-mapping";
+
+/**
+ * Construct the `TraceMap` a column-aware reverse lookup needs
+ * (`mapGeneratedLineToOriginal`'s `generatedColumn` argument). Centralized
+ * here so `TraceMap` is constructed from one place in this module rather
+ * than importing `@jridgewell/trace-mapping` a second time at the call
+ * site.
+ *
+ * @param {object} rawMap parsed source map JSON
+ */
+export function createTracer(rawMap) {
+	return new TraceMap(rawMap);
+}
 
 /**
  * Decode a tsc-emitted source map (parsed v3 JSON) into ascending
@@ -138,19 +156,47 @@ export function mapRangesToGenerated(index, ranges, totalGeneratedLines) {
 }
 
 /**
- * Map one `.js` survivor line back to the `.ts` source line of the
- * statement that most recently started at or before it -- the same
- * "nearest preceding mapped statement" reading tsc's sparse per-statement
- * source maps imply for any generated line that isn't itself a mapped
- * statement start (a continuation line of a multi-line expression, a
- * closing brace, …). Returns null when the line precedes every mapped
- * statement (front-matter comments before the first compiled line).
+ * Map one `.js` survivor location back to the `.ts` source line, column-
+ * aware when a column and a `tracer` (from `createTracer`) are given.
  *
- * @param {{reverse: Array<[number, number]>}} index from buildLineIndex
+ * Several `.ts` statements collapsed onto one generated line (tsc emits a
+ * per-token, not just per-line, mapping there) report the WRONG `.ts` line
+ * under a line-only lookup: verified against a real build,
+ * `clients/actionable-warnings-logger.js:9` holds `.ts` lines 10-12 on one
+ * line, and `originalPositionFor` at the real Stryker mutant columns of
+ * `128 * 1024` and `??` resolves to `.ts:11` and `.ts:12` respectively --
+ * both would read as `.ts:10` (the line's first mapped statement) under
+ * the line-only fallback below.
+ *
+ * `originalPositionFor` only searches WITHIN the queried generated line
+ * (verified: it returns `null` for a line with no segment of its own, never
+ * falling back to a preceding line the way a human reading the sparse map
+ * would), so a continuation line -- the body of a multi-line call, a
+ * closing brace -- falls through to the same "nearest preceding mapped
+ * statement" line index `mapRangesToGenerated` uses, giving every caller
+ * one answer regardless of which case its survivor lands in.
+ *
+ * @param {{reverse: Array<[number, number]>, tracer?: object}} index from
+ *   buildLineIndex, with `tracer` (from createTracer) added for the
+ *   column-aware path
  * @param {number} generatedLine
+ * @param {number} [generatedColumn] 0-based; Stryker's own locations are
+ *   1-based, so a caller passes `mutant.location.start.column - 1`
  * @returns {number | null}
  */
-export function mapGeneratedLineToOriginal(index, generatedLine) {
+export function mapGeneratedLineToOriginal(
+	index,
+	generatedLine,
+	generatedColumn,
+) {
+	if (generatedColumn != null && index.tracer) {
+		const position = originalPositionFor(index.tracer, {
+			line: generatedLine,
+			column: generatedColumn,
+			bias: GREATEST_LOWER_BOUND,
+		});
+		if (position.line != null) return position.line;
+	}
 	const entry = floor(index.reverse, generatedLine);
 	return entry ? entry[1] : null;
 }

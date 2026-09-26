@@ -4,6 +4,13 @@ on:
   pull_request:
     branches: [master]
 
+# round 2 T6: without this, pushing twice to the same PR queues two mutation
+# runs; the older one's report can still land (and its comment update fire)
+# AFTER the newer one's, showing a stale head's result as current.
+concurrency:
+  group: mutation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions: {}
 
 jobs:
@@ -41,7 +48,14 @@ jobs:
       # mcp/**/*.ts and index.ts (through their compiled .js -- see
       # scripts/stryker-diff.mjs), building its own tsconfig.mutation.json
       # source maps internally; no separate build step is needed here for that.
-      - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6
+      #
+      # --head-sha (round 2 T6): a `pull_request` checkout's `git rev-parse
+      # HEAD` is the CI MERGE-REF commit, not the PR's own head -- neither
+      # stable across re-runs once master moves, nor matchable by a reader to
+      # an actual PR commit, and it silently breaks the "the same PR head
+      # always samples the same subset" reproducibility claim the whole
+      # deterministic-seed design rests on.
+      - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6 --head-sha "${{ github.event.pull_request.head.sha }}"
       # Always runs, even when the step above exited non-zero (a 0-mutant run
       # is not a step failure by itself, but the driver still exits 1 for a
       # genuine Stryker failure such as a budget timeout) -- #3531's "a 0-
@@ -87,9 +101,27 @@ jobs:
         with:
           name: mutation-report
           path: reports/mutation
+        # `mutation`'s own upload step already runs with `if: always()` and
+        # `if-no-files-found: ignore` -- this download step failing (or
+        # finding nothing) means the mutation job produced NO artifact at all
+        # (a crash before writeReport, or the job hit its own 90-minute cap
+        # outright), not that this step should abort.
+        continue-on-error: true
       - name: Post or update the sticky mutation comment
         if: hashFiles('reports/mutation/mutation.json') != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: node scripts/mutation-pr-comment.mjs --pr "${{ github.event.pull_request.number }}"
+      # round 2 T6: when the artifact never existed, the step above never ran
+      # and an EARLIER head's comment -- now about a commit this PR no longer
+      # is -- would otherwise just stay up with nothing marking it stale.
+      - name: Mark the sticky comment stale (no report was produced for this head)
+        if: hashFiles('reports/mutation/mutation.json') == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          node scripts/mutation-pr-comment.mjs --pr "${{ github.event.pull_request.number }}" --stale \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	renderMutationMarkdown,
+	renderStaleMarkdown,
 	STICKY_MARKER,
 } from "../../scripts/lib/mutation-report-render.mjs";
 
@@ -161,6 +162,90 @@ describe("renderMutationMarkdown", () => {
 		expect(
 			renderMutationMarkdown({ files: {}, piLensMutationDiff: {} }),
 		).toContain(STICKY_MARKER);
+	});
+
+	it("round 2 S2: labels a partial (budget-killed) run distinctly, alongside whatever DID run", () => {
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/string-utils.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "ConditionalExpression",
+							replacement: "true",
+							status: "Killed",
+							location: {
+								start: { line: 19, column: 12 },
+								end: { line: 19, column: 17 },
+							},
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: {
+					reason:
+						"mutation diff: no mutants evaluated; the 0.55-minute mutation budget expired before Stryker produced a result",
+					evaluated: 6,
+					total: 9,
+				},
+				counts: { Killed: 6 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).toContain("Partial run");
+		expect(markdown).toContain("6 of 9 mutant(s) evaluated");
+		expect(markdown).toContain("budget expired");
+		// The partial run's own real counts still render, same as a complete run.
+		expect(markdown).toContain("100.00");
+	});
+
+	it("names an unknown total when the partial run's total mutant count could not be measured", () => {
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				zeroMutants: null,
+				partial: { reason: "budget expired", evaluated: 3, total: null },
+				counts: { Killed: 3 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).toContain("3 of an unknown total of mutant(s)");
+	});
+});
+
+describe("renderStaleMarkdown (#3531 round 2 T6)", () => {
+	it("names the head that produced no report, and carries the sticky marker so a later run finds and updates it", () => {
+		const markdown = renderStaleMarkdown({
+			headSha: "deadbeef00001234",
+			runUrl: undefined,
+		});
+
+		expect(markdown).toContain(STICKY_MARKER);
+		expect(markdown).toContain("Stale");
+		expect(markdown).toContain("deadbeef0000");
+		expect(markdown).toContain("no longer reflects this PR's current head");
+	});
+
+	it("links the job run when a run URL is given", () => {
+		const markdown = renderStaleMarkdown({
+			headSha: "abc123",
+			runUrl: "https://github.com/apmantza/pi-lens/actions/runs/123",
+		});
+
+		expect(markdown).toContain(
+			"[Job run](https://github.com/apmantza/pi-lens/actions/runs/123)",
+		);
+	});
+
+	it("renders without throwing when given no context at all", () => {
+		expect(() => renderStaleMarkdown()).not.toThrow();
+		expect(renderStaleMarkdown()).toContain(STICKY_MARKER);
 	});
 });
 

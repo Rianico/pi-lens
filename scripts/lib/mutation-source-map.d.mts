@@ -1,3 +1,4 @@
+export declare function createTracer(rawMap: object): object;
 export declare function decodeSourceMapRows(
 	rawMap: object,
 ): Array<{ generatedLine: number; originalLine: number }>;
@@ -13,7 +14,8 @@ export declare function mapRangesToGenerated(
 	totalGeneratedLines: number,
 ): Array<[number, number]>;
 export declare function mapGeneratedLineToOriginal(
-	index: { reverse: Array<[number, number]> },
+	index: { reverse: Array<[number, number]>; tracer?: object },
 	generatedLine: number,
+	generatedColumn?: number,
 ): number | null;
 export declare function countLines(content: string): number;

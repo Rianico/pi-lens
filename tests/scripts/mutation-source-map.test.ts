@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
 	buildLineIndex,
 	countLines,
+	createTracer,
 	decodeSourceMapRows,
 	mapGeneratedLineToOriginal,
 	mapRangesToGenerated,
@@ -114,6 +115,57 @@ describe("mapGeneratedLineToOriginal (reverse: survivor .js:line -> .ts:line)", 
 
 	it("returns null for a generated line before every mapped statement", () => {
 		expect(mapGeneratedLineToOriginal(index, 0)).toBeNull();
+	});
+});
+
+describe("mapGeneratedLineToOriginal, column-aware (#3531 round 2 S3)", () => {
+	// Mirrors a real collapsed multi-line expression verified against a real
+	// build: clients/actionable-warnings-logger.ts's `Math.max(\n\t128 * 1024,
+	// \n\tNumber.parseInt(...) ?? ...\n)` (ts lines 10-12) compiles to one js
+	// line (9) with per-token segments -- `128 * 1024` at ts:11, `??` at
+	// ts:12 -- not one line-level "ts:10" segment. Columns are 0-based here to
+	// match `sourcemap-codec`'s `encode`; production passes
+	// `mutant.location.start.column - 1` since Stryker's own columns are
+	// 1-based (verified separately in stryker-diff.test.ts).
+	const rawMap = {
+		version: 3,
+		sources: ["fixture.ts"],
+		names: [],
+		mappings: encode([
+			[], // js line 1: no mapping at all (a continuation line -- e.g. the
+			// closing `);` of a call whose head is on the next mapped line)
+			[
+				[0, 0, 9, 0], // js:2 col 0 -> ts:10 col 0 (the call's own head)
+				[10, 0, 10, 1], // js:2 col 10 -> ts:11 col 1 (`128 * 1024`)
+				[21, 0, 11, 2], // js:2 col 21 -> ts:12 col 2 (`??`)
+			],
+		]),
+	};
+	const tracer = createTracer(rawMap);
+	const index = { ...buildLineIndex(decodeSourceMapRows(rawMap)), tracer };
+
+	it("resolves two different mutants on the SAME generated line to their own .ts lines", () => {
+		expect(mapGeneratedLineToOriginal(index, 2, 10)).toBe(11);
+		expect(mapGeneratedLineToOriginal(index, 2, 21)).toBe(12);
+	});
+
+	it("resolves a column past the last segment on the line to that last segment (GREATEST_LOWER_BOUND)", () => {
+		expect(mapGeneratedLineToOriginal(index, 2, 30)).toBe(12);
+	});
+
+	it("falls back to the nearest preceding mapped statement when the exact line has no segment of its own", () => {
+		// js:1 carries no mapping; the line-based fallback attributes it to the
+		// nearest preceding mapped statement, same as the no-column API.
+		expect(mapGeneratedLineToOriginal(index, 1, 0)).toBeNull();
+	});
+
+	it("falls back to the line-based lookup when no column is given, even with a tracer present", () => {
+		expect(mapGeneratedLineToOriginal(index, 2)).toBe(10);
+	});
+
+	it("falls back to the line-based lookup when no tracer is present, even with a column given", () => {
+		const noTracerIndex = buildLineIndex(decodeSourceMapRows(rawMap));
+		expect(mapGeneratedLineToOriginal(noTracerIndex, 2, 21)).toBe(10);
 	});
 });
 
