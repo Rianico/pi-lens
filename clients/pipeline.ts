@@ -1447,7 +1447,7 @@ export async function runFormatPhase(
 		formatUnavailable,
 		fileContent,
 		fileReadStamp,
-		abandoned,
+		...(abandoned === undefined ? {} : { abandoned }),
 	};
 }
 

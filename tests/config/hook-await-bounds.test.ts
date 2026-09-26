@@ -355,6 +355,18 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"queue, not the work it admits — #2523 says so explicitly.",
 		owner: "#2523 slice 2",
 	},
+	"clients/runtime-agent-end.ts#0b7eb0bf~12dfd718": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit resync awaits the abandoned format phase's " +
+			"`abandoned` promise inside a `void`-launched task that starts " +
+			"only after `agent_settled`'s own `bounded()` gave up on the " +
+			"phase; the hook never awaits it. It settles when the abandoned " +
+			"formatter run does: its spawn has a 15 s timeout, the command " +
+			"resolution before the spawn has none (#3558).",
+		owner: "#3529",
+	},
 	"clients/runtime-agent-end.ts#1f35703b~52cc4490": {
 		family: "hook-await",
 		site: "agent_settled",
@@ -363,6 +375,16 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"agent_settled list (runtime-agent-end.ts:871): count-capped at " +
 			"5 fixes, with no time bound at all.",
 		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#5f7b6a40~380334ff": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit resync awaits the abandoned format phase " +
+			"itself inside a `void`-launched task that starts only after " +
+			"`agent_settled`'s own `bounded()` gave up on that phase; the " +
+			"hook never awaits it.",
+		owner: "#3529",
 	},
 	"clients/runtime-agent-end.ts#846909f2~82252dcb": {
 		family: "hook-await",
@@ -375,6 +397,16 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"race; the 3-wedged-formatter probe measured `still-blocked " +
 			"after 45011ms`.",
 		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#b2e21790~2c16e2ec": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit `resyncLspFile` of a fresh stamped read, inside " +
+			"a `void`-launched task the hook never awaits (it starts after " +
+			"`agent_settled`'s `bounded()` gave up on the phase). The resync " +
+			"races its own touch against the LSP sync budget.",
+		owner: "#3529",
 	},
 	"clients/runtime-agent-end.ts#b2e21790~677753f9": {
 		family: "hook-await",

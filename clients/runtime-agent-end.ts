@@ -174,7 +174,7 @@ export async function handleAgentEnd({
 		// #3528: a drain that outlived its session requeues nothing into the
 		// next session's cleared queue; the drop is one ledger row.
 		session.guardedWrite(
-			pending.map((record) => record.filePath).join(", "),
+			pending.map((queued) => queued.filePath).join(", "),
 			() => {
 				const kinds = new Set<"autofix" | "format">();
 				const toolNames = new Set<string>();
@@ -640,7 +640,6 @@ export async function handleAgentEnd({
 								toolName: "agent_end",
 								filePath,
 								phase: "deferred_format_post_exit_resync",
-								turnId: record.queuedTurnId,
 								durationMs: Date.now() - fileStart,
 								metadata: { outcome },
 							});
