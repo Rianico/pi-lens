@@ -1798,15 +1798,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// so the disk may not be what pi delivered, and by now it holds the
 				// racer's bytes. The stamp stays where it was. The evidence is the
 				// delivered text (less pi's continuation notice) when pi's own count
-				// (truncation, then the requested limit) vouches for it: text with
-				// more lines is not pi's raw output, a producer upstream decorated
-				// it. With no count (no limit, no truncation) nothing vouches for
-				// the text. Otherwise the evidence is the tool_call's own capture:
-				// the provisional record this result supersedes, the newest one,
-				// since an id can be reused. Where the capture equals the text, the
-				// two are the same evidence; where a write landed before pi's read,
-				// the capture refuses lines the agent was shown until it re-reads.
-				// With no capture there is no evidence, and nothing is recorded.
+				// vouches for it: no more lines than pi's truncation count, or, for
+				// an untruncated limited read, exactly as many lines as the
+				// tool_call's capture hashed. Other text is not pi's raw output (a
+				// producer upstream decorated it), and a read with no count (no
+				// limit, no truncation) has nothing to vouch for it. The evidence
+				// is then the tool_call's own capture: the provisional record this
+				// result supersedes, the newest one, since an id can be reused,
+				// clipped to the lines pi showed. Where the capture equals the text,
+				// the two are the same evidence; where a write landed before pi's
+				// read, the capture refuses lines the agent was shown until it
+				// re-reads. With no hashed capture there is no evidence, and
+				// nothing is recorded.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
 				const deliveredText = raced
 					? deliveredLineEvidence(
@@ -1831,31 +1834,50 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 									`native-read:${nativeReadToolCallId}:provisional`,
 							)
 					: undefined;
-				const piLineCount = truncation?.outputLines ?? requestedLimit;
+				const captureHashes = capture?.lineHashes;
+				const capturedLines = captureHashes
+					? Object.keys(captureHashes).length
+					: 0;
 				const delivered =
 					deliveredText &&
-					piLineCount !== undefined &&
-					deliveredText.lineCount <= piLineCount
+					(truncation?.outputLines !== undefined
+						? deliveredText.lineCount <= truncation.outputLines
+						: requestedLimit !== undefined &&
+							deliveredText.lineCount === capturedLines)
 						? deliveredText
 						: undefined;
+				const shownLimit =
+					capture &&
+					Math.min(
+						capture.effectiveLimit,
+						truncation?.outputLines ?? Number.POSITIVE_INFINITY,
+						capturedLines,
+					);
+				const captureEvidence = capture &&
+					captureHashes &&
+					shownLimit && {
+						effectiveOffset: capture.effectiveOffset,
+						effectiveLimit: shownLimit,
+						lineHashes: Object.fromEntries(
+							Object.entries(captureHashes).filter(
+								([line]) => Number(line) < capture.effectiveOffset + shownLimit,
+							),
+						),
+					};
 				if (raced) {
 					incrementDegradationCount({
 						kind: "native-read-raced-writer",
 						subject: deliveredFilePath,
 						reason: delivered
 							? "the file changed between pi's read and its tool_result; the read is recorded from the delivered text"
-							: capture
+							: captureEvidence
 								? "the file changed between pi's read and its tool_result; pi's line count does not vouch for the delivered text, so the tool_call's capture is the evidence"
-								: "the file changed between pi's read and its tool_result; pi's line count does not vouch for the delivered text and there is no tool_call capture, so the read is not recorded",
+								: "the file changed between pi's read and its tool_result; pi's line count does not vouch for the delivered text and there is no hashed tool_call capture, so the read is not recorded",
 					});
 				}
 				const evidence =
 					raced && !delivered
-						? capture && {
-								effectiveOffset: capture.effectiveOffset,
-								effectiveLimit: capture.effectiveLimit,
-								lineHashes: capture.lineHashes,
-							}
+						? captureEvidence
 						: {
 								effectiveOffset: requestedOffset,
 								effectiveLimit: delivered?.lineCount ?? deliveredLimit,
