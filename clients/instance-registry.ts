@@ -30,6 +30,12 @@ import {
 } from "./degradation-ledger.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import {
+	createGenerationSource,
+	type GenerationHandle,
+	type GenerationSource,
+} from "./generation-guard.js";
+import {
+	LOCK_WAIT_THROUGH_LEASE_MS,
 	withInstanceRegistryLock,
 	withInstanceRegistryLockSync,
 } from "./instance-registry-lock.js";
@@ -324,13 +330,16 @@ async function writeRegistryAsync(file: RegistryFile): Promise<void> {
 
 const REGISTRY_WRITE_RETRIES = 3;
 
+/** `mutate` returns undefined to write nothing (#3498). */
 async function writeRegistryWithRetry(
-	mutate: (file: RegistryFile) => RegistryFile,
+	mutate: (file: RegistryFile) => RegistryFile | undefined,
 	isCommitted: (file: RegistryFile) => boolean,
 ): Promise<void> {
 	await withInstanceRegistryLock(registryPath(), async () => {
 		for (let attempt = 0; attempt < REGISTRY_WRITE_RETRIES; attempt++) {
-			await writeRegistryAsync(mutate(await readRegistryAsync()));
+			const next = mutate(await readRegistryAsync());
+			if (next === undefined) return;
+			await writeRegistryAsync(next);
 			if (isCommitted(await readRegistryAsync())) return;
 		}
 	});
@@ -417,14 +426,23 @@ export function mergeInstanceRoots(
  * heartbeat/rss fields still refresh).
  */
 export function registerInstance(projectRoot: string): Promise<void> {
-	return queueRegistryMutation(() => registerInstanceNow(projectRoot));
+	const generation = registrationGeneration().capture();
+	return queueRegistryMutation(() =>
+		registerInstanceNow(projectRoot, generation),
+	);
 }
 
-async function registerInstanceNow(projectRoot: string): Promise<void> {
+async function registerInstanceNow(
+	projectRoot: string,
+	generation: GenerationHandle,
+): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
+	const normalizedRoot = normalizeFilePath(projectRoot);
+	// #3498: a registration made before `deregisterInstance` starts only after
+	// it (still queued) and must not become the heartbeat's repair root.
+	if (!registrationIsCurrent(generation, normalizedRoot)) return;
 	rememberRegistrationRoot(projectRoot);
 	const pid = process.pid;
-	const normalizedRoot = normalizeFilePath(projectRoot);
 	const now = new Date().toISOString();
 	const identity = isSubagentSession() ? getSubagentIdentity() : undefined;
 	const selfStart = await ownProcessStart(startReadOptions());
@@ -438,6 +456,8 @@ async function registerInstanceNow(projectRoot: string): Promise<void> {
 		: undefined;
 	await writeRegistryWithRetry(
 		(file) => {
+			// #3498: the session may have ended while this waited for the lock.
+			if (!registrationIsCurrent(generation, normalizedRoot)) return undefined;
 			const others = file.instances.filter(
 				(entry) => !isOwnEntry(entry, selfStart),
 			);
@@ -709,6 +729,48 @@ function registrationIntent(): {
 	);
 }
 
+/**
+ * #3498: advanced by `deregisterInstance`. `registerInstance` captures it when
+ * it is called, and a registration whose generation moved drops itself twice:
+ * before it sets the intent, and under the lock before it writes. A
+ * registration still queued, or still waiting on the lock, when the session
+ * ended would otherwise land after the removal and re-create the ended root,
+ * or point the heartbeat's repair at it. Process-wide for the same reason as
+ * the tail: the registration and the removal can run in different
+ * evaluations of this module. The heartbeat's repair calls `registerInstance`,
+ * so it captures the generation current after the heartbeat's own lock.
+ */
+const REGISTRATION_GENERATION_FAMILY =
+	"instance-registry.registration-generation";
+/** Bump when the generation cell's shape changes. */
+const REGISTRATION_GENERATION_VERSION = 1;
+
+function registrationGeneration(): GenerationSource {
+	return getProcessSingleton(
+		REGISTRATION_GENERATION_FAMILY,
+		REGISTRATION_GENERATION_VERSION,
+		() => createGenerationSource("instance-registry-registration"),
+	);
+}
+
+/**
+ * Whether a registration may still land, recording the drop when it may not.
+ * The record comes from this module's own ledger, not the generation source's:
+ * the source is a process singleton and may belong to another evaluation.
+ */
+function registrationIsCurrent(
+	generation: GenerationHandle,
+	normalizedRoot: string,
+): boolean {
+	if (generation.isCurrent()) return true;
+	incrementDegradationCount({
+		kind: "instance-registry-registration-superseded",
+		subject: normalizedRoot,
+		reason: "the session ended before this registration landed; dropped",
+	});
+	return false;
+}
+
 function rememberRegistrationRoot(root: string | undefined): void {
 	const intent = registrationIntent();
 	intent.root = root;
@@ -883,16 +945,61 @@ async function removeLspChildNow(
  */
 export function deregisterInstance(): void {
 	rememberRegistrationRoot(undefined);
+	registrationGeneration().bump();
 	if (!isInstanceRegistryEnabled()) return;
 	const selfStart = ownProcessStartIfKnown();
-	withInstanceRegistryLockSync(registryPath(), () => {
-		const file = readRegistrySync();
-		const remaining = file.instances.filter(
-			(entry) => !isOwnEntry(entry, selfStart),
-		);
-		if (remaining.length === file.instances.length) return;
-		writeRegistrySync({ instances: remaining });
+	const removed = withInstanceRegistryLockSync(registryPath(), () => {
+		const next = withoutOwnEntry(readRegistrySync(), selfStart);
+		if (next) writeRegistrySync(next);
+		return true;
 	});
+	if (removed) return;
+	// #3498: the lock was not free for the whole sync wait. The holder may be
+	// this process's own heartbeat or registration, which cannot release while
+	// the sync wait blocks the event loop. The process may live on through a
+	// session replacement, so queue the removal behind the holder instead of
+	// dropping it and leaving the ended session's root in the registry.
+	incrementDegradationCount({
+		kind: "instance-registry-deregister-queued",
+		subject: String(process.pid),
+		reason:
+			"the sync removal could not take the registry lock; queued behind the holder",
+	});
+	void queueRegistryMutation(deregisterInstanceAfterHolder);
+}
+
+/**
+ * The removal `deregisterInstance` could not make in its sync wait (#3498).
+ * It waits through the lock lease, so a holder that outlives the sync wait
+ * and an ordinary async wait still cannot make it drop.
+ */
+async function deregisterInstanceAfterHolder(): Promise<void> {
+	const selfStart = await ownProcessStart(startReadOptions());
+	await withInstanceRegistryLock(
+		registryPath(),
+		async () => {
+			const next = withoutOwnEntry(await readRegistryAsync(), selfStart);
+			if (next) await writeRegistryAsync(next);
+		},
+		LOCK_WAIT_THROUGH_LEASE_MS,
+	);
+}
+
+/**
+ * The file without this process's entry, or undefined when it holds none.
+ * Both removals, the sync one and the queued one, key it through
+ * `isOwnEntry` (#3498).
+ */
+function withoutOwnEntry(
+	file: RegistryFile,
+	selfStart: string | undefined,
+): RegistryFile | undefined {
+	const remaining = file.instances.filter(
+		(entry) => !isOwnEntry(entry, selfStart),
+	);
+	return remaining.length === file.instances.length
+		? undefined
+		: { instances: remaining };
 }
 
 /**

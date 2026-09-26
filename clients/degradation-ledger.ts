@@ -376,6 +376,12 @@ export type DegradationKind =
 	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "instance-registry-corrupt"
 	/**
+	 * #3498: `deregisterInstance`'s sync removal could not take the registry
+	 * lock, so the removal was queued on the registry tail behind the holder.
+	 * Subject is this process's pid.
+	 */
+	| "instance-registry-deregister-queued"
+	/**
 	 * #3071: a registration-record write fell back to the process cwd because
 	 * the session's identity carried no `projectRoot` — `instance-registry.ts`
 	 * still records the child, just without the caller-supplied root.
@@ -410,6 +416,12 @@ export type DegradationKind =
 	 * synthesizes a minimal host entry so the child stays tracked.
 	 */
 	| "instance-registry-registration-missing"
+	/**
+	 * #3498: a registration made before `deregisterInstance` reached its
+	 * intent or its write after it, and dropped itself. Subject is the
+	 * normalized root it would have registered.
+	 */
+	| "instance-registry-registration-superseded"
 	/**
 	 * #3383: a newline-framed reader (`createWarmIpcLineReader`) discarded an
 	 * unterminated line that had grown past `MAX_FRAMED_LINE_BYTES`. The peer is
