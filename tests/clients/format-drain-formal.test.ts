@@ -444,6 +444,72 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 		expect(staleWriteSubjects()).toEqual([`runtime-session:${filePath}`]);
 	});
 
+	describe("a drain whose session was replaced starts no new in-place write (#3528 r1 F1)", () => {
+		// FormatDrain FixNoStartGen: the old drain's write could not be synced to
+		// the next session's LSP document (its resync is skipped), so it must not
+		// start one.
+		it("the format phase does not start after /new during the autofix phase", async () => {
+			const { fixer, parked, resume } = gatedBiome();
+			writeBiomeAgreement();
+			runtime.deferMutation(
+				filePath,
+				env.tmpDir,
+				"edit",
+				env.tmpDir,
+				"autofix",
+			);
+			let spawned = false;
+			armChild();
+			child.spawned = () => {
+				spawned = true;
+			};
+			const drain = handleAgentEnd(
+				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+			);
+			await parked.p;
+			runtime.resetForSession(Date.now());
+			resume.open();
+			await drain;
+			expect(spawned).toBe(false);
+			expect(fs.readFileSync(filePath, "utf8")).toBe("let x=1\n");
+			expect(staleWriteSubjects()).toContain(`runtime-session:${filePath}`);
+		});
+
+		it("the autofix loop does not start the next file after /new", async () => {
+			const { fixer, parked, resume } = gatedBiome();
+			const fixFileAsync = vi.spyOn(
+				fixer as unknown as { fixFileAsync: () => unknown },
+				"fixFileAsync",
+			);
+			writeBiomeAgreement();
+			flags.add("no-autoformat");
+			// Its own project: Biome's fix scope is the project, so a second file
+			// of the same project would be deduped rather than started.
+			const otherRoot = path.join(env.tmpDir, "other");
+			fs.mkdirSync(otherRoot);
+			writeBiomeAgreement(otherRoot);
+			const second = path.join(otherRoot, "g.ts");
+			fs.writeFileSync(second, "const y=2\n");
+			runtime.deferMutation(
+				filePath,
+				env.tmpDir,
+				"edit",
+				env.tmpDir,
+				"autofix",
+			);
+			runtime.deferMutation(second, otherRoot, "edit", otherRoot, "autofix");
+			const drain = handleAgentEnd(
+				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+			);
+			await parked.p;
+			runtime.resetForSession(Date.now());
+			resume.open();
+			await drain;
+			expect(fixFileAsync).toHaveBeenCalledTimes(1);
+			expect(fs.readFileSync(second, "utf8")).toBe("const y=2\n");
+		});
+	});
+
 	describe("no-drop (#3528, shape 54): a drain that stays in its session still records", () => {
 		it("the format's recordWritten, change log, modified range and turn summary land in its own session", async () => {
 			flags.add("lens-turn-summary");
@@ -500,22 +566,25 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 });
 
 /** The Biome agreement evidence the autofix gate needs, and a biome.json. */
-function writeBiomeAgreement(): void {
+function writeBiomeAgreement(root = env.tmpDir): void {
 	fs.writeFileSync(
-		path.join(env.tmpDir, "package.json"),
-		JSON.stringify({ devDependencies: { "@biomejs/biome": "^2.4.10" } }),
+		path.join(root, "package.json"),
+		JSON.stringify({
+			devDependencies: { "@biomejs/biome": "^2.4.10", prettier: "3.3.3" },
+		}),
 	);
 	fs.writeFileSync(
-		path.join(env.tmpDir, "package-lock.json"),
+		path.join(root, "package-lock.json"),
 		JSON.stringify({
 			lockfileVersion: 3,
 			packages: {
 				"": {},
 				"node_modules/@biomejs/biome": { version: "2.4.10" },
+				"node_modules/prettier": { version: "3.3.3" },
 			},
 		}),
 	);
-	fs.writeFileSync(path.join(env.tmpDir, "biome.json"), "{}\n");
+	fs.writeFileSync(path.join(root, "biome.json"), "{}\n");
 }
 
 const noRuff = {
