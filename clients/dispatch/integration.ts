@@ -2847,6 +2847,8 @@ export async function dispatchLintWithResult(
 		projectRoot?: string;
 		/** Ordered per-file pipeline token, when called from tool_result. */
 		writeIndex?: number;
+		/** #3568: the tool_result handler's session. */
+		sessionGeneration?: GenerationHandle;
 		/** Runtime telemetry identity, when known (#1448) — see
 		 * DispatchContext.telemetryModel's doc. */
 		telemetryModel?: string;
@@ -2867,6 +2869,7 @@ export async function dispatchLintWithResult(
 		options?.writeIndex,
 		options?.telemetryModel,
 		options?.telemetryProvider,
+		options?.sessionGeneration,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
 	// #2243 item 2: release the pin when the dispatch settles.

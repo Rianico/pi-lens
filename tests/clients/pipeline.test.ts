@@ -430,6 +430,17 @@ describe("Pipeline", () => {
 			tmpDir,
 			expect.objectContaining({ sessionGeneration }),
 		);
+		// #3568: and the dispatch, whose collect-later runner defers its result
+		// to a turn end through the same handle
+		// (tests/clients/dispatch/runner-collect-later.test.ts pins the drop).
+		expect(dispatchLintWithResult).toHaveBeenCalledWith(
+			filePath,
+			tmpDir,
+			expect.anything(),
+			undefined,
+			expect.anything(),
+			expect.objectContaining({ sessionGeneration }),
+		);
 	});
 
 	describe("Format phase", () => {

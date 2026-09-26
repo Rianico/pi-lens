@@ -14,6 +14,7 @@
  * - BaselineStore: Track pre-existing issues for delta mode
  */
 
+import type { GenerationHandle } from "../generation-guard.js";
 import { logExtension, type ExtensionLogLevel } from "../extension-log.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -324,6 +325,8 @@ export function createDispatchContext(
 	 * worklog append; see DispatchContext.telemetryModel's doc. */
 	telemetryModel?: string,
 	telemetryProvider?: string,
+	/** #3568: the session of a post-write dispatch, for its deferred runners. */
+	sessionGeneration?: GenerationHandle,
 ): DispatchContext {
 	const absoluteFilePath = resolveRunnerPath(cwd, filePath);
 	const normalizedProjectRoot = normalizeMapKey(
@@ -373,6 +376,7 @@ export function createDispatchContext(
 		blockingOnly,
 		modifiedRanges,
 		writeIndex,
+		sessionGeneration,
 		telemetryModel,
 		telemetryProvider,
 		toolCwdMemo: {},
@@ -1016,6 +1020,7 @@ async function runGroup(
 				markedAtMs,
 				writeIndex: ctx.writeIndex,
 				promise: deferred,
+				session: ctx.sessionGeneration,
 			});
 			// A deferred runner is still an observed runner. Keep it visible in
 			// both the edit latency report and the widget until its turn-end result

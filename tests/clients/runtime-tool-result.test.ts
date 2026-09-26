@@ -1592,6 +1592,99 @@ describe("monorepo turn-state cwd alignment", () => {
 			}
 		},
 	);
+
+	it("a bash handler's synthetic writes carry the session its handler entered in (#3568)", async () => {
+		// A multi-file bash result dispatches one synthetic handler per written
+		// file, one after another. Each used to capture its own session at its
+		// dispatch, after the parent's recovery awaits and the earlier synthetic
+		// dispatches, so a replacement in between handed the later files
+		// session 2's generation.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-3568-bash-synthetic-");
+		try {
+			const first = gatedPromise<void>();
+			const release = gatedPromise<void>();
+			const handles: Array<{ generation: number; isCurrent(): boolean }> = [];
+			vi.mocked(runPipeline).mockImplementation(async (ctx) => {
+				handles.push(ctx.sessionGeneration as never);
+				if (handles.length === 1) {
+					first.resolve();
+					await release.promise;
+				}
+				return {
+					output: "",
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+				};
+			});
+			const existingPath = createTempFile(
+				env.tmpDir,
+				"extracted/existing.js",
+				"(function(){ return 1; })();\n",
+			);
+			const directPath = createTempFile(
+				env.tmpDir,
+				"direct.js",
+				"const direct = 1;\n",
+			);
+			const command = `echo direct > "${directPath}"; node opaque-extractor.js`;
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const entered = runtime.sessionGeneration;
+			const cacheManager = new CacheManager(false);
+			await handleToolCall({
+				event: {
+					toolName: "bash",
+					toolCallId: "3568-bash",
+					input: { command },
+				},
+				ctx: { cwd: env.tmpDir },
+				lensEnabled: true,
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager,
+				ensureLSPConfigInitialized: async () => {},
+				updateLspStatus: () => {},
+				resetLSPService: () => {},
+			} as any);
+			fs.writeFileSync(existingPath, "(function(){ return 2; })();\n");
+			fs.writeFileSync(directPath, "const direct = 2;\n");
+			const handler = handleToolResult({
+				event: {
+					toolName: "bash",
+					toolCallId: "3568-bash",
+					input: { command },
+					content: [{ type: "text", text: "extracted" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager,
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+				readGuard: runtime.readGuard,
+			} as any);
+			await first.promise;
+			// `/new` while the first written file is analysed.
+			runtime.resetForSession();
+			release.resolve();
+			await handler;
+			expect(
+				handles.map((h) => ({
+					generation: h.generation,
+					current: h.isCurrent(),
+				})),
+			).toEqual([
+				{ generation: entered, current: false },
+				{ generation: entered, current: false },
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
 });
 
 describe("runtime-tool-result inline behavior warnings", () => {

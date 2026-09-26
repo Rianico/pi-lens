@@ -671,6 +671,155 @@ describe("formal/dispatch-pipeline replays", () => {
 		}
 	});
 
+	// ── #3568: a handler index.ts abandoned, resuming after session_start ─────
+	describe("#3568: a tool_result handler that straddles a session replacement", () => {
+		/** A clean verdict carrying one fixable and one code-quality warning. */
+		function withWarnings(filePath: string, label: string) {
+			const warning = (rule: string, fixable: boolean) => ({
+				id: `eslint:${rule}:${label}`,
+				tool: "eslint",
+				rule,
+				message: `${rule.toUpperCase()}-FROM-${label}`,
+				filePath,
+				line: 1,
+				column: 1,
+				severity: "warning",
+				semantic: "warning",
+				fixable,
+			});
+			return {
+				...clean(label),
+				warnings: [warning("no-var", true), warning("complexity", false)],
+			};
+		}
+		const warningsOf = (runtime: RuntimeCoordinator) => ({
+			actionable: runtime.peekActionableWarnings().map((w) => w.message),
+			quality: runtime.peekCodeQualityWarnings().map((w) => w.message),
+		});
+		const staleSubjects = () =>
+			getDegradationSummary()
+				.filter((group) => group.kind === "generation-guard-stale-write")
+				.flatMap((group) => group.latestReasons.map((r) => r.subject));
+
+		it("a session-1 handler's warnings, settling after session_start, do not land in session 2's turn", async () => {
+			const env = setupTestEnvironment("tla-3568-warnings-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				const entered = gate();
+				const release = gate();
+				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+					entered.open();
+					await release.p;
+					return withWarnings(fp as string, "v1") as never;
+				});
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				const late = handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await entered.p;
+				runtime.resetForSession();
+				runtime.beginTurn();
+				resetDegradationLedger();
+				release.open();
+				await late;
+				expect(warningsOf(runtime)).toEqual({ actionable: [], quality: [] });
+				expect(staleSubjects()).toEqual([`runtime-session:${filePath}`]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("no-drop (shape 54): a handler that stays in its session records its warnings", async () => {
+			const env = setupTestEnvironment("tla-3568-warnings-own-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp) => withWarnings(fp as string, "v1") as never,
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				expect(warningsOf(runtime)).toEqual({
+					actionable: ["NO-VAR-FROM-v1"],
+					quality: ["COMPLEXITY-FROM-v1"],
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("a handler parked before its dispatch captures its session at entry, so its verdict does not land in session 2", async () => {
+			const env = setupTestEnvironment("tla-3568-entry-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp) =>
+						({
+							...blocking(fp as string, "v1"),
+							warnings: withWarnings(fp as string, "v1").warnings,
+						}) as never,
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				// Parked on the on-demand clients bound, before any capture the
+				// dispatch took until #3568.
+				const late = handleToolResult({
+					...deps(runtime, noBiome, { resident: false }),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await bootstrapGate.parked(1);
+				runtime.resetForSession();
+				runtime.beginTurn();
+				resetDegradationLedger();
+				bootstrapGate.release();
+				await late;
+				expect(inlineSummaries(runtime)).toEqual([]);
+				expect(runtime.gitGuardHasBlockers).toBe(false);
+				expect(warningsOf(runtime)).toEqual({ actionable: [], quality: [] });
+				expect(staleSubjects()).toContain(`runtime-session:${filePath}`);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("no-drop (shape 54): a handler parked before its dispatch in its own session records its verdict", async () => {
+			const env = setupTestEnvironment("tla-3568-entry-own-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp) => blocking(fp as string, "v1") as never,
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				const own = handleToolResult({
+					...deps(runtime, noBiome, { resident: false }),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await bootstrapGate.parked(1);
+				bootstrapGate.release();
+				await own;
+				expect(inlineSummaries(runtime)).toEqual([
+					{ writeIndex: 1, blocker: "BLOCKER-FROM-v1" },
+				]);
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
 	// ── #3506: pi-lens' own writers inside pi's mutation queue ────────────────
 	describe("the immediate autofix and the deferred drain", () => {
 		beforeEach(() => {

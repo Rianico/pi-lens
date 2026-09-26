@@ -257,6 +257,8 @@ interface ToolResultDeps {
 	_readGuardAuthorship?: boolean;
 	/** Internal: synthetic dispatch inherits the parent's ownership decision. */
 	_allowAutonomousWriters?: boolean;
+	/** Internal (#3568): synthetic dispatch inherits the parent's session. */
+	_sessionGeneration?: GenerationHandle;
 }
 
 function ensureToolResultClients(
@@ -822,7 +824,7 @@ async function dispatchPipelineAnalysis(args: {
 	allowAutonomousWriters: boolean;
 	/**
 	 * #3512: the session this dispatch belongs to, captured by the caller
-	 * before its first await on the pipeline. The deferred cascade's tier-3
+	 * at handler entry (#3568), before its first await. The deferred cascade's tier-3
 	 * touch and the caller's later admission of that cascade both drop
 	 * through it once the session is replaced.
 	 */
@@ -1199,6 +1201,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		formatBehaviorWarnings,
 	} = deps;
 
+	// #3506 r1 F8, #3568: the session this handler belongs to, captured before
+	// its first await. index.ts' bound abandons a handler without cancelling
+	// it, so any await below can resume after a session_start that restarted
+	// the turn and write counters; a capture taken there would name session 2.
+	const writeSession =
+		deps._sessionGeneration ?? runtime.captureSessionGeneration();
 	const rawFilePath = (event.input as { path?: string }).path;
 	const workspaceRoot = runtime.projectRoot || process.cwd();
 	let bashAuthorshipConfirmed =
@@ -1577,6 +1585,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// records freshness and runs diagnostics, but it cannot format/autofix
 				// or issue an edit-directed blocker/actionable instruction.
 				_allowAutonomousWriters: recognizedAuthoredSet.has(wp),
+				_sessionGeneration: writeSession,
 			});
 			if (syntheticResult) {
 				// #1590: forward verbatim. The synthetic call already charged the
@@ -2188,8 +2197,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							// per-path dispatch.
 							allowAutonomousWriters: true,
 							// #3512: this path admits no cascade, so the capture
-							// only guards the cascade's tier-3 touch.
-							sessionGeneration: runtime.captureSessionGeneration(),
+							// only guards the cascade's tier-3 touch. #3568: the
+							// handler's, not one taken after path 1's await.
+							sessionGeneration: writeSession,
 						}),
 						{
 							ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
@@ -2452,10 +2462,6 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	const writeIndex = runtime.nextWriteIndex();
 	// #3507: the turn this token was drawn in orders it across turns.
 	const writeTurnIndex = runtime.turnIndex;
-	// #3506 r1 F8: the session the token belongs to. index.ts' bound abandons
-	// this handler without cancelling it, so it can settle after a
-	// session_start that restarted the turn and write counters.
-	const writeSession = runtime.captureSessionGeneration();
 	let modifiedRanges: Array<{ start: number; end: number }> | undefined;
 	// #2423: ranges a shape adapter resolved from the tool's own input. Only a
 	// classified non-native edit shape sets these — a plain host `edit` carries
@@ -2756,11 +2762,17 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		runtime.appendCascadePromise(result.cascadePromise, writeSession, filePath);
 	}
 
-	if (result.actionableWarnings?.length) {
-		runtime.recordActionableWarnings(result.actionableWarnings);
+	// #3568: per-turn maps the replacement's reset cleared.
+	const { actionableWarnings, codeQualityWarnings } = result;
+	if (actionableWarnings?.length) {
+		writeSession.guardedWrite(filePath, () =>
+			runtime.recordActionableWarnings(actionableWarnings),
+		);
 	}
-	if (result.codeQualityWarnings?.length) {
-		runtime.recordCodeQualityWarnings(result.codeQualityWarnings);
+	if (codeQualityWarnings?.length) {
+		writeSession.guardedWrite(filePath, () =>
+			runtime.recordCodeQualityWarnings(codeQualityWarnings),
+		);
 	}
 
 	// #484: opt-in per-turn summary collection. Same signals the pipeline
