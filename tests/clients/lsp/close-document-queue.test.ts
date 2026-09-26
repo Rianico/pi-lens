@@ -21,6 +21,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	closeDocument,
+	diagnosticsVersionForPath,
 	handleNotifyChange,
 	handleNotifyOpen,
 	type LSPClientState,
@@ -244,9 +245,12 @@ describe("#3477 — closeDocument is ordered with the path's notify queue", () =
 
 		vi.useFakeTimers();
 		try {
+			const before = diagnosticsVersionForPath(state, KEY);
 			publish({ uri: pathToFileURL(FILE).href, version: 0, diagnostics: [D] });
 			await vi.advanceTimersByTimeAsync(2_000);
 			expect(state.pushDiagnostics.get(KEY)).toEqual([D]);
+			// Delivered: the version a waiting touch reads has moved.
+			expect(diagnosticsVersionForPath(state, KEY)).toBeGreaterThan(before);
 		} finally {
 			vi.useRealTimers();
 		}
