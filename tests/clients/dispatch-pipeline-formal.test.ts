@@ -1088,7 +1088,13 @@ describe("formal/dispatch-pipeline replays", () => {
 			}
 		});
 
-		it("FixerQueueNoReToken across turns (#3559): a pipeline that re-tokens after its turn ended records its fixed-bytes verdict under the new turn", async () => {
+		/**
+		 * #3559: edit A's fixer is parked in its availability probe; edit B
+		 * records a blocker at turn 1, w=2; the turn ends; A's fixer then fixes
+		 * B's bytes and re-tokens. `fixed` is the dispatch verdict on the fixed
+		 * bytes (v3).
+		 */
+		async function reTokenAcrossTurn(fixed: "blocker" | "clean") {
 			const env = setupTestEnvironment("tla-fixer-token-turn-");
 			try {
 				writeBiomeAgreement(env.tmpDir);
@@ -1098,15 +1104,13 @@ describe("formal/dispatch-pipeline replays", () => {
 				runtime.beginTurn();
 				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
 					const bytes = fs.readFileSync(fp as string, "utf8");
-					// v3: the fixer's output of edit B's bytes.
-					const rev = bytes.includes("const a")
-						? "v3"
-						: bytes.includes("E2")
-							? "v2"
-							: "v1";
+					if (bytes.includes("const a"))
+						return (
+							fixed === "blocker" ? blocking(fp as string, "v3") : clean("v3")
+						) as never;
+					const rev = bytes.includes("E2") ? "v2" : "v1";
 					return blocking(fp as string, rev) as never;
 				});
-				// Edit A's fixer is parked in its availability probe.
 				const probing = gate();
 				const probed = gate();
 				const fixer = {
@@ -1133,7 +1137,6 @@ describe("formal/dispatch-pipeline replays", () => {
 					event: ev("write", filePath, "c1"),
 				} as never);
 				await probing.p;
-				// Edit B records at turn 1, w=2.
 				fs.writeFileSync(filePath, "var a = 1;\nexport const E2 = 2;\n");
 				await handleToolResult({
 					...deps(runtime, noBiome),
@@ -1142,22 +1145,33 @@ describe("formal/dispatch-pipeline replays", () => {
 				expect(inlineSummaries(runtime)).toEqual([
 					{ writeIndex: 2, blocker: "BLOCKER-FROM-v2" },
 				]);
-				// A outlives its turn; its fixer then fixes B's bytes and re-tokens.
 				runtime.beginTurn();
 				probed.open();
 				await write;
 				expect(fs.readFileSync(filePath, "utf8")).toBe(
 					"const a = 1;\nexport const E2 = 2;\n",
 				);
-				expect(inlineSummaries(runtime)).toEqual([
-					{ writeIndex: 1, blocker: "BLOCKER-FROM-v3" },
-				]);
-				expect(
-					(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
-				).toEqual(["BLOCKER-FROM-v3"]);
+				return {
+					inline: inlineSummaries(runtime),
+					widget: (getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+				};
 			} finally {
 				env.cleanup();
 			}
+		}
+
+		it("FixerQueueNoReToken across turns (#3559): a pipeline that re-tokens after its turn ended records its fixed-bytes verdict under the new turn", async () => {
+			expect(await reTokenAcrossTurn("blocker")).toEqual({
+				inline: [{ writeIndex: 1, blocker: "BLOCKER-FROM-v3" }],
+				widget: ["BLOCKER-FROM-v3"],
+			});
+		});
+
+		it("FixerQueueNoReToken across turns (#3559): a re-tokened clean verdict on the fixed bytes clears the older turn's blocker", async () => {
+			expect(await reTokenAcrossTurn("clean")).toEqual({
+				inline: [],
+				widget: [],
+			});
 		});
 
 		it("FixerQueue (#3506): a queued pipeline whose fixer changed nothing keeps its handler's token, so the newer edit's verdict stands", async () => {
