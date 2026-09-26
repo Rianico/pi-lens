@@ -164,7 +164,7 @@ async function piRead(
 	file: string,
 	input: { offset?: number; limit?: number },
 	opts: {
-		gate?: () => void;
+		gate?: () => void | Promise<void>;
 		beforeExec?: () => void;
 		rewrite?: (text: string) => string;
 		skipToolCall?: boolean;
@@ -182,7 +182,7 @@ async function piRead(
 	const result = await tool.execute(toolCallId, args, undefined, undefined, {
 		cwd: runtime.projectRoot,
 	} as never);
-	opts.gate?.();
+	await opts.gate?.();
 	const content = opts.rewrite
 		? result.content.map((part: { type: string; text?: string }) =>
 				part.type === "text" && part.text !== undefined
@@ -783,7 +783,7 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
-	it("credits nothing for a decorated raced read with no tool_call capture", async () => {
+	it("records nothing for a decorated raced read with no tool_call capture", async () => {
 		const env = setupTestEnvironment("rg-3524-noted-race-no-call-");
 		try {
 			const file = fixture(env.tmpDir, "v.ts", `${lines(20).join("\n")}\n`);
@@ -803,8 +803,182 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 					},
 				},
 			);
+			expect(runtime.readGuard.getReadHistory(file)).toHaveLength(1);
 			const changed = await positionalEdit(runtime, file, [[11, 11, "a11"]]);
 			expect(changed.blocked).toBe(true);
+			// An own edit elsewhere re-stamps FileTime; the foreign line 11 is
+			// still refused.
+			const own = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(own.blocked).toBe(false);
+			await applyEdit(runtime, file, own);
+			const after = await positionalEdit(runtime, file, [[11, 11, "a11"]]);
+			expect(after.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("records nothing for a decorated raced read whose tool_call capture was evicted", async () => {
+		const env = setupTestEnvironment("rg-3524-noted-race-evicted-");
+		try {
+			const file = fixture(env.tmpDir, "x.ts", `${lines(20).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 12 },
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: async () => {
+						// 128 later reads of lines 1-4 push the capture past the
+						// per-file record cap before the result arrives.
+						for (let i = 0; i < 128; i++) {
+							await piRead(runtime, file, { offset: 1, limit: 4 });
+						}
+						expect(
+							runtime.readGuard
+								.getReadHistory(file)
+								.some((record) => record.provisional === true),
+						).toBe(false);
+						const v = lines(20);
+						v[10] = "EXTERNAL11";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			const own = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(own.blocked).toBe(false);
+			await applyEdit(runtime, file, own);
+			const changed = await positionalEdit(runtime, file, [[11, 11, "a11"]]);
+			expect(changed.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("takes the newest capture when a tool_call id is reused", async () => {
+		const env = setupTestEnvironment("rg-3524-reused-capture-");
+		try {
+			const file = fixture(env.tmpDir, "r.ts", `${lines(20).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			const args = { path: file, offset: 1, limit: 12 };
+			// A tool_call whose result never came (another extension blocked it).
+			await handleToolCall(
+				callDeps(runtime, {
+					toolName: "read",
+					toolCallId: "call_9",
+					input: args,
+				}),
+			);
+			await piRead(runtime, file, { offset: 1, limit: 12 });
+			const own = await positionalEdit(runtime, file, [[5, 5, "own5"]]);
+			await applyEdit(runtime, file, own);
+			// The id comes back: decorated, and raced on line 11.
+			await handleToolCall(
+				callDeps(runtime, {
+					toolName: "read",
+					toolCallId: "call_9",
+					input: args,
+				}),
+			);
+			const tool = createReadToolDefinition(runtime.projectRoot);
+			const result = await tool.execute("call_9", args, undefined, undefined, {
+				cwd: runtime.projectRoot,
+			} as never);
+			const v = diskLines(file);
+			v[10] = "EXTERNAL11";
+			writeNow(file, v.join("\n"));
+			await handleToolResult(
+				resultDeps(runtime, {
+					toolName: "read",
+					toolCallId: "call_9",
+					input: args,
+					content: [
+						{ type: "text", text: "[other-extension: header note]" },
+						...result.content,
+					],
+					details: result.details,
+				}),
+			);
+			const record = runtime.readGuard.getReadHistory(file).at(-1);
+			expect(record?.lineHashes?.[5]).toBe(lineContentHash("own5"));
+			const changed = await positionalEdit(runtime, file, [[11, 11, "a11"]]);
+			expect(changed.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("refuses the shifted line of a whole-file raced read another extension led with a note", async () => {
+		const env = setupTestEnvironment("rg-3524-countless-insert-");
+		try {
+			const file = fixture(env.tmpDir, "y.ts", `${lines(12).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{},
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => writeNow(file, `INSERTED\n${lines(12).join("\n")}\n`),
+				},
+			);
+			// The agent saw "line5" at line 5; the disk now holds "line4" there.
+			expect(diskLines(file)[4]).toBe("line4");
+			const edit = await positionalEdit(runtime, file, [[5, 5, "agent5"]]);
+			expect(edit.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("refuses a line a whole-file decorated raced read blanked by coincidence", async () => {
+		const env = setupTestEnvironment("rg-3524-countless-blank-");
+		try {
+			const file = fixture(env.tmpDir, "q.ts", "a\n\nc\nd\ne\n");
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{},
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => writeNow(file, "a\n\n\nd\ne\n"),
+				},
+			);
+			// The agent saw "c" at line 3; the disk now holds a blank line.
+			const edit = await positionalEdit(runtime, file, [[3, 3, "c2"]]);
+			expect(edit.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("refuses, until a re-read, a line a whole-file raced read showed when the write landed before pi's read", async () => {
+		const env = setupTestEnvironment("rg-3524-countless-before-read-");
+		try {
+			const file = fixture(env.tmpDir, "z.ts", `${lines(6).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			const delivered = await piRead(
+				runtime,
+				file,
+				{},
+				{
+					beforeExec: () => {
+						const v = lines(6);
+						v[2] = "EXTERNAL3";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			// The accepted cost: with no count from pi, only the tool_call's
+			// capture vouches, and it predates the write the agent was shown.
+			expect(delivered.split("\n")[2]).toBe("EXTERNAL3");
+			const edit = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(edit.blocked).toBe(true);
+			await piRead(runtime, file, {});
+			const reread = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(reread.blocked).toBe(false);
 		} finally {
 			env.cleanup();
 		}
