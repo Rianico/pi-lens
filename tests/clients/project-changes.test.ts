@@ -341,10 +341,9 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 	}
 
 	/** Patch one node:fs function for this test, as its ESM importers see it. */
-	function patchFs<K extends "writeFileSync" | "openSync" | "readSync">(
-		name: K,
-		wrap: (real: (typeof nodeFs)[K]) => (typeof nodeFs)[K],
-	): void {
+	function patchFs<
+		K extends "writeFileSync" | "openSync" | "readSync" | "readFileSync",
+	>(name: K, wrap: (real: (typeof nodeFs)[K]) => (typeof nodeFs)[K]): void {
 		const real = nodeFs[name];
 		nodeFs[name] = wrap(real);
 		syncBuiltinESMExports();
@@ -510,6 +509,28 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 		edit(runtime, "b.ts");
 		const waited = Date.now() - started;
 		releaseGeneration(next);
+		expect(waited).toBeGreaterThanOrEqual(500);
+	});
+
+	it("a first wait is never skipped, even when the holder's generation file cannot be read (#3578)", () => {
+		fakeBackoff();
+		const hold = holdChangeLogLock();
+		const prefix = path.join(`${logPath}.locks`, "lock.");
+		patchFs(
+			"readFileSync",
+			(real) =>
+				((...args: Parameters<typeof real>) => {
+					if (String(args[0]).startsWith(prefix))
+						throw Object.assign(new Error("EACCES: permission denied"), {
+							code: "EACCES",
+						});
+					return real(...args);
+				}) as typeof real,
+		);
+		const started = Date.now();
+		edit(new RuntimeCoordinator(), "a.ts");
+		const waited = Date.now() - started;
+		releaseGeneration(hold);
 		expect(waited).toBeGreaterThanOrEqual(500);
 	});
 

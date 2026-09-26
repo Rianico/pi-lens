@@ -265,8 +265,9 @@ export function tryAcquireGeneration(
 
 // #3578: per lock directory, the holder a wait last ran out on, named by its
 // top generation file and the `<pid> <ms>` it holds. Only a later holder
-// writes another name, so a match is that same holder, still inside.
-const timedOutHolders = new BoundedFifoMap<string, string>(16);
+// writes another name, so a match is that same holder, still inside. An
+// unreadable holder is `undefined`, which never matches.
+const timedOutHolders = new BoundedFifoMap<string, string | undefined>(16);
 
 function topGenerationHolder(dir: string): string | undefined {
 	try {
@@ -323,8 +324,7 @@ export function withGenerationLockSync<T>(
 			timedOutHolder = undefined;
 		}
 		if (Date.now() >= deadline) {
-			const holder = topGenerationHolder(dir);
-			if (holder !== undefined) timedOutHolders.set(dir, holder);
+			timedOutHolders.set(dir, topGenerationHolder(dir));
 			return { held: false };
 		}
 		Atomics.wait(
