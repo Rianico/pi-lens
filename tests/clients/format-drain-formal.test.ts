@@ -495,15 +495,11 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 			const otherRoot = path.join(env.tmpDir, "other");
 			fs.mkdirSync(otherRoot);
 			writeBiomeAgreement(otherRoot);
-			const autofixOnly = path.join(otherRoot, "g.ts");
-			fs.writeFileSync(autofixOnly, "const y=2\n");
-			runtime.deferMutation(
-				autofixOnly,
-				otherRoot,
-				"edit",
-				otherRoot,
-				"autofix",
-			);
+			const bothKinds = path.join(otherRoot, "g.ts");
+			fs.writeFileSync(bothKinds, "const y=2\n");
+			runtime.deferMutation(bothKinds, otherRoot, "edit", otherRoot, "autofix");
+			// Both kinds, neither started: named once, not by each loop.
+			runtime.deferMutation(bothKinds, otherRoot, "edit", otherRoot, "format");
 			const drain = handleAgentEnd(
 				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
 			);
@@ -511,8 +507,8 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 			runtime.resetForSession(Date.now());
 			resume.open();
 			const summary = await drain;
-			// f.ts: its autofix ran, its format was never started. g.ts: its
-			// autofix was never started. b-e.ts: never formatted.
+			// f.ts: its autofix ran, its format was never started. g.ts: neither
+			// its autofix nor its format was started. b-e.ts: never formatted.
 			expect(
 				summary?.skipped
 					.filter((entry) => entry.reason === "session-replaced")
