@@ -330,8 +330,8 @@ beforeEach(() => {
 });
 
 describe("#3519: the attached post-autofix bytes are a read", () => {
-	it("allows edits at the attachment's line numbers, unrelocated (AutofixFalseBlock, AutofixRelocate)", async () => {
-		const env = setupTestEnvironment("rg-3519-attach-");
+	it("allows a one-line edit at the attachment's line numbers (AutofixFalseBlock)", async () => {
+		const env = setupTestEnvironment("rg-3519-attach-one-");
 		try {
 			biomeProject(env.tmpDir);
 			const file = fixture(env.tmpDir, "b.ts", "old\n");
@@ -346,11 +346,23 @@ describe("#3519: the attached post-autofix bytes are a read", () => {
 			]);
 			expect(one.reason).toBeUndefined();
 			expect(one.blocked).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not relocate a two-line edit at the attachment's line numbers (AutofixRelocate)", async () => {
+		const env = setupTestEnvironment("rg-3519-attach-two-");
+		try {
+			biomeProject(env.tmpDir);
+			const file = fixture(env.tmpDir, "b.ts", "old\n");
+			const runtime = newRuntime(env.tmpDir);
+			await writeWithAutofix(runtime, file, WRITTEN);
 			const two = await positionalEdit(runtime, file, [
 				[2, 3, "const b = 20;\nconst c = 30;"],
 			]);
-			expect(two.blocked).toBe(false);
 			expect(two.ranges).toEqual([[2, 3]]);
+			expect(two.blocked).toBe(false);
 			expect(diskLines(file).slice(1, 3)).toEqual([
 				"const b = 2;",
 				"const c = 3;",
