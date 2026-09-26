@@ -29,20 +29,20 @@ change.
 - **The agent**, one tool at a time (pi awaits each handler):
   - **read** (full or ranged): the tool_call provisional record, which takes
     a FileTime stamp (`runtime-tool-call.ts` ~1054), the host read, then the
-    tool_result record that supersedes it (`runtime-tool-result.ts` ~1805).
+    tool_result record that supersedes it (`runtime-tool-result.ts` ~1797).
     Since #3524, when the file moved after the tool_call's stamp, that record
     is hashed and sized from the delivered text and keeps the stamp;
   - **positional edit** of 1 or 2 lines: `checkEdit` at tool_call (~1572),
     optional relocation (~1585), the host apply, then `recordWritten` at
-    tool_result (~2324). Since #3523, an edit the guard allowed unrelocated
+    tool_result (~2326). Since #3523, an edit the guard allowed unrelocated
     (`markToolCallEditInPlace`, ~1628) is recorded as a read of the lines it
-    wrote, hashed from its `newText` (`runtime-tool-result.ts` ~2273);
+    wrote, hashed from its `newText` (`runtime-tool-result.ts` ~2275);
   - **write**: `noteCreatedFile` at tool_call, the host write, and
     `recordWritten`, which injects the creation read from disk
     (`read-guard.ts` `injectCreationRead`, ~1568). The turn's first write then
     runs the immediate autofix (`pipeline.ts`), calls `recordWritten` again
     (`runtime-tool-result.ts` ~1107), and attaches the post-fix bytes as
-    "authoritative" (~2833). Since #3519 the attachment, when delivered, is
+    "authoritative" (~2830). Since #3519 the attachment, when delivered, is
     recorded as a whole-file read hashed from the attached bytes (~2893).
 - **Another writer** (an external editor, a second pi-lens instance, git):
   changes the file between any two steps. With `ExtPhases` it can land inside
