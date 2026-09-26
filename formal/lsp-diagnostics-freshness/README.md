@@ -67,8 +67,10 @@ docker-langserver does 2-3 ms after `didChange`.
 
 ## Results
 
-`node scripts/check-tla-models.mjs`, TLC 2.19, `-workers auto`, `MaxPubs = 3`. For a violated
-config, the state count is how far TLC got before the counterexample.
+`node scripts/check-tla-models.mjs`, TLC 2.19, `-workers 1` (#3517: every config
+now runs with a single worker for a deterministic first-violation verdict),
+`MaxPubs = 3`. For a violated config, the state count is how far TLC got before
+the counterexample.
 
 | Config | Expect | Verdict | Distinct states | s |
 |---|---|---|---|---|
