@@ -80,7 +80,10 @@ vi.mock("../../clients/lsp/client.js", async (importOriginal) => ({
 
 import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
 import { LSPService } from "../../clients/lsp/index.js";
-import { PROJECT_DIAGNOSTICS_CACHE_VERSION } from "../../clients/project-diagnostics/cache.js";
+import {
+	PROJECT_DIAGNOSTICS_CACHE_VERSION,
+	saveProjectDiagnosticsSnapshot,
+} from "../../clients/project-diagnostics/cache.js";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
 
 const PREFIX = "pi-lens-lensdiag-read-stamp-";
@@ -374,6 +377,32 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 				expect(await reconcileStaleWidgetFiles()).toBe(0);
 				expect(widgetRows(other)).toEqual([
 					{ observedAt: T_REC, stale: false, staleReason: undefined },
+				]);
+			},
+			CASE_MS,
+		);
+
+		it(
+			"the cached arm's retirement of the same rows is labelled cached (#3573)",
+			async () => {
+				// The same mid-scan rewrite, persisted by an earlier session and
+				// served here from the cross-session cache.
+				scanReads(other, () => {
+					fs.writeFileSync(other, "export const other = 2;\n");
+					setMtime(other, T_EDIT);
+				});
+				saveProjectDiagnosticsSnapshot(tmp, await scanProjectDiagnostics());
+				logLatency.mockClear();
+				await fullScan({ refreshRunners: "cached" });
+				expect(widgetRows(other)).toEqual([]);
+				expect(
+					logLatency.mock.calls
+						.map(([row]) => row)
+						.filter((row) => row.phase === "project_snapshot_rows_retired"),
+				).toEqual([
+					expect.objectContaining({
+						metadata: expect.objectContaining({ files: 1, snapshot: "cached" }),
+					}),
 				]);
 			},
 			CASE_MS,
