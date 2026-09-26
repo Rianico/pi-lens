@@ -1158,6 +1158,23 @@ export type LspResyncOutcome =
 	| "unsupported"
 	| "aborted";
 
+/**
+ * #3576 R1: resync `filePath` only where a live client of the current service
+ * already holds it open, from a fresh read of the disk; never build a service,
+ * never spawn. For a drain whose session or LSP service was replaced: the next
+ * session may already hold the file (a read-warm touch), and the drain's write
+ * would otherwise leave that document behind the disk until the next drift
+ * sweep. `resyncGitChangedFiles` owns the held-only filter and the drift read.
+ */
+export async function resyncHeldLspDocument(
+	filePath: string,
+	getFlag: PipelineContext["getFlag"],
+): Promise<void> {
+	if (getFlag("no-lsp")) return;
+	const lsp = await loadLspService();
+	await lsp.peekLSPService()?.resyncGitChangedFiles([filePath]);
+}
+
 export async function resyncLspFile(
 	filePath: string,
 	fileContent: string,

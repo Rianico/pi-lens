@@ -10509,6 +10509,16 @@ export function getLSPService(): LSPService {
 }
 
 /**
+ * #3576 R1: the live service, if one exists, without building one. Work that
+ * outlived its session reaches the next session's documents through this and
+ * never through `getLSPService()`, which would build a service (and a touch
+ * would spawn its server) after `resetLSPService`.
+ */
+export function peekLSPService(): LSPService | undefined {
+	return lspProcessState().service ?? undefined;
+}
+
+/**
  * Gate-B readiness seam. It reads only the live client map and never spawns,
  * waits for initialization, or probes a binary.
  */

@@ -367,6 +367,16 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"resolution before the spawn has none (#3558).",
 		owner: "#3558",
 	},
+	"clients/runtime-agent-end.ts#0e5eaed5~b2556cb0": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`resyncLspFile` after a deferred write: the LSP touch has its " +
+			"own wait bound, the resync above it does not. #3528 r1 F1 and " +
+			"#3576 run it through the drain's session and LSP-service guard " +
+			"(`syncDrainWrite`, same await).",
+		owner: "#2523 slice 2",
+	},
 	"clients/runtime-agent-end.ts#1f35703b~52cc4490": {
 		family: "hook-await",
 		site: "agent_settled",
@@ -376,25 +386,27 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"5 fixes, with no time bound at all.",
 		owner: "#2523 slice 2",
 	},
-	"clients/runtime-agent-end.ts#2026645d~2c16e2ec": {
-		family: "hook-await",
-		site: "off-hook",
-		reason:
-			"#3529's post-exit `resyncLspFile` of a fresh stamped read, run only " +
-			"while the drain's session is current (#3528 r1 F1), inside " +
-			"a `void`-launched task the hook never awaits (it starts after " +
-			"`agent_settled`'s `bounded()` gave up on the phase). The resync " +
-			"races its own touch against the LSP sync budget.",
-		owner: "#3529",
-	},
-	"clients/runtime-agent-end.ts#5a28a4f6~63a9c957": {
+	"clients/runtime-agent-end.ts#3595d62d~d453dc5f": {
 		family: "hook-await",
 		site: "agent_settled",
 		reason:
 			"`resyncLspFile` after a deferred write: the LSP touch has its " +
-			"own wait bound, the resync above it does not. #3528 r1 F1 runs it " +
-			"through the drain's session guard (same await).",
+			"own wait bound, the resync above it does not. #3528 r1 F1 and " +
+			"#3576 run it through the drain's session and LSP-service guard " +
+			"(`syncDrainWrite`, same await).",
 		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#458b366b~893f7563": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit `resyncLspFile` of a fresh stamped read, run only " +
+			"while the drain's session (#3528 r1 F1) and LSP service (#3576) " +
+			"are current, inside a `void`-launched task the hook never awaits " +
+			"(it starts after `agent_settled`'s `bounded()` gave up on the " +
+			"phase). The resync races its own touch against the LSP sync " +
+			"budget. #3576 re-keyed it: the same await, through `syncDrainWrite`.",
+		owner: "#3529",
 	},
 	"clients/runtime-agent-end.ts#5f7b6a40~380334ff": {
 		family: "hook-await",
@@ -416,15 +428,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"per-item 30s timers, no aggregate cap and no signal in the " +
 			"race; the 3-wedged-formatter probe measured `still-blocked " +
 			"after 45011ms`.",
-		owner: "#2523 slice 2",
-	},
-	"clients/runtime-agent-end.ts#bdcae053~0cff74c4": {
-		family: "hook-await",
-		site: "agent_settled",
-		reason:
-			"`resyncLspFile` after a deferred write: the LSP touch has its " +
-			"own wait bound, the resync above it does not. #3528 r1 F1 runs it " +
-			"through the drain's session guard (same await).",
 		owner: "#2523 slice 2",
 	},
 	"clients/runtime-agent-end.ts#f0b9e5ad~c7623832": {
@@ -456,6 +459,18 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"exist at the leaf, nothing bounds the phase above them. #3506 " +
 			"hands it a hold on pi's per-file mutation queue, which each " +
 			"fixer branch enters after its resolver (same await, same key).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:d6dad2c9~7c97ebe3": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"#3576 R1: once the drain's session or LSP service was replaced, " +
+			"`syncDrainWrite` resyncs only a document a live client of the " +
+			"current service already holds (`resyncGitChangedFiles`): it never " +
+			"builds a service or spawns, and each resync is one bounded notify " +
+			"write, at most four per drift pass. The pass above it has no " +
+			"aggregate bound, like the live resync it replaces.",
 		owner: "#2523 slice 2",
 	},
 	"clients/runtime-coordinator.ts#f1693e28~c40c7404": {
@@ -1654,15 +1669,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"walking reachability.",
 		owner: "#2523 slice 2",
 	},
-	"index.ts#652343ba~0f4cd6ac": {
-		family: "hook-await",
-		site: "agent_settled",
-		reason:
-			"`onAgentSettled` awaits its three phases in sequence with no " +
-			"aggregate bound; the 10000ms budget is a TOTAL, not a " +
-			"per-phase allowance.",
-		owner: "#2523 slice 2",
-	},
 	"index.ts#65b51dab~a327124f": {
 		family: "hook-await",
 		site: "off-hook",
@@ -1689,6 +1695,16 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"`flushDebouncedToolResults` on the turn_end path: the same " +
 			"unbounded pipeline re-entry as the agent_end copy, under the " +
 			"3000ms turn_end budget.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#6cb74f81~1f6fe236": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`onAgentSettled` awaits its three phases in sequence with no " +
+			"aggregate bound; the 10000ms budget is a TOTAL, not a " +
+			"per-phase allowance. #3576 re-keyed the refresh: the same await, " +
+			"through the settle's session guard.",
 		owner: "#2523 slice 2",
 	},
 	"index.ts#889073a2~ebe0e096": {
@@ -2348,8 +2364,11 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// below the availability probes and installs, so those never hold pi's
 	// edits back). The queue wait is the fix (an agent edit of the same file
 	// must finish first); the pipeline itself stays inside the handler's
-	// bounded().
-	"clients/pipeline.ts": 61,
+	// bounded(). #3576: 61 -> 63. `resyncHeldLspDocument` awaits the lazy LSP
+	// module (1) and the held-only resync (1) of a drain whose session or LSP
+	// service was replaced; it replaces a skipped resync, never spawns, and
+	// each resync is one bounded notify write.
+	"clients/pipeline.ts": 63,
 	"clients/project-changes.ts": 2,
 	"clients/project-snapshot.ts": 2,
 	"clients/quiet-window.ts": 6,

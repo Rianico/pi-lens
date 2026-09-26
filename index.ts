@@ -3546,6 +3546,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// production-unreachable.
 		try {
 			setAmbientAbortSignal(ctx?.signal);
+			// #3576: the session this settle's drain runs in. `/new`, fork and
+			// resume can land while the drain awaits its formatter; the refresh
+			// below then belongs to a session that no longer exists.
+			const settleSession = runtime.captureSessionGeneration();
 			try {
 				// #2430 item 3: the turn-boundary net runs BEFORE the drain, so a
 				// file a path-less third-party tool changed is queued in time to be
@@ -3559,8 +3563,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 				// The drain just wrote formatted/autofixed bytes to files pi-lens
 				// itself owns. Re-baseline them, or the NEXT settle reads our own
 				// formatter output as unexplained third-party drift and requeues the
-				// same files forever.
-				await refreshObservedLedgerSafely(ctx);
+				// same files forever. #3576: with this session's read guard and
+				// handled set only.
+				await settleSession.guardedWrite(
+					`observed-ledger-refresh:${ctx?.cwd ?? runtime.projectRoot}`,
+					() => refreshObservedLedgerSafely(ctx),
+				);
 			} catch (drainErr) {
 				// #1924 classified the stale-ctx case inline here. #1925 moved the
 				// classifier and its record to clients/session-event-guard.ts, so

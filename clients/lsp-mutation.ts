@@ -10,6 +10,7 @@ import {
 	type ProjectChangeRange,
 	type ProjectChangeSource,
 } from "./project-changes.js";
+import type { GenerationHandle } from "./generation-guard.js";
 import type { AppliedWorkspaceEdit } from "./lsp/edits.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getMutationBridge } from "./mutation-bridge.js";
@@ -109,6 +110,12 @@ export interface LspMutationContext {
 	dbg?: (message: string) => void;
 	/** Batch callers can defer the single terminal log until all edits are attempted. */
 	emitSummary?: boolean;
+	/**
+	 * #3576: the session a deferred caller (the agent_settled drain's quickfix
+	 * pass) belongs to. Its bookkeeping, which follows the edit's file-write
+	 * awaits, drops once that session is replaced; the bytes still land.
+	 */
+	session?: GenerationHandle;
 	/** True once at least one bounded mutation summary has been emitted. */
 	summaryEmitted?: boolean;
 	/** Number of per-request summaries emitted for this outer mutation (max 100). */
@@ -304,6 +311,11 @@ function bookkeepLspMutation(
 	const useBridgeFallback = !context.runtime || !context.cacheManager;
 	for (const detail of details) {
 		const filePath = path.resolve(detail.filePath);
+		if (
+			context.session &&
+			context.session.guardedWrite(filePath, () => true) === undefined
+		)
+			continue;
 		// #2450 review round 2 (F4): the SAME recordability gate the bridge
 		// fallback below already applies internally (`isRecordable`, mounted in
 		// index.ts). Applied here too so the direct (deps-threaded) branch

@@ -32,6 +32,7 @@ import {
 	LSPService,
 	resetLSPService,
 } from "../../clients/lsp/index.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
 import { handleAgentEnd } from "../../clients/runtime-agent-end.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
@@ -444,6 +445,24 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 		expect(staleWriteSubjects()).toEqual([`runtime-session:${filePath}`]);
 	});
 
+	it("StraddleAutofix (#3576): a replaced session's autofix does not mark the file fixed for the next session", async () => {
+		const { fixer, parked, resume } = gatedBiome();
+		writeBiomeAgreement();
+		runtime.deferMutation(filePath, env.tmpDir, "edit", env.tmpDir, "autofix");
+		flags.add("no-autoformat");
+		const drain = handleAgentEnd(
+			drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+		);
+		await parked.p;
+		runtime.resetForSession(Date.now());
+		resume.open();
+		await drain;
+		expect(fs.readFileSync(filePath, "utf8")).toBe("let x=1\n");
+		// runAutofix would skip this file for the rest of session 2's turn.
+		expect(runtime.fixedThisTurn.has(filePath)).toBe(false);
+		expect(staleWriteSubjects()).toContain(`runtime-session:${filePath}`);
+	});
+
 	describe("a drain whose session was replaced starts no new in-place write (#3528 r1 F1)", () => {
 		// FormatDrain FixNoStartGen: the old drain's write could not be synced to
 		// the next session's LSP document (its resync is skipped), so it must not
@@ -600,6 +619,26 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 			await postExitSettled();
 		});
 
+		it("the autofix's fixedThisTurn mark lands in its own session (#3576)", async () => {
+			const { fixer, parked, resume } = gatedBiome();
+			writeBiomeAgreement();
+			runtime.deferMutation(
+				filePath,
+				env.tmpDir,
+				"edit",
+				env.tmpDir,
+				"autofix",
+			);
+			flags.add("no-autoformat");
+			const drain = handleAgentEnd(
+				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+			);
+			await parked.p;
+			resume.open();
+			await drain;
+			expect(runtime.fixedThisTurn.has(filePath)).toBe(true);
+		});
+
 		it("the autofix's recordWritten, change log and modified range land in its own session", async () => {
 			const { fixer, resume } = gatedBiome();
 			resume.open();
@@ -681,6 +720,9 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 	/** didOpen/didChange texts the server received, in order. */
 	let wire: string[];
 	let service: LSPService;
+	/** The mock connection's state and the client every spawn returns. */
+	let lspState: ReturnType<typeof createMockState>;
+	let lspClient: Record<string, unknown>;
 
 	beforeEach(async () => {
 		flags.delete("no-lsp");
@@ -758,6 +800,8 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 			},
 		]);
 		lsp.createLSPClient.mockResolvedValue(client);
+		lspState = state;
+		lspClient = client;
 		service = new LSPService();
 		lsp.service = service;
 		lsp.drainTouch = Promise.resolve();
@@ -1042,6 +1086,184 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 			await drain;
 			expect(fs.readFileSync(filePath, "utf8")).toBe("let x=1\n");
 			expect(lsp.createLSPClient.mock.calls.length - spawnsBefore).toBe(0);
+		});
+	});
+
+	describe("#3576: a drain after a session end or an LSP retire", () => {
+		const spawns = () => lsp.createLSPClient.mock.calls.length;
+		/** The drain's `actionable_warnings_autofix` latency rows. */
+		const quickfixRows = () =>
+			logLatency.mock.calls
+				.map(([row]) => row as { phase?: string; metadata?: unknown })
+				.filter((row) => row.phase === "actionable_warnings_autofix");
+		/**
+		 * A fresh actionable-warnings report with one quickfix-eligible warning
+		 * on another file, current at `projectSeqEnd`.
+		 */
+		function writeQuickfixReport(projectSeqEnd: number): string {
+			const target = path.join(env.tmpDir, "g.ts");
+			fs.writeFileSync(target, "let y=1\n");
+			const warning = {
+				id: "prettier:quickfix",
+				filePath: target,
+				displayPath: "g.ts",
+				line: 1,
+				column: 1,
+				severity: "warning" as const,
+				tool: "prettier",
+				message: "quickfix-eligible warning",
+				actions: [
+					{
+						title: "Fix it",
+						hasEdit: true,
+						hasCommand: false,
+						autoFixEligible: true,
+					},
+				],
+				suppressed: false,
+			};
+			cacheManager.writeCache(
+				"actionable-warnings",
+				{
+					generatedAt: new Date().toISOString(),
+					scope: "turn_delta",
+					sessionId: "s1",
+					turnIndex: 1,
+					projectSeqEnd,
+					deltaOnly: true,
+					includeLspCodeActions: true,
+					files: [
+						{ filePath: target, displayPath: "g.ts", warnings: [warning] },
+					],
+					summary: {
+						warnings: 1,
+						unsuppressed: 1,
+						suppressed: 0,
+						files: 1,
+						actions: 1,
+						autoFixEligible: 1,
+					},
+				},
+				env.tmpDir,
+			);
+			flags.add("lens-actionable-warnings");
+			flags.add("lens-actionable-warning-autofix");
+			return target;
+		}
+
+		it("the actionable-warnings quickfix pass does not start after /new", async () => {
+			lsp.realService = getLSPService;
+			// Session 2's project sequence restarts at 0.
+			writeQuickfixReport(0);
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			runtime.resetForSession(Date.now());
+			resetLSPService({ reason: "session_start" });
+			const spawnsBefore = spawns();
+			c.openWrite();
+			await drain;
+			expect(spawns() - spawnsBefore).toBe(0);
+			expect(quickfixRows()).toEqual([]);
+		});
+
+		it("no-drop: in its own session the quickfix pass runs", async () => {
+			lsp.realService = getLSPService;
+			// The drain's own format bumps the project sequence to 1.
+			writeQuickfixReport(1);
+			const c = armChild({ write: false });
+			await handleAgentEnd(drainDeps());
+			await c.wrote;
+			expect(quickfixRows()).toEqual([
+				expect.objectContaining({
+					metadata: expect.objectContaining({ considered: 1 }),
+				}),
+			]);
+		});
+
+		it("the in-hook format resync spawns no server after session_shutdown retired the service", async () => {
+			lsp.realService = getLSPService;
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			// Quit: the service is retired, the runtime session is not bumped.
+			resetLSPService({ reason: "session_shutdown" });
+			const spawnsBefore = spawns();
+			c.openWrite();
+			await drain;
+			expect(fs.readFileSync(filePath, "utf8")).toBe("const x = 1\n");
+			expect(spawns() - spawnsBefore).toBe(0);
+			expect(staleWriteSubjects()).toContain(
+				`lsp-launch-availability:${filePath}`,
+			);
+		});
+
+		it("the in-hook autofix resync spawns no server after session_shutdown retired the service", async () => {
+			lsp.realService = getLSPService;
+			const { fixer, parked, resume } = gatedBiome();
+			writeBiomeAgreement();
+			runtime.deferMutation(
+				filePath,
+				env.tmpDir,
+				"edit",
+				env.tmpDir,
+				"autofix",
+			);
+			flags.add("no-autoformat");
+			const drain = handleAgentEnd(
+				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+			);
+			await parked.p;
+			resetLSPService({ reason: "session_shutdown" });
+			const spawnsBefore = spawns();
+			resume.open();
+			await drain;
+			expect(fs.readFileSync(filePath, "utf8")).toBe("let x=1\n");
+			expect(spawns() - spawnsBefore).toBe(0);
+		});
+
+		it("the post-exit resync spawns no server after the idle reset retired the service", async () => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			lsp.realService = getLSPService;
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.agent_settled + 1);
+			await drain;
+			resetLSPService({ reason: "idle" });
+			const spawnsBefore = spawns();
+			c.openWrite();
+			await c.wrote;
+			await postExitSettled();
+			expect(spawns() - spawnsBefore).toBe(0);
+			expect(postExitRows()).toEqual([
+				expect.objectContaining({ metadata: { outcome: "stale-session" } }),
+			]);
+		});
+
+		it("R1: a replaced session's format resyncs the next session's open document to the bytes on disk, without a spawn", async () => {
+			lsp.realService = getLSPService;
+			lspClient.isDocumentOpen = (fp: string) =>
+				lspState.openDocuments.has(normalizeMapKey(fp));
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			runtime.resetForSession(Date.now());
+			resetLSPService({ reason: "session_start" });
+			// Session 2's read-warm touch opens F (runtime-tool-call.ts), outside
+			// pi's queue, before the child writes.
+			const spawnsBefore = spawns();
+			await getLSPService().touchFile(filePath, disk(), {
+				diagnostics: "none",
+				source: "read-warm",
+				readStamp: performance.now(),
+			});
+			expect(spawns() - spawnsBefore).toBe(1);
+			c.openWrite();
+			await drain;
+			expect(disk()).toBe("const x = 1\n");
+			expect(wire.at(-1)).toBe(disk());
+			expect(spawns() - spawnsBefore).toBe(1);
 		});
 	});
 
