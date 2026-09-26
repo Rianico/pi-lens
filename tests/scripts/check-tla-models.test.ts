@@ -8,9 +8,8 @@ import {
 	buildJavaArgs,
 	classifyTlcOutput,
 	computeConcurrency,
-	computeSharedWorkers,
-	computeWorkers,
 	listModelConfigs,
+	parseConcurrencyArg,
 	parseModelHeader,
 	resolveJarPath,
 	runPool,
@@ -174,41 +173,45 @@ describe("computeConcurrency (#3572)", () => {
 	});
 });
 
-describe("computeSharedWorkers (#3572)", () => {
-	it("divides the CPU budget evenly across the pool", () => {
-		expect(computeSharedWorkers(8, 4)).toBe(2);
+describe("parseConcurrencyArg (#3572)", () => {
+	it("accepts a positive integer", () => {
+		expect(parseConcurrencyArg("4")).toBe(4);
+		expect(parseConcurrencyArg("1")).toBe(1);
 	});
 
-	it("floors at 1 rather than giving a lane zero workers", () => {
-		// A pool as wide as the CPU count (or wider, on a config-starved run)
-		// must still give every lane a real worker to run TLC with.
-		expect(computeSharedWorkers(4, 4)).toBe(1);
-		expect(computeSharedWorkers(2, 5)).toBe(1);
-	});
-});
-
-describe("computeWorkers (#3517)", () => {
-	it("pins a violated-expectation config to one worker regardless of the pool's shared budget", () => {
-		expect(computeWorkers({ status: "violated", invariant: "X" }, 4)).toBe(1);
-		expect(computeWorkers({ status: "violated", invariant: "X" }, 1)).toBe(1);
+	it("throws on a missing value, so a bad flag fails loudly instead of silently becoming 1 lane", () => {
+		expect(() => parseConcurrencyArg(undefined)).toThrow(
+			/--concurrency must be an integer/,
+		);
 	});
 
-	it("gives a pass-expectation config the pool's shared worker budget", () => {
-		expect(computeWorkers({ status: "pass" }, 4)).toBe(4);
-		expect(computeWorkers({ status: "pass" }, 1)).toBe(1);
+	it("throws on a non-numeric value", () => {
+		expect(() => parseConcurrencyArg("many")).toThrow(
+			/--concurrency must be an integer/,
+		);
+	});
+
+	it("throws on zero, a negative number, or a non-integer", () => {
+		expect(() => parseConcurrencyArg("0")).toThrow();
+		expect(() => parseConcurrencyArg("-1")).toThrow();
+		expect(() => parseConcurrencyArg("2.5")).toThrow();
 	});
 });
 
 describe("buildJavaArgs (#3572, #3517)", () => {
-	it("passes the caller's worker count as a literal number, never `auto`", () => {
-		const args = buildJavaArgs("/jar", "/meta", "X.cfg", "Mod", 1);
+	it("always emits a literal `-workers 1`, never `auto` and never a caller-supplied count", () => {
+		// #3517: TLC's own thread interleaving under `-workers auto` decides
+		// which invariant a multi-violation config reports first. Every config
+		// is pinned to one worker so the seam has no way to vary this — there
+		// is no parameter left for a caller (main() included) to widen it.
+		const args = buildJavaArgs("/jar", "/meta", "X.cfg", "Mod");
 		const workersIndex = args.indexOf("-workers");
 		expect(workersIndex).toBeGreaterThan(-1);
 		expect(args[workersIndex + 1]).toBe("1");
 	});
 
 	it("runs the config by its basename, from the module's own directory", () => {
-		const args = buildJavaArgs("/jar", "/meta", "X.cfg", "Mod", 3);
+		const args = buildJavaArgs("/jar", "/meta", "X.cfg", "Mod");
 		expect(args).toEqual([
 			"-Djava.io.tmpdir=/meta",
 			"-XX:+UseParallelGC",
@@ -216,7 +219,7 @@ describe("buildJavaArgs (#3572, #3517)", () => {
 			"/jar",
 			"tlc2.TLC",
 			"-workers",
-			"3",
+			"1",
 			"-metadir",
 			"/meta",
 			"-config",
@@ -231,9 +234,9 @@ describe("buildJavaArgs (#3572, #3517)", () => {
 		// dir can race there (#3572: reproduced running the pool over all of
 		// formal/, one `AbortException` in 320 configs). Each run must get its
 		// own tmpdir instead of the JVM default.
-		const args = buildJavaArgs("/jar", "/meta-a", "X.cfg", "Mod", 1);
+		const args = buildJavaArgs("/jar", "/meta-a", "X.cfg", "Mod");
 		expect(args[0]).toBe("-Djava.io.tmpdir=/meta-a");
-		const other = buildJavaArgs("/jar", "/meta-b", "X.cfg", "Mod", 1);
+		const other = buildJavaArgs("/jar", "/meta-b", "X.cfg", "Mod");
 		expect(other[0]).toBe("-Djava.io.tmpdir=/meta-b");
 	});
 });

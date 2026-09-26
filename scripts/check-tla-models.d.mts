@@ -28,20 +28,12 @@ export declare function computeConcurrency(
 	numConfigs: number,
 	availableParallelism: number,
 ): number;
-export declare function computeSharedWorkers(
-	availableParallelism: number,
-	concurrency: number,
-): number;
-export declare function computeWorkers(
-	expect: ExpectedVerdict,
-	sharedWorkers: number,
-): number;
+export declare function parseConcurrencyArg(raw: string | undefined): number;
 export declare function buildJavaArgs(
 	jar: string,
 	metadir: string,
 	configBasename: string,
 	module: string,
-	workers: number,
 ): string[];
 export declare function runPool<Item, Result>(
 	items: readonly Item[],

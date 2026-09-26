@@ -14,16 +14,18 @@
  *
  * Configs run through a bounded-concurrency pool (#3572) sized to the host's
  * CPU count, so the job's wall time falls well below the sum of every
- * config's own time. A config that documents a `violated` expectation always
- * runs with a single TLC worker (#3517): TLC's `-workers auto` explores the
- * state graph across several threads, so when a model can violate more than
- * one invariant, whichever thread gets there first decides which one TLC
- * reports — a race the pool would otherwise make worse, not better, by
- * adding CPU contention. One worker gives deterministic BFS order and so a
- * deterministic first violation, at no verdict cost: a `pass` config has
- * nothing to race on (every worker must finish exploring the same state
- * graph to report "no error found"), so it keeps a shared multi-worker
- * budget for throughput.
+ * config's own time. Every config always runs with a single TLC worker
+ * (#3517): TLC's `-workers auto` explores the state graph across several
+ * threads, so when a model can violate more than one invariant, whichever
+ * thread gets there first decides which one TLC reports — a race the pool
+ * would otherwise make worse, not better, by adding CPU contention. One
+ * worker gives deterministic BFS order and so a deterministic first
+ * violation, at no verdict cost either way: TLC still explores every
+ * reachable state before it can report `pass`, so pinning one worker only
+ * changes how long that takes, never whether a violation is found. Pinning
+ * every config, not only `violated` ones, also keeps the pool itself simple:
+ * it is the only source of concurrency, and TLC's own threading never
+ * competes with it for the same cores.
  *
  * Usage: node scripts/check-tla-models.mjs [--jar <tla2tools.jar>] [--concurrency <n>]
  * Without --jar, the pinned release is downloaded to .cache/ and verified.
@@ -146,37 +148,41 @@ export function computeConcurrency(numConfigs, availableParallelism) {
 }
 
 /**
- * TLC workers per run for a `pass`-expectation config, sharing the host's
- * CPUs evenly across the concurrent pool. Floored at 1: a pool as wide as
- * the CPU count still gives every lane a real worker, not a fraction of one.
+ * Validates a user-supplied `--concurrency` value. A missing or non-numeric
+ * value (`Number(undefined)` is `NaN`) must fail loudly here rather than
+ * flow into the pool: `runPool`'s own `|| 1` guard would silently downgrade
+ * a typo'd flag to serial execution with no warning at all.
  */
-export function computeSharedWorkers(availableParallelism, concurrency) {
-	return Math.max(1, Math.floor(availableParallelism / concurrency));
-}
-
-/**
- * The `-workers` count for one config (#3517). A `violated` expectation is
- * pinned to 1 for deterministic BFS order regardless of the shared pool
- * budget; a `pass` expectation has no race to guard against, so it uses the
- * pool's shared per-lane count.
- */
-export function computeWorkers(expect, sharedWorkers) {
-	return expect.status === "violated" ? 1 : sharedWorkers;
+export function parseConcurrencyArg(raw) {
+	const n = Number(raw);
+	if (!Number.isInteger(n) || n < 1)
+		throw new Error(
+			`--concurrency must be an integer >= 1, got ${JSON.stringify(raw)}`,
+		);
+	return n;
 }
 
 /**
  * The `java` argv TLC runs with, as a pure function so tests need no JVM.
+ * Always runs with a single TLC worker (`-workers 1`, #3517): TLC's
+ * `-workers auto` explores the state graph across several threads, so a
+ * model that can violate more than one invariant can report a different one
+ * depending on which thread gets there first. One worker gives deterministic
+ * BFS order, at no verdict cost, since TLC still explores every reachable
+ * state before it can report `pass` regardless of worker count.
+ *
  * `-Djava.io.tmpdir` is pinned to the run's own metadir: SANY extracts the
  * TLA+ standard modules (Naturals.tla, Sequences.tla, ...) to the JVM's temp
  * dir under a fixed name, not a unique one, so two TLC processes sharing the
  * OS temp dir can race there and one sees the other's half-written copy
- * (`tla2sany.semantic.AbortException`) — reproduced by running the pool at
- * concurrency 4 over all of formal/ (#3572 PR body, "parallel-lane hazard").
- * The pool makes this collision likelier by running several TLC processes
- * at once, so it is this change's own job to isolate it, not a pre-existing
- * risk merely inherited from the CI host.
+ * (`tla2sany.semantic.AbortException`) — reproduced running the pool over
+ * all of formal/ during this change's own development (see this PR's Tests
+ * section for the stress-probe numbers). The pool makes this collision
+ * likelier by running several TLC processes at once, so isolating it is
+ * this change's own job, not a pre-existing risk merely inherited from the
+ * CI host.
  */
-export function buildJavaArgs(jar, metadir, configBasename, module, workers) {
+export function buildJavaArgs(jar, metadir, configBasename, module) {
 	return [
 		`-Djava.io.tmpdir=${metadir}`,
 		"-XX:+UseParallelGC",
@@ -184,7 +190,7 @@ export function buildJavaArgs(jar, metadir, configBasename, module, workers) {
 		jar,
 		"tlc2.TLC",
 		"-workers",
-		String(workers),
+		"1",
 		"-metadir",
 		metadir,
 		"-config",
@@ -193,15 +199,9 @@ export function buildJavaArgs(jar, metadir, configBasename, module, workers) {
 	];
 }
 
-function runTlc(jar, config, module, workers) {
+function runTlc(jar, config, module) {
 	const metadir = fs.mkdtempSync(path.join(os.tmpdir(), "tlc-"));
-	const args = buildJavaArgs(
-		jar,
-		metadir,
-		path.basename(config),
-		module,
-		workers,
-	);
+	const args = buildJavaArgs(jar, metadir, path.basename(config), module);
 	return new Promise((resolve) => {
 		let child;
 		try {
@@ -274,8 +274,7 @@ async function main() {
 	const concurrency =
 		concurrencyIndex === -1
 			? computeConcurrency(configs.length, availableParallelism)
-			: Math.max(1, Number(argv[concurrencyIndex + 1]));
-	const sharedWorkers = computeSharedWorkers(availableParallelism, concurrency);
+			: parseConcurrencyArg(argv[concurrencyIndex + 1]);
 
 	const wallStarted = Date.now();
 	const outcomes = await runPool(configs, concurrency, async (config) => {
@@ -285,13 +284,12 @@ async function main() {
 			console.log(`FAIL ${name}: ${header.error}`);
 			return { name, dir: path.dirname(name), ok: false, seconds: 0 };
 		}
-		const workers = computeWorkers(header.expect, sharedWorkers);
 		const started = Date.now();
-		const actual = await runTlc(jar, config, header.module, workers);
+		const actual = await runTlc(jar, config, header.module);
 		const seconds = (Date.now() - started) / 1000;
 		const ok = verdictMatches(header.expect, actual);
 		console.log(
-			`${ok ? "ok  " : "FAIL"} ${name}: expected ${describeVerdict(header.expect)}, got ${describeVerdict(actual)} (${seconds.toFixed(1)}s, workers=${workers})`,
+			`${ok ? "ok  " : "FAIL"} ${name}: expected ${describeVerdict(header.expect)}, got ${describeVerdict(actual)} (${seconds.toFixed(1)}s)`,
 		);
 		return { name, dir: path.dirname(name), ok, seconds };
 	});
@@ -313,7 +311,7 @@ async function main() {
 		);
 	console.log("");
 	console.log(
-		`${configs.length} configs, ${wallSeconds.toFixed(1)}s wall (concurrency=${concurrency}, ${sharedWorkers} worker(s)/pass-config, 1 worker/violated-config).`,
+		`${configs.length} configs, ${wallSeconds.toFixed(1)}s wall (concurrency=${concurrency}, 1 TLC worker/config).`,
 	);
 	console.log("Per-directory TLC time (summed, not wall time):");
 	for (const line of dirLines) console.log(line);
