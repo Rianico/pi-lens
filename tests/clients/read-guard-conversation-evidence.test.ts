@@ -982,6 +982,28 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
+	it("refuses the shifted line of a decorated raced read pi truncated", async () => {
+		const env = setupTestEnvironment("rg-3524-truncated-shift-");
+		try {
+			const file = fixture(env.tmpDir, "t2.ts", `${lines(2500).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{},
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => writeNow(file, `INSERTED\n${lines(2500).join("\n")}\n`),
+				},
+			);
+			// The agent saw "line5" at line 5; the disk now holds "line4".
+			const edit = await positionalEdit(runtime, file, [[5, 5, "agent5"]]);
+			expect(edit.blocked).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("does not cover a line pi cut at its byte limit from a decorated limited raced read", async () => {
 		const env = setupTestEnvironment("rg-3524-truncated-bytes-");
 		try {
