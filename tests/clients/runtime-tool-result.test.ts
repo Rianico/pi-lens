@@ -1593,6 +1593,81 @@ describe("monorepo turn-state cwd alignment", () => {
 		},
 	);
 
+	it("drops the cascade of a session-1 handler parked before its dispatch (#3568)", async () => {
+		// The handler waits for the on-demand analysers before it dispatches.
+		// A replacement lands during that wait; the dispatch that follows used
+		// to capture session 2, so the admission guard (#3512) passed its
+		// compute into session 2's turn end.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const sessionOneRun = {
+			filePath: "/proj/session-one-entry.ts",
+			origin: { projectSeq: 1, turnSeq: 1 },
+			result: undefined,
+			neighborCount: 1,
+			diagnosticCount: 1,
+		};
+		vi.mocked(runPipeline).mockImplementation(async () => ({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+			cascadePromise: Promise.resolve(sessionOneRun),
+		}));
+		const entered = gatedPromise<void>();
+		const release = gatedPromise<void>();
+		requestBootstrapClients.mockImplementationOnce(async () => {
+			entered.resolve();
+			await release.promise;
+			return { biomeClient: {}, ruffClient: {}, metricsClient: {} };
+		});
+		resetDegradationLedger();
+		const env = setupTestEnvironment("pi-lens-3568-entry-cascade-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				"edit.ts",
+				"export const x = 2;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.resetForSession();
+			runtime.beginTurn();
+			const handler = handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 2;" },
+					content: [{ type: "text", text: "ok" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: {
+					addModifiedRange: () => {},
+					readTurnState: () => ({}),
+				},
+				testRunnerClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+			await entered.promise;
+			runtime.resetForSession();
+			runtime.beginTurn();
+			release.resolve();
+			await handler;
+			await runtime.settleCascadeRuns(1_000, { trackTurnEndClock: true });
+			expect(runtime.consumeCascadeRuns().map((r) => r.filePath)).toEqual([]);
+			expect(
+				getDegradationSummary()
+					.find((e) => e.kind === "generation-guard-stale-write")
+					?.latestReasons.map((e) => e.subject),
+			).toContain(`runtime-session:${filePath}`);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("a bash handler's synthetic writes carry the session its handler entered in (#3568)", async () => {
 		// A multi-file bash result dispatches one synthetic handler per written
 		// file, one after another. Each used to capture its own session at its
