@@ -128,6 +128,21 @@ vi.mock("../../clients/formatters-lazy.js", async (importOriginal) => {
 });
 
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
+import {
+	COLLECT_LATER_THRESHOLD_MS,
+	observeRunnerLatency,
+	resetObservedRunnerLatency,
+} from "../../clients/dispatch/collect-later-tier.js";
+import {
+	createDispatchContext,
+	dispatchForFile,
+	RunnerRegistry,
+} from "../../clients/dispatch/dispatcher.js";
+import { FactStore } from "../../clients/dispatch/fact-store.js";
+import {
+	drainPendingRunnerFindings,
+	resetPendingRunnerFindings,
+} from "../../clients/dispatch/pending-runner-findings.js";
 import { getLSPService } from "../../clients/lsp/index.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
@@ -817,6 +832,104 @@ describe("formal/dispatch-pipeline replays", () => {
 			} finally {
 				env.cleanup();
 			}
+		});
+
+		/**
+		 * The collect-later runner through the real dispatcher: the dispatch
+		 * double does with the pipeline's options what `dispatchLintWithResult`
+		 * does (`tests/clients/dispatch/integration.test.ts` pins that hop),
+		 * then runs an inline runner the case parks and a collect-later runner
+		 * the dispatcher defers after it.
+		 */
+		async function deferAcrossReplacement(replace: boolean) {
+			const env = setupTestEnvironment("tla-3568-runner-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				resetPendingRunnerFindings();
+				observeRunnerLatency({
+					projectRoot: env.tmpDir,
+					runnerId: "fixture-runner",
+					durationMs: COLLECT_LATER_THRESHOLD_MS + 1,
+				});
+				const entered = gate();
+				const release = gate();
+				const registry = new RunnerRegistry();
+				registry.register({
+					id: "gate-runner",
+					appliesTo: ["jsts"],
+					priority: 1,
+					run: async () => {
+						entered.open();
+						await release.p;
+						return { status: "succeeded", diagnostics: [], semantic: "none" };
+					},
+				});
+				registry.register({
+					id: "fixture-runner",
+					appliesTo: ["jsts"],
+					priority: 2,
+					run: async () => ({
+						status: "succeeded",
+						diagnostics: [],
+						semantic: "warning",
+					}),
+				});
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp, cwd, pi, ranges, _log, options) => {
+						const ctx = createDispatchContext(
+							fp as string,
+							cwd as string,
+							pi as never,
+							new FactStore(),
+							true,
+							ranges,
+							options?.projectRoot,
+							options?.writeIndex,
+							options?.telemetryModel,
+							options?.telemetryProvider,
+							options?.sessionGeneration,
+						);
+						await dispatchForFile(
+							ctx,
+							[{ mode: "all", runnerIds: ["gate-runner", "fixture-runner"] }],
+							registry,
+						);
+						return clean("v1") as never;
+					},
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				const handler = handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await entered.p;
+				if (replace) {
+					// session_start: the store is cleared and the generation bumped
+					// in one tick (runtime-session.ts).
+					resetPendingRunnerFindings();
+					runtime.resetForSession();
+					runtime.beginTurn();
+				}
+				release.open();
+				await handler;
+				// Session 2's turn end drains the store.
+				return (await drainPendingRunnerFindings(0)).map((e) => e.runnerId);
+			} finally {
+				resetObservedRunnerLatency();
+				resetPendingRunnerFindings();
+				env.cleanup();
+			}
+		}
+
+		it("a session-1 handler's collect-later runner, deferred after session_start, is not drained by session 2's turn end", async () => {
+			expect(await deferAcrossReplacement(true)).toEqual([]);
+		});
+
+		it("no-drop (shape 54): a handler that stays in its session defers its collect-later runner to its turn end", async () => {
+			expect(await deferAcrossReplacement(false)).toEqual(["fixture-runner"]);
 		});
 	});
 
