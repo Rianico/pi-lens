@@ -429,6 +429,57 @@ describe("#3555: an unwidened read carries no note", () => {
 		}
 	});
 
+	it("does not label a reused id's read of an ignored file that asks for the widened range", async () => {
+		const env = setupTestEnvironment("rw-3555-orphan-ignored-");
+		try {
+			const a = path.join(env.tmpDir, "a.ts");
+			fs.writeFileSync(a, lines(40).join("\n"));
+			fs.writeFileSync(path.join(env.tmpDir, ".gitignore"), "dist/\n");
+			fs.mkdirSync(path.join(env.tmpDir, "dist"));
+			const b = path.join(env.tmpDir, "dist", "b.js");
+			fs.writeFileSync(b, lines(40, "bee").join("\n"));
+			const runtime = newRuntime(env.tmpDir);
+			await readToolCall(
+				runtime,
+				"call_7",
+				{ path: a, offset: 12, limit: 3 },
+				{ treeSitter: stubTreeSitter(9, 19, "handler") },
+			);
+			// The ignored target returns before the tool_call reaches the widening.
+			const later = await piRead(
+				runtime,
+				{ path: b, offset: 10, limit: 11 },
+				{ toolCallId: "call_7" },
+			);
+			expect([later.input.offset, later.input.limit]).toEqual([10, 11]);
+			expect(later.content).toEqual(later.host);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not label a widened read whose limit alone a later handler changed", async () => {
+		const env = setupTestEnvironment("rw-3555-retargeted-limit-");
+		try {
+			const file = path.join(env.tmpDir, "notes.md");
+			fs.writeFileSync(file, ["## Tareas", ...lines(30)].join("\n"));
+			const runtime = newRuntime(env.tmpDir);
+			const read = await piRead(
+				runtime,
+				{ path: file, offset: 10, limit: 2 },
+				{
+					afterCall: (input) => {
+						input.limit = 5;
+					},
+				},
+			);
+			expect([read.input.offset, read.input.limit]).toEqual([1, 5]);
+			expect(read.content).toEqual(read.host);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("does not label a widened read that a later handler re-targeted", async () => {
 		const env = setupTestEnvironment("rw-3555-retargeted-");
 		try {

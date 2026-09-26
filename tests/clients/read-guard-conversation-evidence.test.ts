@@ -48,7 +48,10 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 		await importOriginal<typeof import("../../clients/latency-logger.js")>();
 	return { ...actual, logLatency: vi.fn(actual.logLatency) };
 });
-import { logLatency } from "../../clients/latency-logger.js";
+import {
+	getLastLoggedPhase,
+	logLatency,
+} from "../../clients/latency-logger.js";
 
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
 import { getLSPService } from "../../clients/lsp/index.js";
@@ -506,6 +509,13 @@ describe("#3519: the attached post-autofix bytes are a read", () => {
 describe("#3523: the agent's own positional edit is a read", () => {
 	it("allows re-editing the line the agent just wrote (OwnReEdit)", async () => {
 		const env = setupTestEnvironment("rg-3523-reedit-");
+		const realLogLatency = vi.mocked(logLatency).getMockImplementation()!;
+		const lastPhaseAtRecord: Array<string | undefined> = [];
+		vi.mocked(logLatency).mockImplementation((entry) => {
+			realLogLatency(entry);
+			if (entry.phase === "read_guard_conversation_read")
+				lastPhaseAtRecord.push(getLastLoggedPhase()?.phase);
+		});
 		try {
 			const file = fixture(env.tmpDir, "g.ts", `${lines(6).join("\n")}\n`);
 			const runtime = newRuntime(env.tmpDir);
@@ -513,6 +523,10 @@ describe("#3523: the agent's own positional edit is a read", () => {
 			const first = await positionalEdit(runtime, file, [[2, 2, "agent2"]]);
 			expect(first.blocked).toBe(false);
 			await applyEdit(runtime, file, first);
+			// The record stays out of stall attribution: read the last-phase
+			// pointer the moment the record is logged.
+			expect(lastPhaseAtRecord).toHaveLength(1);
+			expect(lastPhaseAtRecord[0]).not.toBe("read_guard_conversation_read");
 			const second = await positionalEdit(runtime, file, [[2, 2, "agent2b"]]);
 			expect(second.reason).toBeUndefined();
 			expect(second.blocked).toBe(false);
@@ -531,6 +545,7 @@ describe("#3523: the agent's own positional edit is a read", () => {
 				}),
 			);
 		} finally {
+			vi.mocked(logLatency).mockImplementation(realLogLatency);
 			env.cleanup();
 		}
 	});
@@ -701,7 +716,7 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
-	it("keeps disk evidence for a raced read whose delivered text another producer decorated", async () => {
+	it("falls back to the tool_call's capture for a raced read whose delivered text another producer decorated", async () => {
 		const env = setupTestEnvironment("rg-3524-decorated-race-");
 		try {
 			const file = fixture(env.tmpDir, "t.ts", `${lines(12).join("\n")}\n`);
@@ -723,6 +738,9 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 					},
 				},
 			);
+			// The changed line first, so no own-edit record can stand in for it.
+			const changed = await positionalEdit(runtime, file, [[11, 11, "a11"]]);
+			expect(changed.blocked).toBe(true);
 			// Line 3 did not change: an edit of it must not be refused.
 			const edit = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
 			expect(edit.reason).toBeUndefined();
@@ -731,7 +749,62 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 				getDegradationSummary()
 					.find((g) => g.kind === "native-read-raced-writer")
 					?.latestReasons.at(-1)?.reason,
-			).toContain("the disk is the evidence");
+			).toContain("the tool_call's capture is the evidence");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("falls back to the tool_call's capture for a raced read another extension led with a note", async () => {
+		const env = setupTestEnvironment("rg-3524-noted-race-");
+		try {
+			const file = fixture(env.tmpDir, "u.ts", `${lines(20).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 12 },
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => {
+						const v = lines(20);
+						v[10] = "EXTERNAL11";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			const changed = await positionalEdit(runtime, file, [[11, 11, "a11"]]);
+			expect(changed.blocked).toBe(true);
+			const edit = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(edit.reason).toBeUndefined();
+			expect(edit.blocked).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("credits nothing for a decorated raced read with no tool_call capture", async () => {
+		const env = setupTestEnvironment("rg-3524-noted-race-no-call-");
+		try {
+			const file = fixture(env.tmpDir, "v.ts", `${lines(20).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(runtime, file, { offset: 1, limit: 12 });
+			await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 12 },
+				{
+					skipToolCall: true,
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => {
+						const v = lines(20);
+						v[10] = "EXTERNAL11";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			const changed = await positionalEdit(runtime, file, [[11, 11, "a11"]]);
+			expect(changed.blocked).toBe(true);
 		} finally {
 			env.cleanup();
 		}
