@@ -39,6 +39,8 @@ vi.mock("../../clients/file-utils.js", async (importOriginal) => ({
 
 const ROOT_A = "/repo/session-1";
 const ROOT_B = "/repo/session-2";
+/** A declined secondary's root (#2130), served beside session 1's. */
+const ROOT_SECONDARY = "/repo/temp-sub";
 
 type Registry = typeof import("../../clients/instance-registry.js");
 type Ledger = typeof import("../../clients/degradation-ledger.js");
@@ -150,6 +152,7 @@ describe("instance registry across a session replacement (#3498)", () => {
 				.find((group) => group.kind === "instance-registry-deregister-queued")
 				?.latestReasons[0]?.reason,
 		).toMatch(/queued behind the holder/);
+		expect(degradationCount("instance-registry-deregister-landed")).toBe(1);
 		await expectSessionTwoRegistersAlone();
 	});
 
@@ -175,6 +178,48 @@ describe("instance registry across a session replacement (#3498)", () => {
 					(group) => group.kind === "instance-registry-registration-superseded",
 				)?.latestReasons[0]?.subject,
 		).toBe(normalizeFilePath(ROOT_A));
+		await expectSessionTwoRegistersAlone();
+	});
+
+	it("does not re-create the ended session's entry from an LSP child recorded before shutdown", async () => {
+		// An LSP spawn in the turn a session switch interrupts: its
+		// fire-and-forget record is still queued when session 1 ends, and it
+		// carries session 1's root as a service cwd (clients/lsp/client.ts).
+		const recorded = registry.recordLspChild({
+			pid: process.pid + 1,
+			serverId: "fake-ts",
+			command: "fake-tsserver",
+			sessionIdentity: {
+				projectRoot: ROOT_A,
+				rootSource: "service-cwd",
+				startedAt: new Date().toISOString(),
+			},
+		});
+		registry.deregisterInstance();
+		await recorded;
+
+		expect(ownEntry()).toBeUndefined();
+		await expectSessionTwoRegistersAlone();
+	});
+
+	it("does not point the heartbeat's repair at the ended root when a secondary's removal lands after shutdown", async () => {
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstanceRoot(ROOT_SECONDARY);
+		// A peer holds the lock. A declined secondary's shutdown is queued, then
+		// session 1 ends: its sync removal cannot take the lock and queues
+		// behind the secondary's removal.
+		peerHolds();
+		const secondaryRemoval = registry.deregisterInstanceRoot(ROOT_SECONDARY);
+		registry.deregisterInstance();
+		peerReleases();
+		await secondaryRemoval;
+		await registry._settleRegistryMutationsForTests();
+		expect(ownEntry()).toBeUndefined();
+
+		// Session 2's heartbeat, before its own registration lands.
+		await registry.updateHeartbeat();
+		await registry._settleRegistryMutationsForTests();
+		expect(ownEntry()).toBeUndefined();
 		await expectSessionTwoRegistersAlone();
 	});
 
