@@ -1130,6 +1130,20 @@ export async function runAutofix(
 	};
 }
 
+/**
+ * #3528 r1 F1: what `resyncLspFile` did. Only `synced` means a touch went out
+ * and completed; every early return names its own reason.
+ */
+export type LspResyncOutcome =
+	| "synced"
+	| "failed"
+	| "abandoned"
+	| "no-lsp"
+	| "up-to-date"
+	| "too-large"
+	| "unsupported"
+	| "aborted";
+
 export async function resyncLspFile(
 	filePath: string,
 	fileContent: string,
@@ -1139,9 +1153,9 @@ export async function resyncLspFile(
 	dbg: PipelineContext["dbg"],
 	/** #3481: `performance.now()` taken before `fileContent` was read. */
 	readStamp?: number,
-): Promise<void> {
-	if (getFlag("no-lsp")) return;
-	if (!needsContentRefresh && lspSyncCompleted) return;
+): Promise<LspResyncOutcome> {
+	if (getFlag("no-lsp")) return "no-lsp";
+	if (!needsContentRefresh && lspSyncCompleted) return "up-to-date";
 
 	// #3405 r2: the bound is `clients/lsp/content-limits.ts` now, shared with the
 	// dispatch runner and the didSave payload. THIS call stays: a file past the
@@ -1150,7 +1164,7 @@ export async function resyncLspFile(
 	// a post-write sync owes — removing it would start writing whole-file
 	// didOpen frames for files this pipeline has always refused.
 	const limitCheck = exceedsLspSyncLimits(fileContent);
-	if (limitCheck.tooLarge) return;
+	if (limitCheck.tooLarge) return "too-large";
 
 	try {
 		const lspService = (await loadLspService()).getLSPService();
@@ -1174,7 +1188,7 @@ export async function resyncLspFile(
 			// the edit proceeds. A wedged server no longer parks the pipeline.
 			const budgetMs = lspSyncBudgetMs();
 			const abort = getAmbientAbortSignal();
-			if (abort?.aborted) return;
+			if (abort?.aborted) return "aborted";
 
 			const startedAt = Date.now();
 			const touch = lspService
@@ -1190,10 +1204,10 @@ export async function resyncLspFile(
 					saved: true,
 					readStamp,
 				})
-				.then(() => "done" as const)
+				.then(() => "synced" as const)
 				.catch((err) => {
 					dbg(`LSP resync after autofix error: ${err}`);
-					return "done" as const;
+					return "failed" as const;
 				});
 
 			// #2540: Kick off auxiliary server acquisition concurrently and unawaited
@@ -1287,10 +1301,14 @@ export async function resyncLspFile(
 						? `timed out after ${budgetMs}ms; reason: spawn-in-flight (server still cold-spawning)`
 						: `timed out after ${budgetMs}ms; server slow/wedged`;
 				dbg(`LSP resync ${cause} for ${filePath}`);
+				return "abandoned";
 			}
+			return outcome;
 		}
+		return "unsupported";
 	} catch (err) {
 		dbg(`LSP resync after autofix error: ${err}`);
+		return "failed";
 	}
 }
 

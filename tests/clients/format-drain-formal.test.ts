@@ -263,6 +263,25 @@ function blindEditVerdict(): string | undefined {
 		.action;
 }
 
+/** The drain's post-exit resync records (latency.log). */
+const postExitRows = () =>
+	logLatency.mock.calls
+		.map(([row]) => row as { phase?: string; metadata?: unknown })
+		.filter((row) => row.phase === "deferred_format_post_exit_resync");
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/**
+ * A case whose bound gave up on the phase waits for the drain's detached
+ * post-exit task to settle, so its ledger and latency rows cannot land in
+ * the next case.
+ */
+function postExitSettled() {
+	return waitFor(postExitRows, (rows) => rows.length > 0, {
+		yieldControl: tick,
+		timeoutMs: 2_000,
+	});
+}
+
 function staleWriteSubjects(): string[] {
 	return getDegradationSummary()
 		.filter((group) => group.kind === "generation-guard-stale-write")
@@ -270,6 +289,7 @@ function staleWriteSubjects(): string[] {
 }
 
 beforeEach(() => {
+	logLatency.mockClear();
 	setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
 	setAmbientAbortSignal(undefined);
 	resetDegradationLedger();
@@ -359,6 +379,7 @@ describe("#3527: the drain's format runs inside pi's mutation queue", () => {
 		c.openWrite();
 		await agent.done;
 		expect(fs.readFileSync(filePath, "utf8")).toBe("const x = 1\nconst y=2\n");
+		await postExitSettled();
 	});
 });
 
@@ -397,6 +418,10 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 		expect(staleWriteSubjects()).toEqual([`runtime-session:${filePath}`]);
 		c.openWrite();
 		await c.wrote;
+		await postExitSettled();
+		expect(postExitRows()).toEqual([
+			expect.objectContaining({ metadata: { outcome: "stale-session" } }),
+		]);
 	});
 
 	it("StraddleAutofix (#3528): the drain's autofix bookkeeping does not land in session 2", async () => {
@@ -448,6 +473,7 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 			expect(runtime.pendingDeferredMutationCount).toBe(1);
 			c.openWrite();
 			await c.wrote;
+			await postExitSettled();
 		});
 
 		it("the autofix's recordWritten, change log and modified range land in its own session", async () => {
@@ -530,7 +556,6 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 	let service: LSPService;
 
 	beforeEach(async () => {
-		logLatency.mockClear();
 		flags.delete("no-lsp");
 		wire = [];
 		const state = createMockState({
@@ -628,11 +653,6 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 
 	const disk = () => fs.readFileSync(filePath, "utf8");
 	/** The drain's post-exit resync records (latency.log). */
-	const postExitRows = () =>
-		logLatency.mock.calls
-			.map(([row]) => row as { phase?: string })
-			.filter((row) => row.phase === "deferred_format_post_exit_resync");
-	const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 	it("OverlapLsp (#3529): the drain's resync of bytes read before a next-run edit does not replace that edit's newer sync", async () => {
 		const drainTouch = gate();

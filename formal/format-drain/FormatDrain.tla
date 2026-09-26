@@ -38,7 +38,13 @@
 (*    and later sent to the LSP (~614); the read and the send are separate  *)
 (*    steps, as in the code.                                                *)
 (*  - /new: resetForSession (runtime-coordinator.ts ~447) on the module-    *)
-(*    level `runtime`: fresh read guard, cleared queue, generation + 1.     *)
+(*    level `runtime`: fresh read guard, cleared queue, generation + 1; and *)
+(*    the LSP service is retired (resetLSPService), so the next touch opens *)
+(*    a fresh document and a drain touch after it would spawn a server for  *)
+(*    the next session (#3528 r1 F1). LspGen: the drain's sends run only    *)
+(*    while its session is current. StartGen: nor does it start formatting  *)
+(*    a file after that (the format worker's and the autofix loop's start   *)
+(*    check): its write could not be synced to the next session's LSP.      *)
 (*  - another pi-lens process formatting F (not in this process's queue).   *)
 (*                                                                          *)
 (* The drain's autofix phase (runAutofix) has the same read/write/          *)
@@ -61,6 +67,8 @@ CONSTANTS
     FixGen,           \* fix: capture sessionGeneration at claim; session writes only when current
     GenDropsAll,      \* mutant: the generation guard drops every write, current or not
     FixStamp,         \* fix: the drain's LSP sends carry the stamp of their read
+    LspGen,           \* fix (#3528 r1 F1): the drain's LSP sends run only while its session is current
+    StartGen,         \* fix (#3528 r1 F1): a drain whose session was replaced starts no new format
     FixOrphanSync     \* fix: an abandoned child's exit is followed by a stamped read + resync
 
 Content == [e : SUBSET (1..Edits), f : BOOLEAN]
@@ -75,19 +83,19 @@ VARIABLES
     aop, tmp, nextEdit, queued,
     hs, dGen, before, after, changed, fc, fcStamp,
     sp, sub, oc, ocStamp,
-    clock, lspC, lspLast,
+    clock, lspC, lspLast, lspOpen,
     extS, ext, extLeft,
     badClaim, blind, crossWrite, ownDrop
 
 vars == <<file, mtime, applied, qOwner, gen, sessions, turns, turn, ops,
           reads, written, sessStart, aop, tmp, nextEdit, queued,
           hs, dGen, before, after, changed, fc, fcStamp, sp, sub, oc, ocStamp,
-          clock, lspC, lspLast, extS, ext, extLeft,
+          clock, lspC, lspLast, lspOpen, extS, ext, extLeft,
           badClaim, blind, crossWrite, ownDrop>>
 
 drainVars == <<hs, dGen, before, after, changed, fc, fcStamp>>
 subVars == <<sp, sub, oc, ocStamp>>
-lspVars == <<clock, lspC, lspLast>>
+lspVars == <<clock, lspC, lspLast, lspOpen>>
 extVars == <<extS, ext, extLeft>>
 flagVars == <<badClaim, blind, crossWrite, ownDrop>>
 sessVars == <<gen, sessions, turns, turn, ops, reads, written, sessStart>>
@@ -95,9 +103,9 @@ sessVars == <<gen, sessions, turns, turn, ops, reads, written, sessStart>>
 \* LSP notify queue, #3481: a stamped send older than the last stamped send is
 \* dropped; an unstamped send (stamp 0) always goes out and keeps the stamp.
 Send(c, s) ==
-    IF s = 0 THEN lspC' = c /\ lspLast' = lspLast
-    ELSE IF s < lspLast THEN UNCHANGED <<lspC, lspLast>>
-    ELSE lspC' = c /\ lspLast' = s
+    IF s = 0 THEN lspC' = c /\ lspLast' = lspLast /\ lspOpen' = TRUE
+    ELSE IF s < lspLast THEN UNCHANGED <<lspC, lspLast, lspOpen>>
+    ELSE lspC' = c /\ lspLast' = s /\ lspOpen' = TRUE
 
 WriteFile(c) ==
     /\ file' = c
@@ -111,7 +119,7 @@ Init ==
     /\ hs = "none" /\ dGen = 0 /\ before = Init0 /\ after = Init0
     /\ changed = FALSE /\ fc = Init0 /\ fcStamp = 0
     /\ sp = "none" /\ sub = Init0 /\ oc = Init0 /\ ocStamp = 0
-    /\ clock = 1 /\ lspC = Init0 /\ lspLast = 0
+    /\ clock = 1 /\ lspC = Init0 /\ lspLast = 0 /\ lspOpen = TRUE
     /\ extS = "idle" /\ ext = Init0 /\ extLeft = ExtWrites
     /\ badClaim = FALSE /\ blind = FALSE /\ crossWrite = FALSE /\ ownDrop = FALSE
 
@@ -196,8 +204,9 @@ NewSession ==
     /\ written' = IF ResetClearsGuard THEN FALSE ELSE written
     /\ sessStart' = mtime
     /\ queued' = FALSE            \* _pendingDeferredMutations.clear()
+    /\ lspOpen' = FALSE /\ lspLast' = 0   \* resetLSPService: a fresh service
     /\ UNCHANGED <<file, mtime, applied, qOwner, turns, turn, ops, aop, tmp,
-                   nextEdit, drainVars, subVars, lspVars, extVars, flagVars>>
+                   nextEdit, drainVars, subVars, clock, lspC, extVars, flagVars>>
 
 ----------------------------------------------------------------------------
 \* The drain
@@ -206,8 +215,28 @@ NewSession ==
 Current ==
     IF GenDropsAll THEN FALSE ELSE (~FixGen \/ dGen = gen)
 
+\* #3528 r1 F1: the drain's LSP sends go through the same session guard.
+LspCurrent ==
+    IF GenDropsAll THEN FALSE ELSE (~LspGen \/ dGen = gen)
+
+\* A drain send: skipped when its session was replaced; a send into the next
+\* session's fresh service is a cross-session write.
+DrainSend(c, s) ==
+    /\ IF LspCurrent THEN Send(c, s) ELSE UNCHANGED <<lspC, lspLast, lspOpen>>
+    /\ crossWrite' = (crossWrite \/ (LspCurrent /\ dGen # gen))
+
+\* The format worker's start check: a replaced session's drain skips the file.
+Replaced == StartGen /\ dGen # gen
+
+DSkip ==
+    /\ hs = "before" /\ Replaced
+    /\ hs' = "done"
+    /\ UNCHANGED <<file, mtime, applied, qOwner, sessVars, aop, tmp, nextEdit,
+                   queued, dGen, before, after, changed, fc, fcStamp, subVars,
+                   lspVars, extVars, flagVars>>
+
 DBefore ==
-    /\ hs = "before"
+    /\ hs = "before" /\ ~Replaced
     /\ ~FixQueue \/ qOwner = "none"
     /\ before' = file
     /\ qOwner' = IF FixQueue THEN "drain" ELSE qOwner
@@ -247,15 +276,17 @@ OrphanRead ==
     /\ oc' = file /\ ocStamp' = clock /\ clock' = clock + 1
     /\ sp' = "osend"
     /\ UNCHANGED <<file, mtime, applied, qOwner, sessVars, aop, tmp, nextEdit,
-                   queued, drainVars, sub, lspC, lspLast, extVars, flagVars>>
+                   queued, drainVars, sub, lspC, lspLast, lspOpen, extVars,
+                   flagVars>>
 
 \* ... and, later, its send
 OrphanSend ==
     /\ sp = "osend"
-    /\ Send(oc, IF FixStamp THEN ocStamp ELSE 0)
+    /\ DrainSend(oc, IF FixStamp THEN ocStamp ELSE 0)
     /\ sp' = "none"
     /\ UNCHANGED <<file, mtime, applied, qOwner, sessVars, aop, tmp, nextEdit,
-                   queued, drainVars, sub, oc, ocStamp, clock, extVars, flagVars>>
+                   queued, drainVars, sub, oc, ocStamp, clock, extVars,
+                   badClaim, blind, ownDrop>>
 
 DAfter ==
     /\ hs = "wait" /\ sp = "exited"
@@ -288,15 +319,17 @@ DFc ==
     /\ hs' = "apply"
     /\ UNCHANGED <<file, mtime, applied, sessVars, aop, tmp, nextEdit,
                    queued, dGen, before, after, changed, subVars,
-                   lspC, lspLast, extVars, flagVars>>
+                   lspC, lspLast, lspOpen, extVars, flagVars>>
 
 DApply ==
     /\ hs = "apply"
     /\ badClaim' = (badClaim \/ (changed /\ after.e # before.e))
     /\ written' = IF changed /\ Current THEN TRUE ELSE written
-    /\ crossWrite' = (crossWrite \/ (changed /\ Current /\ dGen # gen))
+    /\ crossWrite' = (crossWrite \/ (changed /\ Current /\ dGen # gen)
+                        \/ (LspCurrent /\ dGen # gen))
     /\ ownDrop' = (ownDrop \/ (changed /\ ~Current /\ dGen = gen))
-    /\ Send(fc, IF FixStamp THEN fcStamp ELSE 0)
+    /\ IF LspCurrent THEN Send(fc, IF FixStamp THEN fcStamp ELSE 0)
+                      ELSE UNCHANGED <<lspC, lspLast, lspOpen>>
     /\ hs' = "done"
     /\ UNCHANGED <<file, mtime, applied, qOwner, gen, sessions, turns, turn, ops,
                    reads, sessStart, aop, tmp, nextEdit, queued,
@@ -322,7 +355,7 @@ ExtWrite ==
 Next ==
     \/ AgentRead \/ EditCheck \/ EditRead \/ EditWrite \/ EditSync
     \/ EndRun \/ StartRun \/ NewSession
-    \/ DBefore \/ DSpawn \/ SubRead \/ SubWrite \/ DAfter \/ Abandon
+    \/ DSkip \/ DBefore \/ DSpawn \/ SubRead \/ SubWrite \/ DAfter \/ Abandon
     \/ OrphanRead \/ OrphanSend
     \/ DFc \/ DApply
     \/ ExtRead \/ ExtWrite
@@ -337,6 +370,7 @@ TypeOK ==
     /\ qOwner \in {"none", "agent", "drain"}
     /\ hs \in {"none", "before", "spawn", "wait", "fc", "apply", "done"}
     /\ sp \in {"none", "start", "run", "exited", "oread", "osend"}
+    /\ lspOpen \in BOOLEAN
 
 \* The drain never overwrites an agent edit (pi docs/extensions.md ~1925).
 NoLostEdit == applied \subseteq file.e
@@ -346,18 +380,21 @@ NoLostEdit == applied \subseteq file.e
 \* no agent edit: before -> after is formatting only.
 HonestFormatClaim == ~badClaim
 
-\* Once everything is quiet, the LSP document holds the bytes on disk. This is
-\* also the stamp filter's no-drop direction: a drain send dropped although it
-\* carried the newest read leaves the LSP behind the disk.
+\* Once everything is quiet, an open LSP document holds the bytes on disk. This
+\* is also the no-drop direction of the stamp filter and of the session guard
+\* on the drain's sends: a send dropped although it carried the newest read
+\* leaves the LSP behind the disk. A retired service (after /new) has no open
+\* document until its session's next touch.
 Quiet == aop = "idle" /\ DrainIdle /\ sp = "none" /\ extS = "idle"
-LspMatchesDisk == Quiet => lspC = file
+LspMatchesDisk == (Quiet /\ lspOpen) => lspC = file
 
 \* An edit is admitted only after this session showed the agent F
 \* (read-guard.ts header: "Read state from session 1 never authorises session 2").
 NoBlindAllow == ~blind
 
 \* Shape 22: a drain claimed in one session never writes the next
-\* session's state (read guard, pending queue, project change log).
+\* session's state (read guard, pending queue, project change log, and its
+\* fresh LSP service: #3528 r1 F1).
 NoCrossSessionWrite == ~crossWrite
 
 \* Shape 54, the generation guard's no-drop direction: a drain that is still

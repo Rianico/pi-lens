@@ -27,7 +27,12 @@ import {
 	getGlobalActionableWarningMaxFixes,
 	type PiLensFlagSource,
 } from "./lens-config.js";
-import { resyncLspFile, runAutofix, runFormatPhase } from "./pipeline.js";
+import {
+	type LspResyncOutcome,
+	resyncLspFile,
+	runAutofix,
+	runFormatPhase,
+} from "./pipeline.js";
 import { holdFileMutationQueue } from "./file-mutation-queue.js";
 import { getAmbientAbortSignal } from "./safe-spawn.js";
 import { type ProjectChangeSource } from "./project-changes.js";
@@ -613,24 +618,29 @@ export async function handleAgentEnd({
 					// the LSP keeps the bytes from before the format.
 					if (!work[index]?.result)
 						void (async () => {
-							let outcome: "synced" | "failed" = "synced";
+							let outcome: LspResyncOutcome | "stale-session" | "read-failed" =
+								"stale-session";
 							try {
 								await (
 									await phase
 								).abandoned;
-								const readStamp = performance.now();
-								const content = nodeFs.readFileSync(filePath, "utf-8");
-								await resyncLspFile(
-									filePath,
-									content,
-									true,
-									false,
-									getFlag,
-									dbg,
-									readStamp,
-								);
+								// #3528 r1 F1: a replaced session retired the LSP service,
+								// so a touch now would spawn a server for the next session.
+								if (session.guardedWrite(filePath, () => true)) {
+									const readStamp = performance.now();
+									const content = nodeFs.readFileSync(filePath, "utf-8");
+									outcome = await resyncLspFile(
+										filePath,
+										content,
+										true,
+										false,
+										getFlag,
+										dbg,
+										readStamp,
+									);
+								}
 							} catch (err) {
-								outcome = "failed";
+								outcome = "read-failed";
 								dbg(
 									`agent_end deferred_format post-exit resync failed for ${filePath}: ${err}`,
 								);
@@ -807,16 +817,20 @@ export async function handleAgentEnd({
 			}
 
 			if (result.fileContent) {
-				await resyncLspFile(
-					filePath,
-					result.fileContent,
-					true,
-					false,
-					getFlag,
-					dbg,
-					// #3529: the next run's edit can land once the hold is released,
-					// and its own stamped sync must not be replaced by this older read.
-					result.fileReadStamp,
+				const fileContent = result.fileContent;
+				// #3528 r1 F1: not into a replaced session's retired LSP service.
+				await session.guardedWrite(filePath, () =>
+					resyncLspFile(
+						filePath,
+						fileContent,
+						true,
+						false,
+						getFlag,
+						dbg,
+						// #3529: the next run's edit can land once the hold is released,
+						// and its own stamped sync must not be replaced by this older read.
+						result.fileReadStamp,
+					),
 				);
 			}
 
@@ -853,18 +867,21 @@ export async function handleAgentEnd({
 	// particular, never publish the autofix intermediate state before format.
 	for (const changedPath of deferredAutofixChanged) {
 		if (!nodeFs.existsSync(changedPath)) continue;
-		// #3529: stamped, like the format resync above.
-		const readStamp = performance.now();
-		const content = nodeFs.readFileSync(changedPath, "utf-8");
-		await resyncLspFile(
-			changedPath,
-			content,
-			true,
-			false,
-			getFlag,
-			dbg,
-			readStamp,
-		);
+		// #3528 r1 F1: not into a replaced session's retired LSP service.
+		await session.guardedWrite(changedPath, () => {
+			// #3529: stamped, like the format resync above.
+			const readStamp = performance.now();
+			const content = nodeFs.readFileSync(changedPath, "utf-8");
+			return resyncLspFile(
+				changedPath,
+				content,
+				true,
+				false,
+				getFlag,
+				dbg,
+				readStamp,
+			);
+		});
 	}
 
 	if (inspectActionableReport) {
