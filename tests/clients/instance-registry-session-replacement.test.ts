@@ -223,6 +223,20 @@ describe("instance registry across a session replacement (#3498)", () => {
 		await expectSessionTwoRegistersAlone();
 	});
 
+	it("still points the heartbeat's repair at a root the live session keeps serving", async () => {
+		// The inverse of the case above: with no shutdown in between, removing
+		// one root re-arms the intent on a root the host still serves (#2130),
+		// so a later repair brings back the live root, not the one that left.
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstance(ROOT_B);
+		await registry.deregisterInstanceRoot(ROOT_B);
+		fs.writeFileSync(registryFilePath(), JSON.stringify({ instances: [] }));
+
+		await registry.updateHeartbeat();
+		await registry._settleRegistryMutationsForTests();
+		expect(ownEntry()?.projectRoots).toEqual([normalizeFilePath(ROOT_A)]);
+	});
+
 	it("keeps another incarnation's entry on this pid when the queued removal lands", async () => {
 		await registry.registerInstance(ROOT_A);
 		// An entry a crashed earlier instance left on this pid (#3538): the
