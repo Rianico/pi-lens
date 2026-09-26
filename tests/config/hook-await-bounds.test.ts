@@ -461,7 +461,7 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"fixer branch enters after its resolver (same await, same key).",
 		owner: "#2523 slice 2",
 	},
-	"clients/runtime-agent-end.ts#handleAgentEnd:d6dad2c9~7c97ebe3": {
+	"clients/runtime-agent-end.ts#handleAgentEnd:b8100bef~7c97ebe3": {
 		family: "hook-await",
 		site: "agent_settled",
 		reason:

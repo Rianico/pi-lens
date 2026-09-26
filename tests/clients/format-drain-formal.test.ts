@@ -1167,6 +1167,21 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 			expect(quickfixRows()).toEqual([]);
 		});
 
+		it("the actionable-warnings quickfix pass does not start after session_shutdown retired the LSP service", async () => {
+			lsp.realService = getLSPService;
+			// The session is not bumped: the drain's own format still records.
+			writeQuickfixReport(1);
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			resetLSPService({ reason: "session_shutdown" });
+			const spawnsBefore = spawns();
+			c.openWrite();
+			await drain;
+			expect(spawns() - spawnsBefore).toBe(0);
+			expect(quickfixRows()).toEqual([]);
+		});
+
 		it("no-drop: in its own session the quickfix pass runs", async () => {
 			lsp.realService = getLSPService;
 			// The drain's own format bumps the project sequence to 1.

@@ -1166,11 +1166,7 @@ export type LspResyncOutcome =
  * would otherwise leave that document behind the disk until the next drift
  * sweep. `resyncGitChangedFiles` owns the held-only filter and the drift read.
  */
-export async function resyncHeldLspDocument(
-	filePath: string,
-	getFlag: PipelineContext["getFlag"],
-): Promise<void> {
-	if (getFlag("no-lsp")) return;
+export async function resyncHeldLspDocument(filePath: string): Promise<void> {
 	const lsp = await loadLspService();
 	await lsp.peekLSPService()?.resyncGitChangedFiles([filePath]);
 }

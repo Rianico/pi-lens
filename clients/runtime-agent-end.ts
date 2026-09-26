@@ -182,7 +182,7 @@ export async function handleAgentEnd({
 				readStamp,
 			);
 		}
-		await resyncHeldLspDocument(filePath, getFlag);
+		await resyncHeldLspDocument(filePath);
 		return undefined;
 	};
 	const { claimed, staleClaimed, deferredToOwner, droppedOrphans } =
