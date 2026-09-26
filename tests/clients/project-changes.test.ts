@@ -443,10 +443,12 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 	});
 
 	/**
-	 * Fake time: each backoff sleep advances the clock instead of blocking, so
-	 * the time a call spent waiting is read off `Date.now()`.
+	 * Fake time: each backoff sleep advances the fake clock the lock's
+	 * deadline reads, instead of blocking. `slept` is the time the main
+	 * thread would have been blocked.
 	 */
-	function fakeBackoff(): void {
+	function fakeBackoff(): { slept: number } {
+		const backoff = { slept: 0 };
 		vi.useFakeTimers({ toFake: ["Date"] });
 		vi.spyOn(Atomics, "wait").mockImplementation(((
 			_array: unknown,
@@ -454,9 +456,11 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 			_value: unknown,
 			timeout?: number,
 		) => {
+			backoff.slept += timeout ?? 0;
 			vi.setSystemTime(Date.now() + (timeout ?? 0));
 			return "timed-out";
 		}) as typeof Atomics.wait);
+		return backoff;
 	}
 
 	function holdChangeLogLock() {
@@ -470,16 +474,14 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 	 * had already run out on: ten logged edits blocked the main thread 5 s.
 	 */
 	it("ten logged edits under a stuck holder wait once, and every entry is tagged unlocked (#3578)", () => {
-		fakeBackoff();
+		const backoff = fakeBackoff();
 		const hold = holdChangeLogLock();
 		const runtime = new RuntimeCoordinator();
-		const started = Date.now();
 		for (let i = 0; i < 10; i++) edit(runtime, `e${i}.ts`);
-		const waited = Date.now() - started;
 		releaseGeneration(hold);
 
-		expect(waited).toBeGreaterThanOrEqual(500);
-		expect(waited).toBeLessThan(1_000);
+		expect(backoff.slept).toBeGreaterThanOrEqual(500);
+		expect(backoff.slept).toBeLessThan(1_000);
 		expect(readProjectChanges(cwd).map((entry) => entry.unlocked)).toEqual(
 			Array(10).fill(true),
 		);
@@ -499,21 +501,20 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 	});
 
 	it("a new holder after the stuck one gets the full wait again (#3578)", () => {
-		fakeBackoff();
+		const backoff = fakeBackoff();
 		const runtime = new RuntimeCoordinator();
 		const stuck = holdChangeLogLock();
 		edit(runtime, "a.ts");
 		releaseGeneration(stuck);
 		const next = holdChangeLogLock();
-		const started = Date.now();
+		const before = backoff.slept;
 		edit(runtime, "b.ts");
-		const waited = Date.now() - started;
 		releaseGeneration(next);
-		expect(waited).toBeGreaterThanOrEqual(500);
+		expect(backoff.slept - before).toBeGreaterThanOrEqual(500);
 	});
 
 	it("a first wait is never skipped, even when the holder's generation file cannot be read (#3578)", () => {
-		fakeBackoff();
+		const backoff = fakeBackoff();
 		const hold = holdChangeLogLock();
 		const prefix = path.join(`${logPath}.locks`, "lock.");
 		patchFs(
@@ -527,22 +528,20 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 					return real(...args);
 				}) as typeof real,
 		);
-		const started = Date.now();
 		edit(new RuntimeCoordinator(), "a.ts");
-		const waited = Date.now() - started;
 		releaseGeneration(hold);
-		expect(waited).toBeGreaterThanOrEqual(500);
+		expect(backoff.slept).toBeGreaterThanOrEqual(500);
 	});
 
 	it("once the stuck holder releases, the next edit takes the lock on its first try (#3578)", () => {
-		fakeBackoff();
+		const backoff = fakeBackoff();
 		const runtime = new RuntimeCoordinator();
 		const stuck = holdChangeLogLock();
 		edit(runtime, "a.ts");
 		releaseGeneration(stuck);
-		const started = Date.now();
+		const before = backoff.slept;
 		edit(runtime, "b.ts");
-		expect(Date.now() - started).toBe(0);
+		expect(backoff.slept).toBe(before);
 		expect(readProjectChanges(cwd).map((entry) => entry.unlocked)).toEqual([
 			true,
 			undefined,

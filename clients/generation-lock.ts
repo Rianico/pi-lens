@@ -316,7 +316,7 @@ export function withGenerationLockSync<T>(
 			if (topGenerationHolder(dir) === timedOutHolder) {
 				recordDegradationOnce({
 					kind: "generation-lock-wait-skipped",
-					subject: path.resolve(dir),
+					subject: dir,
 					reason: `did not wait: ${timedOutHolder} still holds the lock after an earlier wait ran out`,
 				});
 				return { held: false };
