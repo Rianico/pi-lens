@@ -1800,11 +1800,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// delivered text (less pi's continuation notice) when pi's own count
 				// (truncation, then the requested limit) vouches for it: text with
 				// more lines is not pi's raw output, a producer upstream decorated
-				// it. With no count, only the tool_call's own capture can vouch for
-				// the text, so it must equal the capture. Otherwise the capture is
-				// the evidence: the provisional record this result supersedes, the
-				// newest one, since an id can be reused. A write that landed before
-				// pi's read then refuses lines the agent was shown until it re-reads.
+				// it. With no count (no limit, no truncation) nothing vouches for
+				// the text. Otherwise the evidence is the tool_call's own capture:
+				// the provisional record this result supersedes, the newest one,
+				// since an id can be reused. Where the capture equals the text, the
+				// two are the same evidence; where a write landed before pi's read,
+				// the capture refuses lines the agent was shown until it re-reads.
 				// With no capture there is no evidence, and nothing is recorded.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
 				const deliveredText = raced
@@ -1833,11 +1834,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				const piLineCount = truncation?.outputLines ?? requestedLimit;
 				const delivered =
 					deliveredText &&
-					(piLineCount !== undefined
-						? deliveredText.lineCount <= piLineCount
-						: capture?.lineHashes !== undefined &&
-							JSON.stringify(deliveredText.lineHashes) ===
-								JSON.stringify(capture.lineHashes))
+					piLineCount !== undefined &&
+					deliveredText.lineCount <= piLineCount
 						? deliveredText
 						: undefined;
 				if (raced) {
