@@ -29,7 +29,9 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import {
 	clearWidgetState,
+	exportWidgetState,
 	getFileDiagnostics,
+	recordRunner,
 } from "../../clients/widget-state.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -468,11 +470,27 @@ describe("formal/dispatch-pipeline replays", () => {
 			runtime.projectRoot = env.tmpDir;
 			runtime.beginTurn();
 			vi.mocked(dispatchLintWithResult).mockImplementation(
-				async (fp) =>
-					(revisionOf(fp as string) === "v3"
-						? blocking(fp as string, "v3")
-						: clean(revisionOf(fp as string))) as never,
+				async (fp, _cwd, _pi, _ranges, _log, options) => {
+					const rev = revisionOf(fp as string);
+					// The real dispatcher records each runner under the token the
+					// pipeline hands it (`createDispatchContext` -> `recordRunner`).
+					recordRunner(
+						fp as string,
+						"tsc",
+						`ran-${rev}`,
+						0,
+						0,
+						options?.writeIndex,
+					);
+					return (
+						rev === "v3" ? blocking(fp as string, "v3") : clean(rev)
+					) as never;
+				},
 			);
+			const runnerStatus = () =>
+				exportWidgetState()
+					.files.find((f) => f.filePath === filePath)
+					?.runners.find(([id]) => id === "tsc")?.[1].status;
 			for (const rev of ["v1", "v2", "v3"]) {
 				fs.writeFileSync(filePath, `export const x = '${rev}';\n`);
 				await handleToolResult({
@@ -483,6 +501,7 @@ describe("formal/dispatch-pipeline replays", () => {
 			expect(
 				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
 			).toEqual(["BLOCKER-FROM-v3"]);
+			expect(runnerStatus()).toBe("ran-v3");
 			runtime.beginTurn();
 			fs.writeFileSync(filePath, "export const x = 'v4';\n");
 			await handleToolResult({
@@ -492,6 +511,7 @@ describe("formal/dispatch-pipeline replays", () => {
 			expect(
 				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
 			).toEqual([]);
+			expect(runnerStatus()).toBe("ran-v4");
 		} finally {
 			env.cleanup();
 		}
@@ -505,6 +525,63 @@ describe("formal/dispatch-pipeline replays", () => {
 			).toEqual([]);
 		} finally {
 			run.cleanup();
+		}
+	});
+
+	it("widget order (#3540): a turn-1 pipeline that settles after a turn-2 pipeline of the same file started does not write the widget", async () => {
+		const env = setupTestEnvironment("tla-widget-turn-late-");
+		try {
+			const filePath = path.join(env.tmpDir, "a.ts");
+			const other = path.join(env.tmpDir, "b.ts");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			const entered = { v1: gate(), v2: gate() };
+			const release = { v1: gate(), v2: gate() };
+			vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+				const rev = revisionOf(fp as string);
+				if (rev === "v1" || rev === "v2") {
+					entered[rev].open();
+					await release[rev].p;
+				}
+				return (
+					rev === "v1" ? blocking(fp as string, rev) : clean(rev)
+				) as never;
+			});
+			// Two writes of another file first: a.ts's turn-1 token is w=3.
+			for (const id of ["o1", "o2"]) {
+				fs.writeFileSync(other, `export const o = '${id}';\n`);
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", other, id),
+				} as never);
+			}
+			fs.writeFileSync(filePath, "export const x = 'v1';\n");
+			const late = handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, "c1"),
+			} as never);
+			await entered.v1.p;
+			runtime.beginTurn();
+			// a.ts's first edit in turn 2 (w=1) has started its analysis.
+			fs.writeFileSync(filePath, "export const x = 'v2';\n");
+			const newer = handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, "c2"),
+			} as never);
+			await entered.v2.p;
+			release.v1.open();
+			await late;
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+			release.v2.open();
+			await newer;
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+		} finally {
+			env.cleanup();
 		}
 	});
 
