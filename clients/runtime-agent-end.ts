@@ -393,8 +393,8 @@ export async function handleAgentEnd({
 		// #3528 r1 F1: a replaced session's drain starts no new in-place write.
 		// Its resync of that write is skipped, and the next session may already
 		// have the file open in its LSP (FormatDrain FixNoStartGen).
-		if (session.guardedWrite(record.filePath, () => true) === undefined) break;
 		const filePath = path.resolve(record.filePath);
+		if (session.guardedWrite(filePath, () => true) === undefined) break;
 		if (!nodeFs.existsSync(filePath)) {
 			summary.skipped.push({ filePath, reason: "missing" });
 			continue;
@@ -577,11 +577,10 @@ export async function handleAgentEnd({
 				const index = nextIndex++;
 				if (ambientSignal?.aborted) return;
 				const record = formatRecords[index];
-				// #3528 r1 F1: as in the autofix loop, no new format after /new.
-				if (session.guardedWrite(record.filePath, () => true) === undefined)
-					return;
 				const fileStart = Date.now();
 				const filePath = path.resolve(record.filePath);
+				// #3528 r1 F1: as in the autofix loop, no new format after /new.
+				if (session.guardedWrite(filePath, () => true) === undefined) return;
 				started.add(index);
 				if (!nodeFs.existsSync(filePath)) {
 					work[index] = {
