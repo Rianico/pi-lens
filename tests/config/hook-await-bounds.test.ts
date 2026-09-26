@@ -364,8 +364,9 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"only after `agent_settled`'s own `bounded()` gave up on the " +
 			"phase; the hook never awaits it. It settles when the abandoned " +
 			"formatter run does: its spawn has a 15 s timeout, the command " +
-			"resolution before the spawn has none (#3558).",
-		owner: "#3558",
+			"resolution before the spawn has none. #3558 moved that " +
+			"resolution out of pi's queue; bounding the wait is #3599.",
+		owner: "#3599",
 	},
 	"clients/runtime-agent-end.ts#1f35703b~52cc4490": {
 		family: "hook-await",
