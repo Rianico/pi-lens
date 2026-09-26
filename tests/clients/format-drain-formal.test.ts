@@ -1089,6 +1089,8 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		});
 	});
 
+	// #3576: FixNoServiceGen (a retire without a session bump) and
+	// FixNoHeldResync (R1) are the TLC configs these cases replay.
 	describe("#3576: a drain after a session end or an LSP retire", () => {
 		const spawns = () => lsp.createLSPClient.mock.calls.length;
 		/** The drain's `actionable_warnings_autofix` latency rows. */
