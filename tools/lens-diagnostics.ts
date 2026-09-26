@@ -2191,8 +2191,9 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 		includeGenerated?: boolean;
 	},
 ): Promise<ProjectDiagnosticsSnapshot | undefined> {
+	let snapshot: ProjectDiagnosticsSnapshot | undefined;
 	if (shouldRefreshProjectDiagnostics(options.refreshRunners)) {
-		return scanProjectDiagnostics({
+		snapshot = await scanProjectDiagnostics({
 			cwd,
 			tier: "cheap",
 			maxFiles: options.maxProjectFiles,
@@ -2200,38 +2201,44 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 			files: options.files,
 			includeGenerated: options.includeGenerated,
 		});
-	}
-	if (shouldUseCachedProjectDiagnostics(options.refreshRunners)) {
+	} else if (shouldUseCachedProjectDiagnostics(options.refreshRunners)) {
 		// The cached snapshot is a cross-session cache; drop diagnostics for files
-		// edited/deleted since the scan so a stale entry isn't replayed (#298). A
-		// fresh scan (above) is current by construction and needs no reconcile.
-		const cached = loadProjectDiagnosticsSnapshot(cwd);
-		if (!cached) return undefined;
-		const reconciled = reconcileProjectDiagnosticsSnapshot(cached);
-		// #2154: what this gate DROPS was invisible — the count was computed and
-		// thrown away, so a session that silently retired another session's rows
-		// (the whole point of the content axis added this round) left no record
-		// of having done so. Bounded by construction: at most one row per
-		// mode=full call, and only when rows were actually retired — the shape
-		// `lsp_authoritative_widget_retire` uses for the sibling arm.
-		if (reconciled.staleDropped > 0) {
-			logLatency({
-				type: "phase",
-				toolName: "lens_diagnostics",
-				filePath: cwd,
-				phase: "project_snapshot_rows_retired",
-				durationMs: 0,
-				metadata: {
-					files: reconciled.staleDropped,
-					rows:
-						cached.diagnostics.length - reconciled.snapshot.diagnostics.length,
-					scannedAt: cached.scannedAt,
-				},
-			});
-		}
-		return reconciled.snapshot;
+		// edited/deleted since the scan so a stale entry isn't replayed (#298).
+		snapshot = loadProjectDiagnosticsSnapshot(cwd);
 	}
-	return undefined;
+	if (!snapshot) return undefined;
+	// #3573: a fresh scan is reconciled too. Its `scannedAt` is taken after the
+	// whole file loop, and it becomes the widget row's `observedAt`, so a file
+	// rewritten while the scan was still running reads as older than its row and
+	// no widget gate would ever drop it. The fingerprint of the bytes the rules
+	// read settles it before the rows reach the widget.
+	const reconciled = reconcileProjectDiagnosticsSnapshot(snapshot);
+	// #2154: what this gate DROPS was invisible — the count was computed and
+	// thrown away, so a session that silently retired another session's rows
+	// (the whole point of the content axis added this round) left no record
+	// of having done so. Bounded by construction: at most one row per
+	// mode=full call, and only when rows were actually retired — the shape
+	// `lsp_authoritative_widget_retire` uses for the sibling arm.
+	if (reconciled.staleDropped > 0) {
+		logLatency({
+			type: "phase",
+			toolName: "lens_diagnostics",
+			filePath: cwd,
+			phase: "project_snapshot_rows_retired",
+			durationMs: 0,
+			metadata: {
+				files: reconciled.staleDropped,
+				rows:
+					snapshot.diagnostics.length - reconciled.snapshot.diagnostics.length,
+				scannedAt: snapshot.scannedAt,
+				// #3573: which arm retired them, now that both are reconciled.
+				snapshot: shouldRefreshProjectDiagnostics(options.refreshRunners)
+					? "fresh"
+					: "cached",
+			},
+		});
+	}
+	return reconciled.snapshot;
 }
 
 // @delivery-surface: lens-diagnostics:mode-full

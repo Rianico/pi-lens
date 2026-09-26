@@ -29,9 +29,44 @@ import {
 	setupTestEnvironment,
 } from "../clients/test-utils.js";
 
-const { getServersForFileWithConfig, createLSPClient } = vi.hoisted(() => ({
+const {
+	getServersForFileWithConfig,
+	createLSPClient,
+	scanProjectDiagnostics,
+	fetchFreshProjectDiagnostics,
+	logLatency,
+} = vi.hoisted(() => ({
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
+	scanProjectDiagnostics: vi.fn(),
+	fetchFreshProjectDiagnostics: vi.fn(),
+	logLatency: vi.fn(),
+}));
+// A pass-through, so every row still reaches the real logger.
+vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/latency-logger.js")>();
+	logLatency.mockImplementation(actual.logLatency);
+	return { ...actual, logLatency };
+});
+vi.mock(
+	"../../clients/project-diagnostics/scanner.js",
+	async (importOriginal) => ({
+		...(await importOriginal()),
+		scanProjectDiagnostics,
+	}),
+);
+// The heavyweight analyzers are not under test; they answer with nothing.
+vi.mock(
+	"../../clients/project-diagnostics/fresh-fetch.js",
+	async (importOriginal) => ({
+		...(await importOriginal()),
+		fetchFreshProjectDiagnostics,
+	}),
+);
+vi.mock("../../clients/bootstrap.js", async (importOriginal) => ({
+	...(await importOriginal()),
+	loadBootstrapClients: vi.fn().mockResolvedValue({}),
 }));
 vi.mock("../../clients/lsp/config.js", async (importOriginal) => ({
 	...(await importOriginal()),
@@ -43,7 +78,9 @@ vi.mock("../../clients/lsp/client.js", async (importOriginal) => ({
 	createLSPClient,
 }));
 
+import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
 import { LSPService } from "../../clients/lsp/index.js";
+import { PROJECT_DIAGNOSTICS_CACHE_VERSION } from "../../clients/project-diagnostics/cache.js";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
 
 const PREFIX = "pi-lens-lensdiag-read-stamp-";
@@ -123,7 +160,9 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 	let dep: string;
 	const services: LSPService[] = [];
 
-	async function fullScan(): Promise<void> {
+	async function fullScan(
+		params: { refreshRunners?: string; paths?: string[] } = {},
+	): Promise<void> {
 		const service = new LSPService();
 		services.push(service);
 		const tool = createLensDiagnosticsTool(
@@ -134,7 +173,7 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 		// `other.ts` first, so the group warm-up reads it and not `a.ts`.
 		await tool.execute(
 			"1",
-			{ mode: "full", paths: [other, file] },
+			{ mode: "full", paths: [other, file], ...params },
 			new AbortController().signal,
 			null as never,
 			{ cwd: tmp } as never,
@@ -168,6 +207,18 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 			fp.endsWith(".ts") ? [server] : [],
 		);
 		createLSPClient.mockResolvedValue(makeClient(tmp, file));
+		scanProjectDiagnostics.mockReset();
+		fetchFreshProjectDiagnostics.mockReset();
+		fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: [],
+			authoritativeCoverage: [],
+			cold: [],
+			coldReasons: {},
+			failed: [],
+			timings: {},
+		});
 		vi.useFakeTimers({ toFake: ["Date"] });
 		vi.setSystemTime(T_READ);
 	});
@@ -239,4 +290,93 @@ describe("lens_diagnostics mode=full stamps a swept row at its read (#3573)", ()
 		},
 		CASE_MS,
 	);
+
+	// ── project rows: a fresh cheap-tier scan ────────────────────────────────
+	describe("a fresh project scan's rows", () => {
+		/**
+		 * The cheap-tier scan as `clients/project-diagnostics/scanner.ts` runs
+		 * it, on the axis under test: it fingerprints the bytes it READ, and
+		 * stamps `scannedAt` after its whole file loop. `during` runs between
+		 * the two, while the scan is still analysing other files.
+		 */
+		function scanReads(filePath: string, during?: () => void) {
+			scanProjectDiagnostics.mockImplementation(async () => {
+				const bytes = fs.readFileSync(filePath);
+				const fingerprint = {
+					sizeBytes: bytes.length,
+					contentHash: hashDiagnosticContent(bytes.toString("utf-8")),
+				};
+				vi.setSystemTime(T_EDIT);
+				during?.();
+				vi.setSystemTime(T_REC);
+				return {
+					version: PROJECT_DIAGNOSTICS_CACHE_VERSION,
+					cwd: tmp,
+					tier: "cheap",
+					scannedAt: new Date().toISOString(),
+					diagnostics: [
+						{
+							filePath,
+							line: 1,
+							column: 1,
+							severity: "error",
+							semantic: "blocking",
+							tool: "ast-grep-napi",
+							runner: "ast-grep-napi",
+							rule: "no-debugger",
+							message: "PROJECT ROW computed on the bytes the scan read",
+							source: "project-scan",
+						},
+					],
+					filesScanned: 1,
+					runners: ["ast-grep-napi"],
+					fileFingerprints: { [filePath]: fingerprint },
+				};
+			});
+		}
+
+		it(
+			"a file rewritten while the project scan is still running leaves no row in the widget (#3573)",
+			async () => {
+				scanReads(other, () => {
+					fs.writeFileSync(other, "export const other = 2;\n");
+					setMtime(other, T_EDIT);
+				});
+				logLatency.mockClear();
+				await fullScan({ refreshRunners: "cheap" });
+				await reconcileStaleWidgetFiles();
+				expect(widgetRows(other)).toEqual([]);
+				// The fresh arm's retirement is recorded like the cached arm's.
+				expect(
+					logLatency.mock.calls
+						.map(([row]) => row)
+						.filter((row) => row.phase === "project_snapshot_rows_retired"),
+				).toEqual([
+					expect.objectContaining({
+						metadata: expect.objectContaining({
+							files: 1,
+							rows: 1,
+							snapshot: "fresh",
+						}),
+					}),
+				]);
+			},
+			CASE_MS,
+		);
+
+		it(
+			"a file written before the project scan read it keeps its row (#3573)",
+			async () => {
+				fs.writeFileSync(other, "export const other = 2;\n");
+				setMtime(other, T_READ + 40);
+				scanReads(other);
+				await fullScan({ refreshRunners: "cheap" });
+				expect(await reconcileStaleWidgetFiles()).toBe(0);
+				expect(widgetRows(other)).toEqual([
+					{ observedAt: T_REC, stale: false, staleReason: undefined },
+				]);
+			},
+			CASE_MS,
+		);
+	});
 });
