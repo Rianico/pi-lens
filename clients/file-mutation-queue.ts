@@ -126,13 +126,16 @@ export function withHostFileMutationQueue<T>(
  * writer there never yields for a queue that does not exist (the drain's
  * worker order depends on it): `acquire` resolves once the queue is entered
  * (idempotent), `release` lets the next queued mutation run (idempotent, and a
- * no-op when nothing was acquired). `outlive` hands the hold a writer that a
- * bound gave up on while its child process runs on: `release` then waits for
- * it to settle, so the child cannot write over an edit queued behind the hold.
+ * no-op when nothing was acquired). `enter` is `acquire` for a writer that may
+ * outlive a bound (#3558): it enters at the writer's own write, after its
+ * command resolution, so an install never holds pi's edits back. Before
+ * `release`, the writer joins the hold and `release` waits for it to settle,
+ * so its child cannot write over an edit queued behind the hold; after it, the
+ * writer takes a queue entry of its own until it settles.
  */
 export interface FileMutationHold {
 	acquire(): Promise<void>;
-	outlive(writer: Promise<unknown>): void;
+	enter(writer: Promise<unknown>): Promise<void>;
 	release(): void;
 }
 
@@ -142,24 +145,36 @@ export function holdFileMutationQueue(
 	if (!loadHostSdk) return undefined;
 	let entered: Promise<void> | undefined;
 	let releaseHeld: () => void = () => {};
+	let released = false;
 	const outliving: Promise<unknown>[] = [];
+	const acquire = () => {
+		entered ??= new Promise<void>((resolveEntered, rejectEntered) => {
+			const held = new Promise<void>((resolveHeld) => {
+				releaseHeld = resolveHeld;
+			});
+			withHostFileMutationQueue(filePath, () => {
+				resolveEntered();
+				return held;
+			}).catch(rejectEntered);
+		});
+		return entered;
+	};
 	return {
-		acquire() {
-			entered ??= new Promise<void>((resolveEntered, rejectEntered) => {
-				const held = new Promise<void>((resolveHeld) => {
-					releaseHeld = resolveHeld;
-				});
+		acquire,
+		enter(writer) {
+			if (!released) {
+				outliving.push(writer);
+				return acquire();
+			}
+			return new Promise<void>((resolveEntered, rejectEntered) => {
 				withHostFileMutationQueue(filePath, () => {
 					resolveEntered();
-					return held;
+					return writer;
 				}).catch(rejectEntered);
 			});
-			return entered;
-		},
-		outlive(writer) {
-			outliving.push(writer);
 		},
 		release() {
+			released = true;
 			void Promise.allSettled(outliving).then(() => releaseHeld());
 		},
 	};

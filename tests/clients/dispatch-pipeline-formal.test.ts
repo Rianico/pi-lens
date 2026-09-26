@@ -97,6 +97,7 @@ vi.mock("../../clients/bootstrap.js", async () => {
 // #3506 r1: an in-place formatter CHILD for the real FormatService, the shape
 // of formatters.ts formatFile's spawn: it reads the file, runs, and writes its
 // format of what it read, whatever the service's budget decided meanwhile.
+// Like formatFile, it enters pi's queue (`enter`, #3558) before that read.
 const formatterChild = vi.hoisted(() => ({
 	active: false,
 	parked: undefined as undefined | (() => void),
@@ -113,7 +114,12 @@ vi.mock("../../clients/formatters-lazy.js", async (importOriginal) => {
 			return {
 				...real,
 				getFormattersForFile: async () => [{ name: "slowfmt" }],
-				formatFile: async (fp: string) => {
+				formatFile: async (
+					fp: string,
+					_formatter: unknown,
+					enter?: () => Promise<void>,
+				) => {
+					await enter?.();
 					const before = fs.readFileSync(fp, "utf8");
 					formatterChild.parked?.();
 					await formatterChild.resume;
@@ -551,6 +557,9 @@ describe("formal/dispatch-pipeline replays", () => {
 		});
 		afterEach(() => {
 			setHostFileMutationQueueLoader(undefined);
+			formatterChild.active = false;
+			formatterChild.parked = undefined;
+			formatterChild.resume = undefined;
 		});
 
 		it("FixerParallel (#3506): the immediate autofix does not write over an agent edit made through pi's queue", async () => {
@@ -762,26 +771,14 @@ describe("formal/dispatch-pipeline replays", () => {
 				vi.mocked(dispatchLintWithResult).mockImplementation(
 					async () => clean("any") as never,
 				);
+				// #3558: the real FormatService, which hands the hold to the
+				// formatter (the child double below) to enter before its read.
 				const parked = gate();
 				const resume = gate();
-				const formatService = {
-					recordRead: () => {},
-					formatFile: async (fp: string) => {
-						const before = fs.readFileSync(fp, "utf8");
-						parked.open();
-						await resume.p;
-						fs.writeFileSync(
-							fp,
-							before.replace("let value=1", "let value = 1;"),
-						);
-						return {
-							filePath: fp,
-							formatters: [{ name: "biome", success: true, changed: true }],
-							anyChanged: true,
-							allSucceeded: true,
-						};
-					},
-				} as unknown as FormatService;
+				formatterChild.active = true;
+				formatterChild.parked = parked.open;
+				formatterChild.resume = resume.p;
+				const formatService = new FormatService("tla", true);
 				const run = runPipeline(
 					{
 						filePath,
@@ -886,26 +883,14 @@ describe("formal/dispatch-pipeline replays", () => {
 					env.tmpDir,
 					"format",
 				);
+				// #3558: the real FormatService, which hands the hold to the
+				// formatter (the child double below) to enter before its read.
 				const parked = gate();
 				const resume = gate();
-				const formatService = {
-					recordRead: () => {},
-					formatFile: async (fp: string) => {
-						const before = fs.readFileSync(fp, "utf8");
-						parked.open();
-						await resume.p;
-						fs.writeFileSync(
-							fp,
-							before.replace("let value=1", "let value = 1;"),
-						);
-						return {
-							filePath: fp,
-							formatters: [{ name: "biome", success: true, changed: true }],
-							anyChanged: true,
-							allSucceeded: true,
-						};
-					},
-				} as unknown as FormatService;
+				formatterChild.active = true;
+				formatterChild.parked = parked.open;
+				formatterChild.resume = resume.p;
+				const formatService = new FormatService("tla", true);
 				const drain = handleAgentEnd(
 					drainDeps(runtime, env, { getFormatService: () => formatService }),
 				);

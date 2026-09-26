@@ -2379,6 +2379,11 @@ async function resolveFormatterCommand(
 export async function formatFile(
 	filePath: string,
 	formatter: FormatterInfo,
+	/**
+	 * #3558: enters pi's mutation queue for the file. Called once the command
+	 * is resolved (an install can take minutes) and before the before-read.
+	 */
+	enter?: () => Promise<void>,
 ): Promise<FormatterResult> {
 	try {
 		const absolutePath = path.resolve(filePath);
@@ -2389,7 +2394,6 @@ export async function formatFile(
 			absolutePath,
 			{ cwd: path.parse(absolutePath).root },
 		).cwd;
-		const contentBefore = await fs.readFile(absolutePath, "utf-8");
 
 		// Resolve command: prefer local (venv/vendor/node_modules) over global.
 		// The shared seam must honor SKIP_FORMATTING before selecting the static
@@ -2420,6 +2424,8 @@ export async function formatFile(
 				error: `${formatter.name}: project tool agreement could not be established`,
 			};
 		}
+		await enter?.();
+		const contentBefore = await fs.readFile(absolutePath, "utf-8");
 		// Run formatter without blocking the event loop.
 		const result = await safeSpawnAsync(cmd[0], cmd.slice(1), {
 			timeout: 15000,

@@ -172,14 +172,19 @@ describe("formatFile", () => {
 			fs.writeFileSync(path.join(env.tmpDir, "Gemfile"), 'gem "rubocop"\n');
 			const filePath = path.join(env.tmpDir, "app.rb");
 			fs.writeFileSync(filePath, "puts  'hi'\n");
-			safeSpawnAsync.mockImplementation(async () => {
-				fs.writeFileSync(filePath, "puts 'hi'\n");
-				return {
-					status: 1,
-					stdout: "1 file inspected, 1 offense detected, 1 offense corrected",
-					stderr: "",
-				};
-			});
+			safeSpawnAsync.mockImplementation(
+				async (_cmd: string, args: string[]) => {
+					// #3558: only rubocop's own run rewrites the file, not the
+					// resolver's `which bundle` probe, which now precedes the before-read.
+					if (args.includes(filePath))
+						fs.writeFileSync(filePath, "puts 'hi'\n");
+					return {
+						status: 1,
+						stdout: "1 file inspected, 1 offense detected, 1 offense corrected",
+						stderr: "",
+					};
+				},
+			);
 
 			const { formatFile, rubocop } = await loadFormatFile();
 			const result = await formatFile(filePath, rubocop);

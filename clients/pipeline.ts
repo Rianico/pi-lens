@@ -1401,17 +1401,16 @@ export async function runFormatPhase(
 
 	const formatService = getFormatService();
 	try {
-		// #3506: the formatter rewrites the file in place (see runAutofix).
-		if (writeHold) await writeHold.acquire();
 		formatService.recordRead(filePath);
+		// #3506: the formatter rewrites the file in place (see runAutofix). It
+		// enters the hold once its command is resolved (#3558), and one the
+		// budget gave up on keeps its entry until its child settles.
 		const result = await formatService.formatFile(filePath, {
 			signal,
 			budgetMs,
 			hook,
+			...(writeHold ? { writeHold } : {}),
 		});
-		// #3506: a formatter the budget gave up on still runs, and its child
-		// writes later; the hold is released only once it has settled.
-		if (writeHold && result.abandoned) writeHold.outlive(result.abandoned);
 		abandoned = result.abandoned;
 		// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
 		// `formattersUsed` (which drives change bookkeeping / turn summaries) and

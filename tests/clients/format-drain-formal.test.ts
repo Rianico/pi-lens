@@ -383,6 +383,66 @@ describe("#3527: the drain's format runs inside pi's mutation queue", () => {
 	});
 });
 
+/**
+ * #3558: the formatter enters pi's queue only once its command is resolved.
+ * `child.resolved` parks `resolveCommand`, the step where the eight
+ * install-capable resolvers call `ensureTool` (an install can take 120 s).
+ */
+describe("#3558: the drain's formatter resolves its command outside pi's queue", () => {
+	function parkResolution() {
+		const resolving = gate();
+		const resolution = gate();
+		child.resolving = resolving.open;
+		child.resolved = resolution.p;
+		return { resolving: resolving.p, resolve: resolution.open };
+	}
+
+	it("InstallHold (#3558): a next-run edit made while the formatter resolves its command lands at once, and is formatted with the file", async () => {
+		const r = parkResolution();
+		const c = armChild();
+		const drain = handleAgentEnd(drainDeps());
+		await r.resolving;
+		const agent = agentAppend("const y=2\n");
+		await afterQueueRegistration();
+		expect(agent.wrote()).toBe(true);
+		r.resolve();
+		const summary = await drain;
+		await c.wrote;
+		expect(fs.readFileSync(filePath, "utf8")).toBe(
+			"const x = 1\nconst y = 2\n",
+		);
+		expect(summary?.changed).toEqual([filePath]);
+	});
+
+	it("InstallOrphan (#3558): a formatter both bounds gave up on while it resolved holds no queue until it reaches its write, then writes inside one", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const r = parkResolution();
+		const c = armChild({ write: true });
+		const drain = handleAgentEnd(drainDeps());
+		await r.resolving;
+		// The hook's bound, then the service's 30 s aggregate, give up while the
+		// install runs on; the phase settles and releases its hold.
+		await vi.advanceTimersByTimeAsync(30_000);
+		await drain;
+		const whileResolving = agentAppend("const y=2\n");
+		await afterQueueRegistration();
+		expect(whileResolving.wrote()).toBe(true);
+		// The install finishes: the late formatter reads F inside a queue entry
+		// of its own, so an edit made before its write waits for it.
+		r.resolve();
+		await c.didRead;
+		const whileWriting = agentAppend("const z=3\n");
+		await afterQueueRegistration();
+		expect(whileWriting.wrote()).toBe(false);
+		c.openWrite();
+		await whileWriting.done;
+		expect(fs.readFileSync(filePath, "utf8")).toBe(
+			"const x = 1\nconst y = 2\nconst z=3\n",
+		);
+		await postExitSettled();
+	});
+});
+
 describe("#3528: a drain that outlives its session writes nothing into the next", () => {
 	it("Straddle (#3528): a session-1 drain's recordWritten does not admit a never-read session-2 edit", async () => {
 		flags.add("lens-turn-summary");

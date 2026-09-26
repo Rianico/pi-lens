@@ -23,6 +23,7 @@ import type {
 import { loadFormatters } from "./formatters-lazy.js";
 import { bounded } from "./deadline-utils.js";
 import type { LedgerHookKey } from "./hook-budgets.js";
+import type { FileMutationHold } from "./file-mutation-queue.js";
 
 // --- Configuration ---
 
@@ -40,6 +41,11 @@ export interface FormatOptions {
 	signal?: AbortSignal;
 	budgetMs?: number;
 	hook?: LedgerHookKey;
+	/**
+	 * #3558: pi's mutation queue for the file, entered by each formatter once
+	 * its command is resolved (see `formatters.formatFile`).
+	 */
+	writeHold?: FileMutationHold;
 }
 
 export interface FormatSummary {
@@ -133,6 +139,7 @@ export class FormatService {
 			options.budgetMs,
 			options.hook,
 			abandoned,
+			options.writeHold,
 		);
 
 		// Record new file state after formatting
@@ -178,6 +185,7 @@ export class FormatService {
 		budgetMs = 30_000,
 		hook: LedgerHookKey = "tool_result_edit",
 		abandoned: Promise<unknown>[] = [],
+		writeHold?: FileMutationHold,
 	): Promise<FormatterResult[]> {
 		const results: FormatterResult[] = [];
 		const startedAt = Date.now();
@@ -197,8 +205,13 @@ export class FormatService {
 			// This keeps one total formatter budget per file instead of re-arming a
 			// 30s timer for every formatter.
 			try {
-				const run = loadFormatters().then(({ formatFile }) =>
-					formatFile(filePath, formatter),
+				const run: Promise<FormatterResult> = loadFormatters().then(
+					({ formatFile }) =>
+						formatFile(
+							filePath,
+							formatter,
+							writeHold && (() => writeHold.enter(run)),
+						),
 				);
 				const result = await bounded(run, {
 					ms: remainingMs,
