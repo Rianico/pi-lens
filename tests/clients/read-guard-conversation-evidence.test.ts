@@ -1066,6 +1066,86 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
+	it("does not relocate an edit onto lines pi cut from a decorated raced read", async () => {
+		const env = setupTestEnvironment("rg-3524-cut-relocate-");
+		try {
+			const line = (i: number, tag = "v") =>
+				`const ${tag}${i} = "${"x".repeat(1500)}";`;
+			const base = Array.from({ length: 50 }, (_, i) => line(i + 1));
+			const file = fixture(env.tmpDir, "r.ts", `${base.join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			// The agent's view of lines 20-50, including v45-v46.
+			await piRead(runtime, file, { offset: 20, limit: 31 });
+			// Another writer changes 45-46; the agent never re-reads them.
+			const changed = [...base];
+			changed[44] = line(45, "Y");
+			changed[45] = line(46, "Y");
+			writeNow(file, `${changed.join("\n")}\n`);
+			// pi cuts this read at its byte limit, well before line 45.
+			const shown = await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 50 },
+				{
+					rewrite: (text) => `[other-extension: header note]\n${text}`,
+					gate: () => {
+						const moved = [...changed];
+						moved.splice(40, 0, line(901, "ins"), line(902, "ins"));
+						writeNow(file, `${moved.join("\n")}\n`);
+					},
+				},
+			);
+			expect(shown).toMatch(/\(50\.0KB limit\)/);
+			const own = await positionalEdit(runtime, file, [
+				[10, 10, line(10, "own")],
+			]);
+			expect(own.blocked).toBe(false);
+			await applyEdit(runtime, file, own);
+			// Y45-46 moved to 47-48; the agent never saw Y.
+			const edit = await positionalEdit(runtime, file, [
+				[45, 46, "agentX45\nagentX46"],
+			]);
+			expect(edit.blocked).toBe(true);
+			expect(edit.ranges).toEqual([[45, 46]]);
+			expect(edit.reason).toContain("Edit range changed since read");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not cover lines past the file end of a decorated limited raced read", async () => {
+		const env = setupTestEnvironment("rg-3524-limit-past-lines-");
+		try {
+			const file = fixture(env.tmpDir, "f.ts", lines(8).join("\n"));
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 50 },
+				{
+					rewrite: (text) => `${text}\n[other-extension: footer]`,
+					gate: () =>
+						writeNow(
+							file,
+							[
+								...lines(8),
+								...Array.from({ length: 12 }, (_, i) => `APPENDED${i + 9}`),
+							].join("\n"),
+						),
+				},
+			);
+			const own = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(own.blocked).toBe(false);
+			await applyEdit(runtime, file, own);
+			// pi showed 8 lines; line 16 was never delivered.
+			const edit = await positionalEdit(runtime, file, [[16, 16, "agent16"]]);
+			expect(edit.blocked).toBe(true);
+			expect(edit.reason).toContain("Edit outside read range");
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	for (const limit of [100, 12, 13]) {
 		it(`refuses the shifted line of a decorated raced read with limit ${limit} on a 12-line file`, async () => {
 			const env = setupTestEnvironment("rg-3524-limit-past-end-");
