@@ -112,12 +112,14 @@ vi.mock("../../clients/formatters-lazy.js", async (importOriginal) => {
 });
 
 // The LSP half: the REAL LSPService and notify queue over a mock connection
-// (the harness of tests/clients/lsp/notify-read-order.test.ts). The drain
-// reaches the service through `getLSPService`; `drainTouch` lets a case
-// order the drain's resync after the next edit's own sync.
+// (the harness of tests/clients/lsp/notify-read-order.test.ts). The drain's
+// touches pass through a gate: `drainTouch` lets a case order the drain's
+// resync after the next edit's own sync, and `drainTouchesWaiting` says when
+// the drain's touch has been issued.
 const lsp = vi.hoisted(() => ({
 	service: undefined as unknown,
 	drainTouch: Promise.resolve() as Promise<void>,
+	drainTouchesWaiting: 0,
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
 }));
@@ -135,19 +137,31 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/latency-logger.js")>()),
 	logLatency,
 }));
-vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
-	getLSPService: () => {
-		const service = lsp.service as LSPService;
-		return {
-			supportsLSP: (fp: string) => service.supportsLSP(fp),
-			touchFile: async (...args: Parameters<LSPService["touchFile"]>) => {
-				await lsp.drainTouch;
-				return service.touchFile(...args);
+// `resyncLspFile` reaches the service through the lazy seam
+// (clients/lsp-lazy.ts); measured on this branch, a mock of `lsp/index.js`
+// does not reach that dynamic import, which then serves a second, real
+// service instance.
+vi.mock("../../clients/lsp-lazy.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/lsp-lazy.js")>();
+	return {
+		...actual,
+		loadLspService: async () => ({
+			...(await actual.loadLspService()),
+			getLSPService: () => {
+				const service = lsp.service as LSPService;
+				return {
+					supportsLSP: (fp: string) => service.supportsLSP(fp),
+					touchFile: async (...args: Parameters<LSPService["touchFile"]>) => {
+						lsp.drainTouchesWaiting++;
+						await lsp.drainTouch;
+						return service.touchFile(...args);
+					},
+				};
 			},
-		};
-	},
-}));
+		}),
+	};
+});
 
 let env: ReturnType<typeof setupTestEnvironment>;
 let runtime: RuntimeCoordinator;
@@ -583,6 +597,7 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		service = new LSPService();
 		lsp.service = service;
 		lsp.drainTouch = Promise.resolve();
+		lsp.drainTouchesWaiting = 0;
 		// The queued edit's own pipeline sync of the unformatted bytes.
 		await service.touchFile(filePath, "const x=1\n", {
 			diagnostics: "none",
@@ -626,6 +641,8 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		await handleAgentEnd(drainDeps());
 		expect(disk()).toBe("const x = 1\n");
 		expect(wire.at(-1)).toBe(disk());
+		// A phase that settled inside the bound needs no post-exit resync.
+		expect(postExitRows()).toEqual([]);
 	});
 
 	it("OrphanLsp (#3529): the child the hook's 10 s bound gave up on is synced after it writes", async () => {
@@ -675,6 +692,38 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 				metadata: expect.objectContaining({ outcome: "synced" }),
 			}),
 		]);
+	});
+
+	it("OrphanLsp (#3529): the post-exit resync of a read taken before a next-run edit does not replace that edit's newer sync", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const drainTouch = gate();
+		lsp.drainTouch = drainTouch.p;
+		const c = armChild({ write: true });
+		const drain = handleAgentEnd(drainDeps());
+		await c.didRead;
+		await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.agent_settled + 1);
+		await drain;
+		// Another queued mutation of F holds the queue past the child's exit,
+		// so the post-exit read is taken before the next-run edit lands.
+		const other = gate();
+		const holder = withFileMutationQueue(filePath, () => other.p);
+		const agent = agentAppend("const y=2\n", service);
+		c.openWrite();
+		await waitFor(
+			() => lsp.drainTouchesWaiting,
+			(waiting) => waiting === 1,
+			{ yieldControl: tick, timeoutMs: 2_000 },
+		);
+		other.open();
+		await holder;
+		await agent.done;
+		drainTouch.open();
+		await waitFor(postExitRows, (rows) => rows.length > 0, {
+			yieldControl: tick,
+			timeoutMs: 2_000,
+		});
+		expect(disk()).toBe("const x = 1\nconst y=2\n");
+		expect(wire.at(-1)).toBe(disk());
 	});
 
 	it("the post-exit resync of a file the child removed records the failure instead of rejecting (#3529)", async () => {
