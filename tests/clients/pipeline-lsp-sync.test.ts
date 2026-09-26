@@ -439,6 +439,13 @@ describe("resyncLspFile — its outcome names what it did (#3528 r1 F1)", () => 
 		gate.resolve(null);
 	});
 
+	it("failed: the service lookup threw", async () => {
+		vi.mocked(getLSPService).mockImplementation(() => {
+			throw new Error("service unavailable");
+		});
+		await expect(resync()).resolves.toBe("failed");
+	});
+
 	it("failed: the touch rejected", async () => {
 		mockService(async () => {
 			throw new Error("server gone");
