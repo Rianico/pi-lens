@@ -799,10 +799,14 @@ export function _settleRegistryMutationsForTests(): Promise<void> {
 
 /** Append/replace (by pid) an LSP child under this process's entry. */
 export function recordLspChild(entry: RecordLspChildInput): Promise<void> {
-	return queueRegistryMutation(() => recordLspChildNow(entry));
+	const generation = registrationGeneration().capture();
+	return queueRegistryMutation(() => recordLspChildNow(entry, generation));
 }
 
-async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
+async function recordLspChildNow(
+	entry: RecordLspChildInput,
+	generation: GenerationHandle,
+): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const now = new Date().toISOString();
@@ -825,6 +829,13 @@ async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
 				isOwnEntry(inst, selfStart),
 			);
 			if (idx === -1) {
+				// #3498: a child recorded before the session ended must not
+				// re-create the ended session's entry. Its own shutdown path kills
+				// it, and the OS-table backstop still sees it.
+				const guessedRoot = normalizeFilePath(
+					entry.sessionIdentity?.projectRoot ?? process.cwd(),
+				);
+				if (!registrationIsCurrent(generation, guessedRoot)) return undefined;
 				// registerInstance hasn't run yet in this process (or was reaped) —
 				// synthesize a minimal entry so the child is still tracked.
 				recordDegradationOnce({
@@ -980,6 +991,13 @@ async function deregisterInstanceAfterHolder(): Promise<void> {
 		async () => {
 			const next = withoutOwnEntry(await readRegistryAsync(), selfStart);
 			if (next) await writeRegistryAsync(next);
+			incrementDegradationCount({
+				kind: "instance-registry-deregister-landed",
+				subject: String(process.pid),
+				reason: next
+					? "the queued removal took the lock and removed this process's entry"
+					: "the queued removal took the lock; the entry was already gone",
+			});
 		},
 		LOCK_WAIT_THROUGH_LEASE_MS,
 	);
@@ -1030,12 +1048,16 @@ function withoutOwnEntry(
  * removal to be visible.
  */
 export function deregisterInstanceRoot(projectRoot: string): Promise<void> {
+	const generation = registrationGeneration().capture();
 	return queueRegistryMutation(async () =>
-		deregisterInstanceRootNow(projectRoot),
+		deregisterInstanceRootNow(projectRoot, generation),
 	);
 }
 
-function deregisterInstanceRootNow(projectRoot: string): void {
+function deregisterInstanceRootNow(
+	projectRoot: string,
+	generation: GenerationHandle,
+): void {
 	if (!isInstanceRegistryEnabled()) return;
 	const normalizedRoot = normalizeFilePath(projectRoot);
 	const selfStart = ownProcessStartIfKnown();
@@ -1075,8 +1097,10 @@ function deregisterInstanceRootNow(projectRoot: string): void {
 			projectRoot: remainingRoots[0],
 			projectRoots: remainingRoots,
 		};
-		// Keep a heartbeat re-registration on a root the host still serves.
-		rememberRegistrationRoot(remainingRoots[0]);
+		// Keep a heartbeat re-registration on a root the host still serves,
+		// unless the host session ended since this removal was queued (#3498):
+		// its roots are no longer served, and the intent must stay clear.
+		if (generation.isCurrent()) rememberRegistrationRoot(remainingRoots[0]);
 		writeRegistrySync(file);
 	});
 }

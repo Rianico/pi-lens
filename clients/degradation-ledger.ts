@@ -376,6 +376,13 @@ export type DegradationKind =
 	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "instance-registry-corrupt"
 	/**
+	 * #3498: the removal `deregisterInstance` queued took the registry lock
+	 * and ran, whether or not the entry was still there. A queued removal
+	 * with no landed record was lost (host exit, or the lock never came).
+	 * Subject is this process's pid.
+	 */
+	| "instance-registry-deregister-landed"
+	/**
 	 * #3498: `deregisterInstance`'s sync removal could not take the registry
 	 * lock, so the removal was queued on the registry tail behind the holder.
 	 * Subject is this process's pid.
@@ -1790,6 +1797,9 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// #2874: a successful legacy-directory migration is an upgrade tally, not
 	// a call to action. The hash-only subject avoids exposing the project path.
 	"data_dir_migrated",
+	// #3498: a queued registry removal that landed is the retry working; the
+	// `instance-registry-deregister-queued` beside it is the line that stands out.
+	"instance-registry-deregister-landed",
 ]);
 
 export function renderDegradationLines(
