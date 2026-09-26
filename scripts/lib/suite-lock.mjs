@@ -306,6 +306,102 @@ async function createOwnedLock(lockPath) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const TAKEOVER_GENERATION = /^lock\.(\d+)(\.released)?$/;
+
+/** @param {readonly string[]} entries */
+function topTakeoverGeneration(entries) {
+	let top = 0;
+	for (const name of entries) {
+		const match = TAKEOVER_GENERATION.exec(name);
+		if (match && !match[2]) top = Math.max(top, Number(match[1]));
+	}
+	return top;
+}
+
+/**
+ * Win the right to take over one stale lock file (#3516), with the
+ * discipline of `clients/generation-lock.ts` (TLC-checked in
+ * `formal/file-locks/GenerationLock.tla`), which scripts cannot import
+ * before a build: a directory of generations `lock.<n>`, where winning is
+ * the exclusive create of the next generation. Of several takers that judged
+ * the same generation free or stale, one create succeeds. A generation is
+ * held while it is neither marked released nor stale by `inspectLock`'s
+ * rules, so a taker that died holding it does not wedge later takeovers.
+ *
+ * @param {string} dir
+ * @param {number} staleMaxAgeMs
+ * @returns {Promise<{ dir: string, generation: number } | undefined>}
+ */
+async function acquireTakeover(dir, staleMaxAgeMs) {
+	await fsp.mkdir(dir, { recursive: true });
+	const listed = await fsp.readdir(dir);
+	const top = topTakeoverGeneration(listed);
+	if (!listed.includes(`lock.${top}.released`)) {
+		const { state } = await inspectLock(
+			path.join(dir, `lock.${top}`),
+			staleMaxAgeMs,
+		);
+		if (state === "held") return undefined;
+	}
+	const takeover = { dir, generation: top + 1 };
+	if (!(await createOwnedLock(path.join(dir, `lock.${takeover.generation}`))))
+		return undefined;
+	// A listing taken before cleanup can re-create a generation cleanup
+	// removed; the new generation then sits below the top, and must back off.
+	const entries = await fsp.readdir(dir);
+	if (topTakeoverGeneration(entries) > takeover.generation) {
+		await releaseTakeover(takeover);
+		return undefined;
+	}
+	// Keep the predecessor, as generation-lock.ts does, so a taker whose
+	// listing still shows it as the top collides with this generation.
+	for (const name of entries) {
+		const match = TAKEOVER_GENERATION.exec(name);
+		if (!match || Number(match[1]) + 1 >= takeover.generation) continue;
+		await removeLockWithRetry(path.join(dir, name));
+	}
+	return takeover;
+}
+
+/**
+ * A write that fails throws, as a failed create does: the generation stays
+ * held until this process dies, and `inspectLock` then reads it as stale.
+ *
+ * @param {{ dir: string, generation: number }} takeover
+ */
+async function releaseTakeover(takeover) {
+	await fsp.writeFile(
+		path.join(takeover.dir, `lock.${takeover.generation}.released`),
+		"",
+	);
+}
+
+/**
+ * Remove a lock file this caller judged stale, without the #3476 race
+ * (#3516). Removing it by path let two takers that judged the same dead
+ * holder stale each remove it, and the later removal deleted the earlier
+ * taker's fresh lock, so both entered. Only the winner of the takeover
+ * removes, and only after reading the file again: under the takeover, a
+ * stale file can change only through a writer from before #3516.
+ *
+ * @param {string} lockPath
+ * @param {number} staleMaxAgeMs
+ * @returns {Promise<boolean>} whether this call removed the file. False when
+ *   another taker holds the takeover, the file is no longer stale, or it
+ *   could not be removed; the caller waits and looks again.
+ */
+async function removeStaleLock(lockPath, staleMaxAgeMs) {
+	const takeover = await acquireTakeover(`${lockPath}.takeover`, staleMaxAgeMs);
+	if (!takeover) return false;
+	try {
+		const { state } = await inspectLock(lockPath, staleMaxAgeMs);
+		if (state !== "stale") return false;
+		return await removeLockWithRetry(lockPath);
+	} finally {
+		await releaseTakeover(takeover);
+	}
+}
+
 /**
  * Wait until every shared slot is free (or reclaimable as stale), called by
  * the EXCLUSIVE holder AFTER it already owns the exclusive lock file. That
@@ -335,6 +431,10 @@ async function drainSharedSlots({
 			const { state } = await inspectLock(slotPath, staleMaxAgeMs);
 			if (state === "free") continue;
 			if (state === "stale") {
+				// By path, unlike every other stale removal (#3516): this runs
+				// while this process already holds the exclusive lock, and a
+				// shared taker that re-created the slot since this read gives it
+				// back at its own re-check of the exclusive lock.
 				await removeLockWithRetry(slotPath);
 				continue;
 			}
@@ -412,13 +512,14 @@ export async function acquireSharedSlot(options = {}) {
 	for (;;) {
 		const exclusive = await inspectLock(lockPath, staleMaxAgeMs);
 		if (exclusive.state === "stale") {
-			await removeLockWithRetry(lockPath);
+			await removeStaleLock(lockPath, staleMaxAgeMs);
 		}
 		if (exclusive.state !== "held") {
 			for (let index = 0; index < slots; index++) {
 				const slotPath = getSlotPath(lockPath, index);
 				const slot = await inspectLock(slotPath, staleMaxAgeMs);
-				if (slot.state === "stale") await removeLockWithRetry(slotPath);
+				if (slot.state === "stale")
+					await removeStaleLock(slotPath, staleMaxAgeMs);
 				else if (slot.state === "held") continue;
 
 				if (!(await createOwnedLock(slotPath))) continue;
@@ -622,27 +723,13 @@ export async function acquireTestLock(options = {}) {
 				}
 			}
 
-			if (stale) {
-				// KNOWN RACE (inherited as-is from clients/installer/index.ts's
-				// acquireInstallLock, same shape there): between deciding `stale`
-				// above and the unlink below, the dead/aged-out owner could
-				// theoretically have been reaped by a DIFFERENT waiter that has
-				// already re-created the lock as its own fresh, live owner — this
-				// waiter would then unlink that fresh lock out from under it
-				// (ABA). The window is milliseconds and only reachable right after
-				// a crash (a live owner's PID is never "stale"), so it's left
-				// as-is rather than fixed here; a real fix (re-read + compare the
-				// owner body immediately before unlink) would need to land in
-				// both places per the repo's bug-class-sweep discipline, not just
-				// this one. See PR #1112 review discussion (#1101).
-				const removed = await removeLockWithRetry(lockPath);
-				if (!removed) {
-					// Another process may hold a transient handle on it; loop and
-					// re-evaluate rather than looping tightly forever.
-					await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-				}
-				continue;
-			}
+			// #3516: another waiter may have judged the same owner stale and
+			// already re-created the lock as its own. Only the takeover's winner
+			// removes, after reading the file again. When this waiter did not
+			// remove it (another taker holds the takeover, the file is no longer
+			// stale, or a process holds a transient handle on it), it waits like
+			// any contended waiter, under the same timeout.
+			if (stale && (await removeStaleLock(lockPath, staleMaxAgeMs))) continue;
 
 			const now = Date.now();
 			if (timeoutMs > 0 && now - start > timeoutMs) {
