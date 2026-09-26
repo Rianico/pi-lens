@@ -281,6 +281,13 @@ export type DegradationKind =
 	 */
 	| "generation-lock-stale-takeover"
 	/**
+	 * #3578: a sync generation-lock wait (the change-log and snapshot cache
+	 * locks) was skipped because the holder an earlier wait ran out on is
+	 * still inside. The call fell back as a timed-out wait does. Once per
+	 * session; subject is the lock directory.
+	 */
+	| "generation-lock-wait-skipped"
+	/**
 	 * Failed-first test state was retired only after ENOENT/ENOTDIR evidence,
 	 * retained when the filesystem probe was indeterminate, or evicted at the
 	 * state cap (#2044). Subject is outcome + runner + bounded path, so repeated
@@ -376,6 +383,19 @@ export type DegradationKind =
 	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "instance-registry-corrupt"
 	/**
+	 * #3498: the removal `deregisterInstance` queued took the registry lock
+	 * and ran, whether or not the entry was still there. A queued removal
+	 * with no landed record was lost (host exit, or the lock never came).
+	 * Subject is this process's pid.
+	 */
+	| "instance-registry-deregister-landed"
+	/**
+	 * #3498: `deregisterInstance`'s sync removal could not take the registry
+	 * lock, so the removal was queued on the registry tail behind the holder.
+	 * Subject is this process's pid.
+	 */
+	| "instance-registry-deregister-queued"
+	/**
 	 * #3071: a registration-record write fell back to the process cwd because
 	 * the session's identity carried no `projectRoot` — `instance-registry.ts`
 	 * still records the child, just without the caller-supplied root.
@@ -410,6 +430,12 @@ export type DegradationKind =
 	 * synthesizes a minimal host entry so the child stays tracked.
 	 */
 	| "instance-registry-registration-missing"
+	/**
+	 * #3498: a registration made before `deregisterInstance` reached its
+	 * intent or its write after it, and dropped itself. Subject is the
+	 * normalized root it would have registered.
+	 */
+	| "instance-registry-registration-superseded"
 	/**
 	 * #3383: a newline-framed reader (`createWarmIpcLineReader`) discarded an
 	 * unterminated line that had grown past `MAX_FRAMED_LINE_BYTES`. The peer is
@@ -1778,6 +1804,9 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// #2874: a successful legacy-directory migration is an upgrade tally, not
 	// a call to action. The hash-only subject avoids exposing the project path.
 	"data_dir_migrated",
+	// #3498: a queued registry removal that landed is the retry working; the
+	// `instance-registry-deregister-queued` beside it is the line that stands out.
+	"instance-registry-deregister-landed",
 ]);
 
 export function renderDegradationLines(

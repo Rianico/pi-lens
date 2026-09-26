@@ -1,0 +1,20 @@
+{
+	"extends": "./tsconfig.build.json",
+	"compilerOptions": {
+		"sourceMap": true
+	},
+	// scripts/download-grammars.js is a checked-in build exception (the one
+	// `!scripts/*.js` line in .gitignore): `npm run build` regenerates it
+	// byte-identically, but adding --sourceMap appends a
+	// `//# sourceMappingURL=` comment the committed file doesn't have, so a
+	// plain broadened `tsc --sourceMap` dirties a tracked file the mutation
+	// lane never mutates. Excluded here; scripts/**/*.mjs mutation targets
+	// aren't compiled at all, so this has no effect on that lane.
+	"exclude": [
+		"node_modules",
+		"test-lsp-files",
+		"_trigger-test.ts",
+		"tests",
+		"scripts/download-grammars.ts"
+	]
+}
