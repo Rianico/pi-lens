@@ -810,6 +810,33 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
+	it("records a raced read from its delivered text, not the tool_call's capture, when the write landed before pi's read", async () => {
+		const env = setupTestEnvironment("rg-3524-before-read-");
+		try {
+			const file = fixture(env.tmpDir, "w.ts", `${lines(6).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			const delivered = await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 6 },
+				{
+					beforeExec: () => {
+						const v = lines(6);
+						v[2] = "EXTERNAL3";
+						writeNow(file, `${v.join("\n")}\n`);
+					},
+				},
+			);
+			// The agent was shown the other writer's line.
+			expect(delivered.split("\n")[2]).toBe("EXTERNAL3");
+			const edit = await positionalEdit(runtime, file, [[3, 3, "agent3"]]);
+			expect(edit.reason).toBeUndefined();
+			expect(edit.blocked).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("leaves FileTime at the tool_call stamp after a raced read, so a newer context-only read cannot cancel the mismatch", async () => {
 		const env = setupTestEnvironment("rg-3524-no-restamp-");
 		try {

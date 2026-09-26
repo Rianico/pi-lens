@@ -271,6 +271,13 @@ describe("#3555: a widened read is labelled", () => {
 			expect([read.input.offset, read.input.limit]).toEqual([1, 31]);
 			expect(read.content[0]?.text).toMatch(NOTE);
 			expect(read.content.slice(1)).toEqual(read.host);
+			// The record names the file, not the agent's relative spelling.
+			expect(logLatency).toHaveBeenCalledWith(
+				expect.objectContaining({
+					phase: "read_widening_note",
+					filePath: path.join(env.tmpDir, "notes.md"),
+				}),
+			);
 		} finally {
 			env.cleanup();
 		}
