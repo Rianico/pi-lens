@@ -1,0 +1,5 @@
+---
+section: Fixed
+---
+
+- **A write that lands while pi is reading a file is no longer credited as read (refs #3524)** — the read guard took a read's line hashes, line count and file timestamp from the disk when pi-lens handled the result, not from the text pi delivered. Another writer (a second pi-lens, an external editor) landing between pi's read and that handler was therefore treated as seen, and an edit of the changed line was allowed. When the file moved after the read was requested, the read is now recorded from the delivered text, counted the way pi counted it, and the file's timestamp keeps the value from before the read, so the change still blocks until the agent re-reads. pi-lens counts each such read in its degradation report (`native-read-raced-writer`). The read pi-lens injects after a `write` creates a file still hashes the disk; that remainder stays open on #3524.
