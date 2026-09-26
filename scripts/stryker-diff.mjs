@@ -12,9 +12,11 @@ import {
 	buildRunConfig,
 	capMutationFiles,
 	compiledJsPath,
+	decideMutationOutcome,
 	dedupePatterns,
 	DEFAULT_MAX_FILES,
 	DEFAULT_MAX_RANGES,
+	describePartialInterruptCause,
 	describeStrykerFailure,
 	estimateAffordableMutants,
 	formatCapNotice,
@@ -26,6 +28,7 @@ import {
 	mutationRangePatterns,
 	parseChangedLineRanges,
 	parseDryRunCost,
+	planResample,
 	sampleRangesDeterministically,
 } from "./lib/stryker-diff.mjs";
 import {
@@ -403,12 +406,24 @@ if (!cost) {
 } else {
 	costEstimate = cost;
 	if (cost.totalMutants === 0) {
-		const reason = `Stryker found no mutable code in ${allPatterns.length} changed range(s)`;
-		console.log(`mutation diff: no mutants evaluated; ${reason}`);
+		// round 2 R2-2: routed through decideMutationOutcome, the same pure
+		// function the post-run and partial branches use below, so this branch
+		// is no longer an untested `if` of its own.
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants: [],
+			sampled: false,
+			rangesEvaluated: allPatterns.length,
+			rangesTotal: allPatterns.length,
+			totalMutants: cost.totalMutants,
+		});
+		console.log(
+			`mutation diff: no mutants evaluated; ${outcome.zeroMutants.reason}`,
+		);
 		writeReport(
 			null,
 			baseMeta({
-				zeroMutants: { reason },
+				zeroMutants: outcome.zeroMutants,
 				filesSkippedOverCap: skipped,
 				filesUncovered: uncovered,
 				rangesTotal: allPatterns.length,
@@ -447,105 +462,143 @@ if (!cost) {
 	}
 }
 
-// The incremental file is rewritten below regardless (force:true, round 2
-// T4), but clearing it up front means a run that never reaches Stryker (an
-// early exit above) never leaves a STALE file for some later, unrelated
-// local invocation to trip over.
-rmSync(INCREMENTAL_PATH, { force: true });
-
 const configFile = writeRunConfig(tests);
-console.log(`mutation diff: mutating ${patterns.join(", ")}`);
-console.log(`mutation diff: running related tests ${tests.join(", ")}`);
-console.log(`mutation diff: budget ${budgetMinutes} minute(s)`);
-const result = spawnSync(
-	"node_modules/.bin/stryker",
-	["run", "--mutate", patterns.join(","), configFile],
-	{
-		stdio: "inherit",
-		encoding: "utf8",
-		timeout: remainingBudgetMs(),
-		killSignal: "SIGTERM",
-	},
-);
 
-if (result.error || result.status !== 0) {
-	// round 2 S2: a budget kill (or any other interrupt) can still leave a
-	// PARTIAL result Stryker itself saved (`.stryker/incremental.json`,
-	// force:true keeps `incremental` enabled so this write-on-interrupt path
-	// stays live -- see buildRunConfig). Report what DID run, labelled
-	// partial, instead of a blanket "no mutants evaluated" that discards real
-	// signal the run already paid for.
-	if (existsSync(INCREMENTAL_PATH)) {
-		try {
-			const partialReport = JSON.parse(readFileSync(INCREMENTAL_PATH, "utf8"));
-			const { mutants, counts, score } = augmentAndSummarize(
-				partialReport,
-				compiledIndexByJsFile,
-			);
-			if (mutants.length > 0) {
-				const reason = describeStrykerFailure(result, budgetMinutes);
-				console.error(reason);
-				console.log(
-					`mutation diff: partial report -- ${mutants.length} of ${costEstimate?.totalMutants ?? "an unknown total of"} mutant(s) evaluated before the interrupt`,
+// round 2 R2-1: a deterministic sample can land entirely on ranges Stryker's
+// mutator set has none for -- a real #3579 replay at a 15-minute budget
+// sampled 1 of 99 ranges (`clients/instance-reaper.js:931-931`, a shorthand-
+// property line), while the other 98 together held all 710 measured
+// mutants. When the measurement KNOWS mutants exist elsewhere, retry with a
+// fresh sample that excludes every range already proven empty (planResample)
+// instead of reporting that verdict for the run's very first, possibly
+// unlucky, sample. Each attempt costs a full Stryker run, so this is bounded
+// by both MAX_RESAMPLE_ATTEMPTS and the shrinking remaining budget.
+const MAX_RESAMPLE_ATTEMPTS = 3;
+const triedPatternSet = new Set();
+let triedPatterns = [];
+let attempt = 0;
+
+for (;;) {
+	for (const pattern of patterns) triedPatternSet.add(pattern);
+	triedPatterns = [...triedPatternSet];
+	// The incremental file is rewritten below regardless (force:true, round 2
+	// T4), but clearing it before every attempt means neither a run that never
+	// reaches Stryker nor a PRIOR (empty) attempt in this same resample loop
+	// leaves a STALE file for the next attempt, or some later, unrelated local
+	// invocation, to trip over.
+	rmSync(INCREMENTAL_PATH, { force: true });
+
+	console.log(`mutation diff: mutating ${patterns.join(", ")}`);
+	console.log(`mutation diff: running related tests ${tests.join(", ")}`);
+	console.log(`mutation diff: budget ${budgetMinutes} minute(s)`);
+	const result = spawnSync(
+		"node_modules/.bin/stryker",
+		["run", "--mutate", patterns.join(","), configFile],
+		{
+			stdio: "inherit",
+			encoding: "utf8",
+			timeout: remainingBudgetMs(),
+			killSignal: "SIGTERM",
+		},
+	);
+
+	if (result.error || result.status !== 0) {
+		// round 2 S2: a budget kill (or any other interrupt) can still leave a
+		// PARTIAL result Stryker itself saved (`.stryker/incremental.json`,
+		// force:true keeps `incremental` enabled so this write-on-interrupt path
+		// stays live -- see buildRunConfig). Report what DID run, labelled
+		// partial, instead of a blanket "no mutants evaluated" that discards
+		// real signal the run already paid for. No retry on an interrupt: the
+		// remaining budget that would fund one is exactly what just ran out.
+		let partialMutants = [];
+		let partialReport = null;
+		let partialCounts = {};
+		let partialScore = "n/a";
+		if (existsSync(INCREMENTAL_PATH)) {
+			try {
+				partialReport = JSON.parse(readFileSync(INCREMENTAL_PATH, "utf8"));
+				({
+					mutants: partialMutants,
+					counts: partialCounts,
+					score: partialScore,
+				} = augmentAndSummarize(partialReport, compiledIndexByJsFile));
+			} catch (error) {
+				console.error(
+					`mutation diff: partial report unreadable: ${error.message}`,
 				);
-				logSurvivors(mutants);
-				writeReport(
-					partialReport,
-					baseMeta({
-						zeroMutants: null,
-						partial: {
-							reason,
-							evaluated: mutants.length,
-							total: costEstimate?.totalMutants ?? null,
-						},
-						filesSkippedOverCap: skipped,
-						filesUncovered: uncovered,
-						rangesTotal: allPatterns.length,
-						rangesEvaluated: patterns.length,
-						rangesSampled: sampled,
-						testsRun: tests,
-						counts,
-						score,
-					}),
-				);
-				process.exit(1);
 			}
-		} catch (error) {
-			console.error(
-				`mutation diff: partial report unreadable: ${error.message}`,
+		}
+		// round 2 R2-2: routed through decideMutationOutcome, the same
+		// function the two zero-mutant branches use, so a mutation of any of
+		// the three original independent conditions is caught by one shared
+		// test surface rather than none.
+		const outcome = decideMutationOutcome({
+			interrupted: true,
+			mutants: partialMutants,
+			sampled,
+			rangesEvaluated: triedPatterns.length,
+			rangesTotal: allPatterns.length,
+			totalMutants: costEstimate?.totalMutants ?? null,
+			failureReason: describeStrykerFailure(result, budgetMinutes),
+			partialReason: describePartialInterruptCause(result, budgetMinutes),
+		});
+		console.error(describeStrykerFailure(result, budgetMinutes));
+		if (outcome.partial) {
+			console.log(
+				`mutation diff: partial report -- ${outcome.partial.evaluated} of ${outcome.partial.total ?? "an unknown total of"} mutant(s) evaluated before the interrupt`,
+			);
+			logSurvivors(partialMutants);
+			writeReport(
+				partialReport,
+				baseMeta({
+					zeroMutants: null,
+					partial: outcome.partial,
+					filesSkippedOverCap: skipped,
+					filesUncovered: uncovered,
+					rangesTotal: allPatterns.length,
+					rangesEvaluated: triedPatterns.length,
+					rangesSampled: sampled,
+					testsRun: tests,
+					counts: partialCounts,
+					score: partialScore,
+				}),
+			);
+		} else {
+			writeReport(
+				null,
+				baseMeta({
+					zeroMutants: outcome.zeroMutants,
+					filesSkippedOverCap: skipped,
+					filesUncovered: uncovered,
+					rangesTotal: allPatterns.length,
+					rangesEvaluated: triedPatterns.length,
+					rangesSampled: sampled,
+					testsRun: tests,
+				}),
 			);
 		}
+		process.exit(1);
 	}
-	const reason = describeStrykerFailure(result, budgetMinutes);
-	console.error(reason);
-	writeReport(
-		null,
-		baseMeta({
-			zeroMutants: { reason },
-			filesSkippedOverCap: skipped,
-			filesUncovered: uncovered,
-			rangesTotal: allPatterns.length,
-			rangesSampled: sampled,
-			testsRun: tests,
-		}),
-	);
-	process.exit(1);
-}
 
-if (!existsSync(REPORT_PATH)) {
-	console.error("mutation diff: report not found after Stryker run");
-	writeReport(
-		null,
-		baseMeta({
-			zeroMutants: { reason: "Stryker produced no report file" },
-			filesSkippedOverCap: skipped,
-		}),
-	);
-	process.exit(1);
-}
+	if (!existsSync(REPORT_PATH)) {
+		console.error("mutation diff: report not found after Stryker run");
+		writeReport(
+			null,
+			baseMeta({
+				zeroMutants: { reason: "Stryker produced no report file" },
+				filesSkippedOverCap: skipped,
+			}),
+		);
+		process.exit(1);
+	}
 
-try {
-	const strykerReport = JSON.parse(readFileSync(REPORT_PATH, "utf8"));
+	let strykerReport;
+	try {
+		strykerReport = JSON.parse(readFileSync(REPORT_PATH, "utf8"));
+	} catch (error) {
+		console.error(`mutation diff: report unreadable: ${error.message}`);
+		process.exit(1);
+	}
 	// The mutation-report schema keys mutants by file; the entries themselves
 	// carry no file name (spike 2026-09-09 printed `survived: undefined:59`).
 	const { mutants, counts, score } = augmentAndSummarize(
@@ -553,23 +606,69 @@ try {
 		compiledIndexByJsFile,
 	);
 
-	// round 2 S1: a full run that instruments and executes 0 mutants (every
-	// changed-line token this diff produced is one Stryker's mutator set has
-	// no operator for -- a property-shorthand addition, a destructuring
-	// entry) must not render as a normal, scoreless "clean pass".
-	if (mutants.length === 0) {
-		const reason = `Stryker found no mutable code in ${allPatterns.length} changed range(s)`;
-		console.log(`mutation diff: no mutants evaluated; ${reason}`);
+	if (mutants.length > 0) {
+		console.log(`mutation diff score: ${score}`);
+		console.log(`mutation diff counts: ${JSON.stringify(counts)}`);
+		logSurvivors(mutants);
 		writeReport(
 			strykerReport,
 			baseMeta({
-				zeroMutants: { reason },
+				zeroMutants: null,
 				filesSkippedOverCap: skipped,
 				filesUncovered: uncovered,
 				filesNoSourceMap: compiledSkippedNoMap,
 				filesNoMutableLines: compiledSkippedNoLines,
 				rangesTotal: allPatterns.length,
-				rangesEvaluated: patterns.length,
+				rangesEvaluated: triedPatterns.length,
+				rangesSampled: sampled,
+				testsRun: tests,
+				counts,
+				score,
+			}),
+		);
+		break;
+	}
+
+	// round 2 S1: a full run that instruments and executes 0 mutants (every
+	// changed-line token this diff produced is one Stryker's mutator set has
+	// no operator for -- a property-shorthand addition, a destructuring
+	// entry) must not render as a normal, scoreless "clean pass". round 2
+	// R2-1: before reporting that, try a fresh sample if this run's sample is
+	// the reason, not the changed lines themselves.
+	const plan = sampled
+		? planResample({
+				allPatterns,
+				triedPatterns,
+				keepRangeCount: patterns.length,
+				seed: sha,
+				attemptsSoFar: attempt,
+				maxAttempts: MAX_RESAMPLE_ATTEMPTS,
+			})
+		: { retry: false };
+	attempt += 1;
+
+	if (!plan.retry || remainingBudgetMs() <= 0) {
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants,
+			sampled,
+			rangesEvaluated: triedPatterns.length,
+			rangesTotal: allPatterns.length,
+			totalMutants: costEstimate?.totalMutants ?? null,
+		});
+		console.log(
+			`mutation diff: no mutants evaluated; ${outcome.zeroMutants.reason}`,
+		);
+		writeReport(
+			strykerReport,
+			baseMeta({
+				zeroMutants: outcome.zeroMutants,
+				filesSkippedOverCap: skipped,
+				filesUncovered: uncovered,
+				filesNoSourceMap: compiledSkippedNoMap,
+				filesNoMutableLines: compiledSkippedNoLines,
+				rangesTotal: allPatterns.length,
+				rangesEvaluated: triedPatterns.length,
 				rangesSampled: sampled,
 				testsRun: tests,
 			}),
@@ -577,29 +676,10 @@ try {
 		process.exit(0);
 	}
 
-	console.log(`mutation diff score: ${score}`);
-	console.log(`mutation diff counts: ${JSON.stringify(counts)}`);
-	logSurvivors(mutants);
-
-	writeReport(
-		strykerReport,
-		baseMeta({
-			zeroMutants: null,
-			filesSkippedOverCap: skipped,
-			filesUncovered: uncovered,
-			filesNoSourceMap: compiledSkippedNoMap,
-			filesNoMutableLines: compiledSkippedNoLines,
-			rangesTotal: allPatterns.length,
-			rangesEvaluated: patterns.length,
-			rangesSampled: sampled,
-			testsRun: tests,
-			counts,
-			score,
-		}),
+	console.log(
+		`mutation diff: ${patterns.length} sampled range(s) held 0 mutants; retrying with ${plan.patterns.length} more of the ${allPatterns.length - triedPatterns.length} not yet tried (attempt ${attempt} of ${MAX_RESAMPLE_ATTEMPTS})`,
 	);
-} catch (error) {
-	console.error(`mutation diff: report unreadable: ${error.message}`);
-	process.exit(1);
+	patterns = plan.patterns;
 }
 
 console.log("mutation diff: completed");

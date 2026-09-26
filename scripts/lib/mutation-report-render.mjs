@@ -41,14 +41,24 @@ export function renderMutationMarkdown(report) {
 	const meta = report?.piLensMutationDiff ?? {};
 	const lines = [STICKY_MARKER, "### Mutation diff (advisory)", ""];
 
+	// round 2 R2-1: shared by the zero-mutant and the scored path below, so a
+	// run that sampled ranges down and then found nothing still SAYS it
+	// sampled -- previously the zero-mutant branch returned before this note
+	// was ever built, so a false-looking "no mutable code in M ranges" verdict
+	// carried no hint that only a subset of M was actually tried.
+	const samplingNote = meta.rangesSampled
+		? `_Sampled ${meta.rangesEvaluated ?? "?"} of ${meta.rangesTotal ?? "?"} changed-line ranges deterministically (seed \`${shortSha(meta.headSha)}\`)._`
+		: null;
+
 	if (meta.zeroMutants) {
 		lines.push(
 			"**0 mutants evaluated.** This is not a clean pass -- it means the lane found nothing to mutate or could not finish.",
 			"",
 			`> ${meta.zeroMutants.reason}`,
 			"",
-			metaTable(meta),
 		);
+		if (samplingNote) lines.push(samplingNote, "");
+		lines.push(metaTable(meta));
 		return lines.join("\n");
 	}
 
@@ -78,12 +88,7 @@ export function renderMutationMarkdown(report) {
 		"",
 	);
 
-	if (meta.rangesSampled) {
-		lines.push(
-			`_Sampled ${meta.rangesEvaluated ?? "?"} of ${meta.rangesTotal ?? "?"} changed-line ranges deterministically (seed \`${shortSha(meta.headSha)}\`)._`,
-			"",
-		);
-	}
+	if (samplingNote) lines.push(samplingNote, "");
 
 	if (survivors.length > 0) {
 		lines.push(`#### Survivors (${survivors.length})`, "");
@@ -125,17 +130,28 @@ export function renderMutationMarkdown(report) {
  * Carries the same `STICKY_MARKER` so a later successful run still finds
  * and updates this same comment rather than posting a second one.
  *
- * @param {{headSha?: string, runUrl?: string}} [context]
+ * `upstreamResult` (round 2 R2-4), when the caller can supply it (the
+ * `mutation-comment` workflow job passes `needs.mutation.result`),
+ * distinguishes a run the new per-PR concurrency group cancelled outright
+ * from one that crashed or hit its own time cap -- neither of which it
+ * actually did. With no reliable signal either way, the wording stays
+ * neutral rather than guessing "crashed" for what may just be a cancellation.
+ *
+ * @param {{headSha?: string, runUrl?: string, upstreamResult?: string}} [context]
  * @returns {string} markdown
  */
-export function renderStaleMarkdown({ headSha, runUrl } = {}) {
+export function renderStaleMarkdown({ headSha, runUrl, upstreamResult } = {}) {
+	const cause =
+		upstreamResult === "cancelled"
+			? "a newer push to this PR superseded it before it produced one"
+			: "it did not produce one (a crash, or hitting its overall time cap, are both possible; this cannot always be told apart from a cancellation)";
 	const lines = [
 		STICKY_MARKER,
 		"### Mutation diff (advisory)",
 		"",
-		`**Stale.** This head (\`${shortSha(headSha)}\`) produced no mutation report -- the job likely crashed before writing one, or hit its overall time cap outright (distinct from the driver's own, narrower Stryker budget, which always writes a report even when Stryker itself times out).`,
+		`**Stale.** This head (\`${shortSha(headSha)}\`) produced no mutation report -- ${cause} (distinct from the driver's own, narrower Stryker budget, which always writes a report even when Stryker itself times out).`,
 		"",
-		"This comment is left over from an earlier, different commit and no longer reflects this PR's current head.",
+		"This comment has just been updated to say so; any result it previously showed was for a different, earlier commit and no longer reflects this PR's current head.",
 	];
 	if (runUrl) lines.push("", `[Job run](${runUrl})`);
 	return lines.join("\n");

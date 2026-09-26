@@ -3,4 +3,5 @@ export declare function renderMutationMarkdown(report: unknown): string;
 export declare function renderStaleMarkdown(context?: {
 	headSha?: string;
 	runUrl?: string;
+	upstreamResult?: string;
 }): string;

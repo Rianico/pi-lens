@@ -116,6 +116,13 @@ jobs:
       # round 2 T6: when the artifact never existed, the step above never ran
       # and an EARLIER head's comment -- now about a commit this PR no longer
       # is -- would otherwise just stay up with nothing marking it stale.
+      #
+      # round 2 R2-4: `needs.mutation.result` (success/failure/cancelled/
+      # skipped) is the one signal this job actually has for WHY the artifact
+      # is missing -- a `mutation` job the new per-PR concurrency group
+      # cancelled reads "cancelled" here, distinct from a genuine crash or
+      # time-cap failure, which reads "failure". This job itself runs either
+      # way (`if: always()` on the job overrides the default needs-skip).
       - name: Mark the sticky comment stale (no report was produced for this head)
         if: hashFiles('reports/mutation/mutation.json') == ''
         env:
@@ -124,4 +131,5 @@ jobs:
         run: |
           node scripts/mutation-pr-comment.mjs --pr "${{ github.event.pull_request.number }}" --stale \
             --head-sha "${{ github.event.pull_request.head.sha }}" \
-            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --upstream-result "${{ needs.mutation.result }}"

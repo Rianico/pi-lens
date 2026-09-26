@@ -204,20 +204,43 @@ export function extractSnippet(sourceLines, location) {
 }
 
 /**
- * Describe a Stryker child that produced no mutation result. `spawnSync` marks
- * an expired budget with `error.code === "ETIMEDOUT"`; `signal` is null when the
- * child exits on the signal itself, which Stryker's UnexpectedExitHandler does,
- * so the signal is not a usable discriminator.
+ * The bare cause clause a Stryker child's failed/interrupted exit maps to
+ * (round 2 R2-4), shared by `describeStrykerFailure` (a full, zero-mutant
+ * failure -- prefixed "no mutants evaluated") and
+ * `describePartialInterruptCause` (a PARTIAL result -- some mutants WERE
+ * evaluated, so that prefix would contradict the "N of M evaluated" banner
+ * shown right above it). `spawnSync` marks an expired budget with
+ * `error.code === "ETIMEDOUT"`; `signal` is null when the child exits on the
+ * signal itself, which Stryker's UnexpectedExitHandler does, so the signal is
+ * not a usable discriminator.
  *
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
  */
+function strykerFailureCause(result, budgetMinutes) {
+	return result.error?.code === "ETIMEDOUT"
+		? `the ${budgetMinutes}-minute mutation budget expired before Stryker produced a result`
+		: `dry run or mutation execution failed (Stryker status ${result.status ?? "unknown"}${result.error ? `: ${result.error.message}` : ""})`;
+}
+
+/**
+ * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
+ * @param {number} budgetMinutes
+ */
 export function describeStrykerFailure(result, budgetMinutes) {
-	const cause =
-		result.error?.code === "ETIMEDOUT"
-			? `the ${budgetMinutes}-minute mutation budget expired before Stryker produced a result`
-			: `dry run or mutation execution failed (Stryker status ${result.status ?? "unknown"}${result.error ? `: ${result.error.message}` : ""})`;
-	return `mutation diff: no mutants evaluated; ${cause}`;
+	return `mutation diff: no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}`;
+}
+
+/**
+ * The reason text for a PARTIAL run's interrupt (round 2 R2-4): unlike
+ * `describeStrykerFailure`, this never says "no mutants evaluated" -- some
+ * mutants were, which is exactly why a partial report exists to show them.
+ *
+ * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
+ * @param {number} budgetMinutes
+ */
+export function describePartialInterruptCause(result, budgetMinutes) {
+	return `mutation diff: ${strykerFailureCause(result, budgetMinutes)}`;
 }
 
 export function formatCapNotice(selectedCount, totalCount, skipped) {
@@ -402,6 +425,137 @@ export function estimateAffordableMutants({
  */
 export function dedupePatterns(patterns) {
 	return [...new Set(patterns)];
+}
+
+/**
+ * The zero-mutant reason text (round 2 R2-1). Unsampled, this states the
+ * true global fact ("Stryker found no mutable code in M ranges"). SAMPLED,
+ * that same sentence is false whenever the measurement found mutants
+ * elsewhere: a real #3579 replay at a 15-minute budget sampled 1 of 99
+ * ranges -- `clients/instance-reaper.js:931-931`, a shorthand-property line
+ * with 0 mutants -- and reported "Stryker found no mutable code in 99
+ * changed range(s))" although the other 98 ranges together held 710
+ * (measured 2026-09-26). The sampled phrasing names the sample size and the
+ * measured total instead, so the reader sees "we tried a subset and it came
+ * up empty", never "there is nothing here".
+ *
+ * @param {{sampled: boolean, rangesEvaluated: number, rangesTotal: number, totalMutants: number|null}} args
+ */
+export function describeZeroMutantOutcome({
+	sampled,
+	rangesEvaluated,
+	rangesTotal,
+	totalMutants,
+}) {
+	if (!sampled) {
+		return `Stryker found no mutable code in ${rangesTotal} changed range(s)`;
+	}
+	return `0 mutants in ${rangesEvaluated} sampled of ${rangesTotal} ranges (${rangesTotal} ranges held ${totalMutants} mutant(s))`;
+}
+
+/**
+ * The single decision point for the driver's three previously-independent
+ * "did this attempt produce a usable result" branches (round 2 R2-2): the
+ * measurement-time `cost.totalMutants === 0` check, the post-run
+ * `mutants.length === 0` check, and the partial path's `mutants.length > 0`
+ * check. Before this, mutating all three of those conditions to `< 0` left
+ * the whole suite green (98/98, verified 2026-09-26) -- nothing exercised
+ * the driver's own branches, only the library functions they called. Pure,
+ * so each branch is now pinned with a literal-input test rather than a real
+ * Stryker run.
+ *
+ * @param {{
+ *   interrupted: boolean,
+ *   mutants: Array<{status: string}>,
+ *   sampled: boolean,
+ *   rangesEvaluated: number,
+ *   rangesTotal: number,
+ *   totalMutants: number | null,
+ *   failureReason?: string,
+ *   partialReason?: string,
+ * }} args `failureReason` (`describeStrykerFailure`'s output) and
+ *   `partialReason` (`describePartialInterruptCause`'s output) matter only
+ *   when `interrupted` is true.
+ * @returns {{
+ *   zeroMutants: {reason: string} | null,
+ *   partial: {reason: string, evaluated: number, total: number|null} | null,
+ * }}
+ */
+export function decideMutationOutcome({
+	interrupted,
+	mutants,
+	sampled,
+	rangesEvaluated,
+	rangesTotal,
+	totalMutants,
+	failureReason,
+	partialReason,
+}) {
+	if (interrupted && mutants.length > 0) {
+		return {
+			zeroMutants: null,
+			partial: {
+				reason: partialReason,
+				evaluated: mutants.length,
+				total: totalMutants,
+			},
+		};
+	}
+	if (interrupted) {
+		return { zeroMutants: { reason: failureReason }, partial: null };
+	}
+	if (mutants.length === 0) {
+		return {
+			zeroMutants: {
+				reason: describeZeroMutantOutcome({
+					sampled,
+					rangesEvaluated,
+					rangesTotal,
+					totalMutants,
+				}),
+			},
+			partial: null,
+		};
+	}
+	return { zeroMutants: null, partial: null };
+}
+
+/**
+ * Whether, and with what, the driver should retry a sampled attempt that
+ * evaluated 0 mutants (round 2 R2-1 fix #3): re-sample from the ranges NOT
+ * yet tried, excluding every range already proven empty, so a retry can
+ * never land on the same empty sample twice. `maxAttempts` and the caller's
+ * own remaining-budget check both bound the retry, since each attempt costs
+ * a full Stryker run.
+ *
+ * @param {{
+ *   allPatterns: string[],
+ *   triedPatterns: string[],
+ *   keepRangeCount: number,
+ *   seed: string,
+ *   attemptsSoFar: number,
+ *   maxAttempts: number,
+ * }} args
+ * @returns {{retry: false} | {retry: true, patterns: string[]}}
+ */
+export function planResample({
+	allPatterns,
+	triedPatterns,
+	keepRangeCount,
+	seed,
+	attemptsSoFar,
+	maxAttempts,
+}) {
+	if (attemptsSoFar >= maxAttempts) return { retry: false };
+	const tried = new Set(triedPatterns);
+	const remaining = allPatterns.filter((pattern) => !tried.has(pattern));
+	if (remaining.length === 0) return { retry: false };
+	const { selected } = sampleRangesDeterministically(
+		remaining,
+		Math.min(keepRangeCount, remaining.length),
+		`${seed}:retry${attemptsSoFar}`,
+	);
+	return { retry: true, patterns: selected };
 }
 
 /**

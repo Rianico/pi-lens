@@ -25,4 +25,14 @@ section: Changed
   `scripts/mutation-report.mjs` renders a downloaded `mutation.json` the same
   way for local use. The fixer and reviewer playbooks read the PR's Stryker
   report (once one exists) before hand-mutating anything it already covers,
-  including a partial run's unevaluated remainder. Still advisory.
+  including a partial run's unevaluated remainder. A sampled run that
+  evaluates 0 mutants now retries against the ranges not yet tried before
+  reporting that, and when it still comes up empty its reason names the
+  sample size and the measured total instead of claiming no mutable code
+  exists across the whole changed-line set (both the job summary and the
+  sticky comment always show the "sampled N of M" note, even on that
+  zero-mutant path). A partial run's reason no longer contradicts its own "N
+  of M evaluated" banner by claiming no mutants were evaluated, and the stale
+  notice on a head that produced no report distinguishes a run the
+  workflow's own per-PR concurrency group cancelled from one that actually
+  crashed or hit its time cap, when GitHub says which. Still advisory.

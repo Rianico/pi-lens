@@ -6,8 +6,11 @@ import {
 	buildRunConfig,
 	capMutationFiles,
 	compiledJsPath,
+	decideMutationOutcome,
 	dedupePatterns,
+	describePartialInterruptCause,
 	describeStrykerFailure,
+	describeZeroMutantOutcome,
 	DEFAULT_MAX_RANGES,
 	estimateAffordableMutants,
 	extractSnippet,
@@ -20,6 +23,7 @@ import {
 	mutationRangePatterns,
 	parseChangedLineRanges,
 	parseDryRunCost,
+	planResample,
 	sampleRangesDeterministically,
 } from "../../scripts/lib/stryker-diff.mjs";
 import {
@@ -294,6 +298,25 @@ describe("stryker diff wall-clock budget", () => {
 		expect(driver).toContain("--budget-minutes");
 		expect(driver).toContain("mutationRangePatterns");
 		expect(driver).toContain("describeStrykerFailure");
+	});
+
+	it("wires the resample loop through planResample and decideMutationOutcome, not a hand-rolled duplicate (#3531 round 3 R2-1/R2-2)", () => {
+		// Recurrence: planResample and decideMutationOutcome are fully
+		// mutation-proved as pure functions above (every branch reds under a
+		// direct mutation of scripts/lib/stryker-diff.mjs -- see the PR body's
+		// mutation table), but the driver ITSELF is a top-level script this
+		// suite cannot import and exercise end to end. A real live replay that
+		// forces the sampler onto an empty range and then proves the retry
+		// fires a SECOND real Stryker child needs multi-run Stryker-scale
+		// timing (the review's own #3579 replay at a 15-minute budget ran
+		// ~19 minutes wall-clock end to end, s2-3579.log) -- out of proportion
+		// to prove twice for a loop whose every DECISION point is already
+		// pinned above. This assertion is the stated exception's closest
+		// executable check: the driver actually calls the pinned functions,
+		// not a re-implementation that could silently diverge from them.
+		expect(driver).toContain("planResample({");
+		expect(driver).toContain("decideMutationOutcome({");
+		expect(driver).toContain("MAX_RESAMPLE_ATTEMPTS");
 	});
 
 	it("builds the per-run Stryker config through buildRunConfig, not a hand-rolled duplicate", () => {
@@ -632,6 +655,214 @@ describe("dedupePatterns (#3531 round 2 S3)", () => {
 	it("is a no-op on an already-unique list", () => {
 		const patterns = ["a.js:1-1", "b.js:2-2"];
 		expect(dedupePatterns(patterns)).toEqual(patterns);
+	});
+});
+
+describe("describePartialInterruptCause (#3531 round 3 R2-4)", () => {
+	it("never says 'no mutants evaluated' -- some mutants WERE, which is why a partial report exists", () => {
+		// Recurrence: the review found the partial reason quoting
+		// describeStrykerFailure's "no mutants evaluated" prefix directly under
+		// the render's own "Partial run -- 8 of 9 evaluated" banner --
+		// self-contradictory.
+		const reason = describePartialInterruptCause(
+			{
+				status: 143,
+				signal: null,
+				error: Object.assign(new Error("spawnSync ETIMEDOUT"), {
+					code: "ETIMEDOUT",
+				}),
+			},
+			60,
+		);
+
+		expect(reason).not.toContain("no mutants evaluated");
+		expect(reason).toContain("60-minute mutation budget expired");
+	});
+
+	it("still names Stryker's own status for a non-timeout interrupt", () => {
+		const reason = describePartialInterruptCause(
+			{ status: 1, signal: null, error: undefined },
+			60,
+		);
+
+		expect(reason).not.toContain("no mutants evaluated");
+		expect(reason).toContain("Stryker status 1");
+	});
+});
+
+describe("describeZeroMutantOutcome (#3531 round 3 R2-1)", () => {
+	it("states the true global fact when the whole changed-range set was tried, unsampled", () => {
+		expect(
+			describeZeroMutantOutcome({
+				sampled: false,
+				rangesEvaluated: 5,
+				rangesTotal: 5,
+				totalMutants: 0,
+			}),
+		).toBe("Stryker found no mutable code in 5 changed range(s)");
+	});
+
+	it("names the sample size and the measured total instead of the false global claim, when sampled", () => {
+		// Recurrence: a real #3579 replay at a 15-minute budget sampled 1 of 99
+		// ranges (a shorthand-property line with 0 mutants) while the
+		// measurement found 710 mutants across all 99 -- "Stryker found no
+		// mutable code in 99 changed range(s)" was false.
+		expect(
+			describeZeroMutantOutcome({
+				sampled: true,
+				rangesEvaluated: 1,
+				rangesTotal: 99,
+				totalMutants: 710,
+			}),
+		).toBe(
+			"0 mutants in 1 sampled of 99 ranges (99 ranges held 710 mutant(s))",
+		);
+	});
+});
+
+describe("decideMutationOutcome (#3531 round 3 R2-2: the driver's three outcome branches, unified and pure)", () => {
+	it("measurement-time: cost.totalMutants === 0 reports a zero-mutant outcome, not a partial or scored one", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants: [],
+			sampled: false,
+			rangesEvaluated: 12,
+			rangesTotal: 12,
+			totalMutants: 0,
+		});
+
+		expect(outcome.partial).toBeNull();
+		expect(outcome.zeroMutants).toEqual({
+			reason: "Stryker found no mutable code in 12 changed range(s)",
+		});
+	});
+
+	it("post-run: mutants.length === 0 after a completed run reports zero, sample-aware", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants: [],
+			sampled: true,
+			rangesEvaluated: 1,
+			rangesTotal: 99,
+			totalMutants: 710,
+		});
+
+		expect(outcome.partial).toBeNull();
+		expect(outcome.zeroMutants).toEqual({
+			reason:
+				"0 mutants in 1 sampled of 99 ranges (99 ranges held 710 mutant(s))",
+		});
+	});
+
+	it("post-run: any mutant evaluated reports neither zero nor partial (a normal scored run)", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants: [{ status: "Killed" }],
+			sampled: false,
+			rangesEvaluated: 1,
+			rangesTotal: 1,
+			totalMutants: 1,
+		});
+
+		expect(outcome.zeroMutants).toBeNull();
+		expect(outcome.partial).toBeNull();
+	});
+
+	it("interrupted with mutants.length > 0 reports partial, carrying the partial-specific reason", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: true,
+			mutants: [{ status: "Killed" }, { status: "Killed" }],
+			sampled: false,
+			rangesEvaluated: 1,
+			rangesTotal: 1,
+			totalMutants: 9,
+			failureReason: "mutation diff: no mutants evaluated; budget expired",
+			partialReason: "mutation diff: budget expired",
+		});
+
+		expect(outcome.zeroMutants).toBeNull();
+		expect(outcome.partial).toEqual({
+			reason: "mutation diff: budget expired",
+			evaluated: 2,
+			total: 9,
+		});
+	});
+
+	it("interrupted with no usable partial result (mutants.length === 0) falls back to the failure reason, not describeZeroMutantOutcome's", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: true,
+			mutants: [],
+			sampled: true,
+			rangesEvaluated: 1,
+			rangesTotal: 99,
+			totalMutants: 710,
+			failureReason: "mutation diff: no mutants evaluated; budget expired",
+			partialReason: "mutation diff: budget expired",
+		});
+
+		expect(outcome.partial).toBeNull();
+		expect(outcome.zeroMutants).toEqual({
+			reason: "mutation diff: no mutants evaluated; budget expired",
+		});
+	});
+});
+
+describe("planResample (#3531 round 3 R2-1 fix #3)", () => {
+	it("resamples from only the ranges not yet tried, excluding every proven-empty one", () => {
+		const plan = planResample({
+			allPatterns: ["a.js:1-1", "b.js:2-2", "c.js:3-3", "d.js:4-4"],
+			triedPatterns: ["a.js:1-1"],
+			keepRangeCount: 2,
+			seed: "deadbeef",
+			attemptsSoFar: 0,
+			maxAttempts: 3,
+		});
+
+		if (!plan.retry) throw new Error("expected plan.retry to be true");
+		expect(plan.patterns).toHaveLength(2);
+		expect(plan.patterns).not.toContain("a.js:1-1");
+		for (const pattern of plan.patterns) {
+			expect(["b.js:2-2", "c.js:3-3", "d.js:4-4"]).toContain(pattern);
+		}
+	});
+
+	it("gives up once every range has been tried", () => {
+		const plan = planResample({
+			allPatterns: ["a.js:1-1", "b.js:2-2"],
+			triedPatterns: ["a.js:1-1", "b.js:2-2"],
+			keepRangeCount: 2,
+			seed: "deadbeef",
+			attemptsSoFar: 0,
+			maxAttempts: 3,
+		});
+
+		expect(plan).toEqual({ retry: false });
+	});
+
+	it("gives up once the attempt cap is reached, even with untried ranges remaining", () => {
+		const plan = planResample({
+			allPatterns: ["a.js:1-1", "b.js:2-2", "c.js:3-3"],
+			triedPatterns: ["a.js:1-1"],
+			keepRangeCount: 1,
+			seed: "deadbeef",
+			attemptsSoFar: 3,
+			maxAttempts: 3,
+		});
+
+		expect(plan).toEqual({ retry: false });
+	});
+
+	it("is deterministic: the same seed and tried set resample to the identical subset", () => {
+		const args = {
+			allPatterns: ["a.js:1-1", "b.js:2-2", "c.js:3-3", "d.js:4-4"],
+			triedPatterns: ["a.js:1-1"],
+			keepRangeCount: 2,
+			seed: "9ebbb5da",
+			attemptsSoFar: 0,
+			maxAttempts: 3,
+		};
+
+		expect(planResample(args)).toEqual(planResample({ ...args }));
 	});
 });
 

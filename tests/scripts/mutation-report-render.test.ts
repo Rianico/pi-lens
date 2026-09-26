@@ -139,6 +139,35 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).not.toContain("| Location |");
 	});
 
+	it("round 3 R2-1: prints the sampling note on the zero-mutant path too, and the sample-aware reason", () => {
+		// Recurrence: a real #3579 replay sampled 1 of 99 ranges (a
+		// shorthand-property line with 0 mutants) while the measurement found
+		// 710 mutants across all 99 -- the zero-mutant branch returned before
+		// ever reaching the "Sampled N of M" note built below it, so the
+		// comment read as an unqualified "no mutable code in 99 ranges", with
+		// no hint that 98 of those 99 were never even tried.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "9ebbb5dac2d3157d4a5560366098a85ee5099fd6",
+				zeroMutants: {
+					reason:
+						"0 mutants in 1 sampled of 99 ranges (99 ranges held 710 mutant(s))",
+				},
+				rangesSampled: true,
+				rangesEvaluated: 1,
+				rangesTotal: 99,
+			},
+		});
+
+		expect(markdown).toContain("0 mutants evaluated");
+		expect(markdown).toContain(
+			"0 mutants in 1 sampled of 99 ranges (99 ranges held 710 mutant(s))",
+		);
+		expect(markdown).toContain("Sampled 1 of 99");
+	});
+
 	it("names a deterministic sample when the range budget capped the run", () => {
 		const markdown = renderMutationMarkdown({
 			files: {},
@@ -187,8 +216,10 @@ describe("renderMutationMarkdown", () => {
 				headSha: "abc1234",
 				zeroMutants: null,
 				partial: {
+					// round 3 R2-4: describePartialInterruptCause's shape -- never
+					// "no mutants evaluated" under a "6 of 9 evaluated" banner.
 					reason:
-						"mutation diff: no mutants evaluated; the 0.55-minute mutation budget expired before Stryker produced a result",
+						"mutation diff: the 0.55-minute mutation budget expired before Stryker produced a result",
 					evaluated: 6,
 					total: 9,
 				},
@@ -200,6 +231,9 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).toContain("Partial run");
 		expect(markdown).toContain("6 of 9 mutant(s) evaluated");
 		expect(markdown).toContain("budget expired");
+		// Recurrence (round 3 R2-4): the reason sits right under "6 of 9
+		// evaluated" -- it must never itself say the run evaluated nothing.
+		expect(markdown).not.toContain("no mutants evaluated");
 		// The partial run's own real counts still render, same as a complete run.
 		expect(markdown).toContain("100.00");
 	});
@@ -219,7 +253,7 @@ describe("renderMutationMarkdown", () => {
 	});
 });
 
-describe("renderStaleMarkdown (#3531 round 2 T6)", () => {
+describe("renderStaleMarkdown (#3531 round 2 T6, round 3 R2-4 wording)", () => {
 	it("names the head that produced no report, and carries the sticky marker so a later run finds and updates it", () => {
 		const markdown = renderStaleMarkdown({
 			headSha: "deadbeef00001234",
@@ -230,6 +264,10 @@ describe("renderStaleMarkdown (#3531 round 2 T6)", () => {
 		expect(markdown).toContain("Stale");
 		expect(markdown).toContain("deadbeef0000");
 		expect(markdown).toContain("no longer reflects this PR's current head");
+		// Recurrence (round 3 R2-4): the PATCH this very call produces
+		// OVERWRITES the comment with this notice -- "left over" implied no
+		// action was taken, when the update is happening right now.
+		expect(markdown).not.toContain("left over");
 	});
 
 	it("links the job run when a run URL is given", () => {
@@ -246,6 +284,31 @@ describe("renderStaleMarkdown (#3531 round 2 T6)", () => {
 	it("renders without throwing when given no context at all", () => {
 		expect(() => renderStaleMarkdown()).not.toThrow();
 		expect(renderStaleMarkdown()).toContain(STICKY_MARKER);
+	});
+
+	it("names the concurrency group, not a crash or the time cap, when the upstream job was cancelled", () => {
+		// Recurrence: `mutation`'s own job can be cancelled by the workflow's
+		// per-PR concurrency group (a newer push superseding it), which is
+		// neither a crash nor hitting the 90-minute time cap -- the comment
+		// must not blame either when GitHub's own `needs.mutation.result`
+		// tells this job it was "cancelled".
+		const markdown = renderStaleMarkdown({
+			headSha: "abc123",
+			upstreamResult: "cancelled",
+		});
+
+		expect(markdown).toContain("superseded");
+		expect(markdown).not.toContain("crash");
+		expect(markdown).not.toContain("time cap outright");
+	});
+
+	it("words it neutrally (not a specific crash/cancellation claim) when the upstream result is unknown or a genuine failure", () => {
+		const markdown = renderStaleMarkdown({
+			headSha: "abc123",
+			upstreamResult: "failure",
+		});
+
+		expect(markdown).not.toContain("superseded");
 	});
 });
 

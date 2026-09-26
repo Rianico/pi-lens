@@ -41,6 +41,14 @@ export declare function describeStrykerFailure(
 	},
 	budgetMinutes: number,
 ): string;
+export declare function describePartialInterruptCause(
+	result: {
+		status: number | null;
+		signal?: NodeJS.Signals | null;
+		error?: Error & { code?: string };
+	},
+	budgetMinutes: number,
+): string;
 export declare function sampleRangesDeterministically(
 	patterns: string[],
 	limit: number,
@@ -69,6 +77,33 @@ export declare function estimateAffordableMutants(args: {
 	safetyFactor?: number;
 }): number;
 export declare function dedupePatterns(patterns: string[]): string[];
+export declare function describeZeroMutantOutcome(args: {
+	sampled: boolean;
+	rangesEvaluated: number;
+	rangesTotal: number;
+	totalMutants: number | null;
+}): string;
+export declare function decideMutationOutcome(args: {
+	interrupted: boolean;
+	mutants: Array<{ status: string }>;
+	sampled: boolean;
+	rangesEvaluated: number;
+	rangesTotal: number;
+	totalMutants: number | null;
+	failureReason?: string;
+	partialReason?: string;
+}): {
+	zeroMutants: { reason: string } | null;
+	partial: { reason: string; evaluated: number; total: number | null } | null;
+};
+export declare function planResample(args: {
+	allPatterns: string[];
+	triedPatterns: string[];
+	keepRangeCount: number;
+	seed: string;
+	attemptsSoFar: number;
+	maxAttempts: number;
+}): { retry: false } | { retry: true; patterns: string[] };
 export declare function augmentAndSummarize(
 	strykerReport: { files?: Record<string, { mutants?: any[] }> },
 	compiledIndexByJsFile: Map<string, { index: object; tsFile: string }>,

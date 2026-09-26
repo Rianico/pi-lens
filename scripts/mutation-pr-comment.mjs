@@ -14,7 +14,7 @@
  *
  *   node scripts/mutation-pr-comment.mjs --pr <number> [--report path]
  *   node scripts/mutation-pr-comment.mjs --pr <number> --stale \
- *     [--head-sha sha] [--run-url url]
+ *     [--head-sha sha] [--run-url url] [--upstream-result result]
  *
  * `--stale` (round 2 T6) marks the EXISTING sticky comment, if any, as
  * belonging to an earlier, different head: used when this head's job
@@ -47,13 +47,14 @@ const stale = process.argv.includes("--stale");
 const reportPath = argumentValue("--report", "reports/mutation/mutation.json");
 const headSha = argumentValue("--head-sha", null);
 const runUrl = argumentValue("--run-url", null);
+const upstreamResult = argumentValue("--upstream-result", null);
 if (!pr) {
 	console.error("mutation-pr-comment: --pr <number> is required");
 	process.exit(1);
 }
 
 const body = stale
-	? renderStaleMarkdown({ headSha, runUrl })
+	? renderStaleMarkdown({ headSha, runUrl, upstreamResult })
 	: renderMutationMarkdown(JSON.parse(readFileSync(reportPath, "utf8")));
 
 function postOrUpdateStickyComment(commentBody) {
