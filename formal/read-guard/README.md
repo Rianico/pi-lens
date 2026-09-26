@@ -104,8 +104,14 @@ nor refuse an exact one.
 ## Results
 
 TLC 2.19 (`tla2tools.jar` v1.7.4), `-workers auto`. Times were measured on a
-loaded machine (load average about 19-25 on 4 cores): 448 s for the 30
-configs here, `Guarded` 163 s of it.
+loaded machine (load average about 6-8 on 4 cores): 80 s for the 30 configs
+here (82 s wall at `-workers 2`), `NewSession` the slowest at 14 s.
+
+`Guarded` runs at three agent ops to fit CI's `TLA+ models` budget (#3572).
+At three ops, every mutant keeps its verdict and the #3523 flip still flips.
+The four-op interleaving (for example two reads and two edits) was checked
+only once, at the old bound: it passed with 969,664 distinct states on the
+head that added this model. It is not checked in CI.
 
 | Config | Models | Expect | Distinct states |
 |---|---|---|---|
@@ -124,7 +130,7 @@ configs here, `Guarded` 163 s of it.
 | `EvidenceAtResultHandler` | the same with the read taken from disk at tool_result (the code before #3524) | violated `NoStaleAllow` | 316 |
 | `EvidenceFromDelivered` | #3524 fixed, another writer anywhere, replace/delete/insert | pass | 93,904 |
 | `CreationAtResult` | remainder of #3524: the injected creation read still hashes the disk | violated `NoStaleAllow` | 1,291 |
-| `Guarded` | current code, reads, one-line edits, another writer between tool calls | pass (all three invariants) | 969,664 |
+| `Guarded` | current code, reads, one-line edits, another writer between tool calls, three agent ops (#3572) | pass (all three invariants) | 69,531 |
 | `GuardedNoCoverage` / `GuardedNoSnapshot` | `Guarded` without `checkCoverage` / `validateRangeSnapshot` | violated `NoBlindAllow` / `NoStaleAllow` | 100 / 3,830 |
 | `NewSession` | current code across `/new` | pass | 316,790 |
 | `Unhashed` / `UnhashedNoFileTime` | current code without line hashes / without FileTime | pass / violated `NoStaleAllow` | 13,370 / 243 |
