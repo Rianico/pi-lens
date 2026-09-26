@@ -500,6 +500,19 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 			runtime.deferMutation(bothKinds, otherRoot, "edit", otherRoot, "autofix");
 			// Both kinds, neither started: named once, not by each loop.
 			runtime.deferMutation(bothKinds, otherRoot, "edit", otherRoot, "format");
+			// Autofix only, in a third project: only the autofix loop can name it.
+			const thirdRoot = path.join(env.tmpDir, "third");
+			fs.mkdirSync(thirdRoot);
+			writeBiomeAgreement(thirdRoot);
+			const autofixOnly = path.join(thirdRoot, "h.ts");
+			fs.writeFileSync(autofixOnly, "const w=4\n");
+			runtime.deferMutation(
+				autofixOnly,
+				thirdRoot,
+				"edit",
+				thirdRoot,
+				"autofix",
+			);
 			const drain = handleAgentEnd(
 				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
 			);
@@ -508,13 +521,14 @@ describe("#3528: a drain that outlives its session writes nothing into the next"
 			resume.open();
 			const summary = await drain;
 			// f.ts: its autofix ran, its format was never started. g.ts: neither
-			// its autofix nor its format was started. b-e.ts: never formatted.
+			// its autofix nor its format was started. h.ts: its autofix was never
+			// started. b-e.ts: never formatted.
 			expect(
 				summary?.skipped
 					.filter((entry) => entry.reason === "session-replaced")
 					.map((entry) => path.basename(entry.filePath))
 					.sort(),
-			).toEqual(["b.ts", "c.ts", "d.ts", "e.ts", "f.ts", "g.ts"]);
+			).toEqual(["b.ts", "c.ts", "d.ts", "e.ts", "f.ts", "g.ts", "h.ts"]);
 			for (const fp of formatOnly)
 				expect(fs.readFileSync(fp, "utf8")).toBe("const z=3\n");
 		});
