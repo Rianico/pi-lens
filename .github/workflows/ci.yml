@@ -149,7 +149,10 @@ jobs:
     # refs #3447: TLC over formal/*/*.cfg. Measured locally: 166s for 74
     # configs on 4 cores (the largest, lsp-server-content's two-writer
     # configs, about 19s each); timeout = floor of 10 min.
-    timeout-minutes: 10
+    # refs #3572: the serial run outgrew 10 min (master 551415b28 was cancelled
+    # at 598s with every reached config ok). 20 min is a stopgap until the
+    # per-config timing and parallel lane from #3572 land.
+    timeout-minutes: 20
     permissions:
       contents: read
 

@@ -135,11 +135,19 @@ function backoff(): void {
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, backoffMs());
 }
 
+/**
+ * A wait that outlasts any one hold (#3498): a generation, or an older
+ * writer's lock file, older than the lease is taken over, so waiting the lease
+ * plus one ordinary wait reaches the lock unless a filesystem error stops it.
+ */
+export const LOCK_WAIT_THROUGH_LEASE_MS = LOCK_STALE_MS + LOCK_WAIT_MS;
+
 export async function withInstanceRegistryLock<T>(
 	target: string,
 	op: () => Promise<T>,
+	waitMs = LOCK_WAIT_MS,
 ): Promise<T | undefined> {
-	const deadline = Date.now() + LOCK_WAIT_MS;
+	const deadline = Date.now() + waitMs;
 	while (Date.now() <= deadline) {
 		const hold = tryAcquire(target);
 		if (hold === "failed") return undefined;

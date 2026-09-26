@@ -2325,7 +2325,14 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// #2523 AC4 threads it. Review round 1 (F2) adds one more in the reaper:
 	// the re-check also re-reads the owner tag, the same bounded query.
 	"clients/instance-reaper.ts": 32,
-	"clients/instance-registry.ts": 28,
+	// 28 → 33 (#3498): the removal deregisterInstance queues when its sync
+	// wait cannot take the lock adds four (this process's start, the lock, the
+	// read, the write), and writeRegistryWithRetry's read and write now sit on
+	// two lines so a registration whose session ended can skip the write. The
+	// queued removal runs on the registry tail, never awaited by a hook; each
+	// is a local file operation or the registry lock's own bounded wait, and
+	// none can take the hook's signal until #2523 AC4 threads it.
+	"clients/instance-registry.ts": 33,
 	"clients/language-profile.ts": 3,
 	"clients/lens-engine.ts": 1,
 	"clients/lens-map.ts": 2,
