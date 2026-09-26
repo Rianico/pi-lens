@@ -24,6 +24,7 @@ import {
 	type SearchReadLocation,
 } from "./search-read-registration.js";
 import type { CacheManager } from "./cache-manager.js";
+import type { GenerationHandle } from "./generation-guard.js";
 import { createFileTime } from "./file-time.js";
 import { publishFormatQueued } from "./format-events-publish.js";
 import {
@@ -819,6 +820,13 @@ async function dispatchPipelineAnalysis(args: {
 	// identity gates read-guard credit and all autonomous writer/instruction
 	// surfaces (#3226).
 	allowAutonomousWriters: boolean;
+	/**
+	 * #3512: the session this dispatch belongs to, captured by the caller
+	 * before its first await on the pipeline. The deferred cascade's tier-3
+	 * touch and the caller's later admission of that cascade both drop
+	 * through it once the session is replaced.
+	 */
+	sessionGeneration: GenerationHandle;
 }): Promise<
 	| { crashed: false; result: PipelineResult }
 	| {
@@ -846,6 +854,7 @@ async function dispatchPipelineAnalysis(args: {
 		toolResultStart,
 		nativeAppliedPairs,
 		allowAutonomousWriters,
+		sessionGeneration,
 	} = args;
 	const {
 		event,
@@ -902,6 +911,7 @@ async function dispatchPipelineAnalysis(args: {
 			onWordIndexUpdated: (index) => {
 				scheduleWordIndexPersist(dispatchCwd, index, dbg);
 			},
+			sessionGeneration,
 			nextWriteIndex: () => runtime.nextWriteIndex(),
 		},
 		{
@@ -2036,6 +2046,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							// carries evidence and stays enabled on every
 							// per-path dispatch.
 							allowAutonomousWriters: true,
+							// #3512: this path admits no cascade, so the capture
+							// only guards the cascade's tier-3 touch.
+							sessionGeneration: runtime.captureSessionGeneration(),
 						}),
 						{
 							ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
@@ -2457,6 +2470,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			toolResultStart,
 			nativeAppliedPairs,
 			allowAutonomousWriters: bashAuthorshipConfirmed,
+			// #3512: one capture for the whole dispatch, the same one the
+			// inline verdict below writes through.
+			sessionGeneration: writeSession,
 		}),
 		{
 			ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
@@ -2595,7 +2611,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	}
 
 	if (result.cascadePromise) {
-		runtime.appendCascadePromise(result.cascadePromise);
+		runtime.appendCascadePromise(result.cascadePromise, writeSession, filePath);
 	}
 
 	if (result.actionableWarnings?.length) {
