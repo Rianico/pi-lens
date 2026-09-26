@@ -1247,7 +1247,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"index.ts": 4,
 	},
 	warning: {
-		"clients/actionable-warnings.ts": 63,
+		// #3576: 63 -> 65. The quickfix pass's session check skips the loop's
+		// `warning` like its sibling skips (its id and its file as the ledger
+		// subject); the loop variable is not this fix's to rename.
+		"clients/actionable-warnings.ts": 65,
 		"clients/ast-grep-client.ts": 4,
 		"clients/code-quality-warnings.ts": 32,
 		"clients/dispatch/runners/rubocop.ts": 1,
