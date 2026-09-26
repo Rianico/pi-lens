@@ -1795,15 +1795,17 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					},
 				});
 				// #3524: another writer moved the file after the tool_call's stamp,
-				// so the disk may not be what pi delivered. The delivered text (less
-				// pi's continuation notice) is then the evidence, and the stamp
-				// stays where it was. Text with more lines than pi's own count
-				// (truncation, then the requested limit) is not pi's raw output: a
-				// producer upstream decorated it, and its hashes would refuse lines
-				// that did not change. The disk now holds the racing write, so the
-				// evidence is then the tool_call's own capture, read before the
-				// racer (the provisional record this result supersedes), and no
-				// hashes at all when there is none.
+				// so the disk may not be what pi delivered, and by now it holds the
+				// racer's bytes. The stamp stays where it was. The evidence is the
+				// delivered text (less pi's continuation notice) when pi's own count
+				// (truncation, then the requested limit) vouches for it: text with
+				// more lines is not pi's raw output, a producer upstream decorated
+				// it. With no count, only the tool_call's own capture can vouch for
+				// the text, so it must equal the capture. Otherwise the capture is
+				// the evidence: the provisional record this result supersedes, the
+				// newest one, since an id can be reused. A write that landed before
+				// pi's read then refuses lines the agent was shown until it re-reads.
+				// With no capture there is no evidence, and nothing is recorded.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
 				const deliveredText = raced
 					? deliveredLineEvidence(
@@ -1817,21 +1819,26 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							requestedOffset,
 						)
 					: undefined;
+				const capture = raced
+					? deps.readGuard
+							.getReadHistory(deliveredFilePath)
+							.slice()
+							.reverse()
+							.find(
+								(candidate) =>
+									candidate.source ===
+									`native-read:${nativeReadToolCallId}:provisional`,
+							)
+					: undefined;
 				const piLineCount = truncation?.outputLines ?? requestedLimit;
 				const delivered =
 					deliveredText &&
-					(piLineCount === undefined || deliveredText.lineCount <= piLineCount)
+					(piLineCount !== undefined
+						? deliveredText.lineCount <= piLineCount
+						: capture?.lineHashes !== undefined &&
+							JSON.stringify(deliveredText.lineHashes) ===
+								JSON.stringify(capture.lineHashes))
 						? deliveredText
-						: undefined;
-				const fallbackHashes =
-					raced && !delivered
-						? (deps.readGuard
-								.getReadHistory(deliveredFilePath)
-								.find(
-									(candidate) =>
-										candidate.source ===
-										`native-read:${nativeReadToolCallId}:provisional`,
-								)?.lineHashes ?? {})
 						: undefined;
 				if (raced) {
 					incrementDegradationCount({
@@ -1839,28 +1846,43 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						subject: deliveredFilePath,
 						reason: delivered
 							? "the file changed between pi's read and its tool_result; the read is recorded from the delivered text"
-							: "the file changed between pi's read and its tool_result; the delivered text does not match pi's line count, so the tool_call's capture is the evidence",
+							: capture
+								? "the file changed between pi's read and its tool_result; pi's line count does not vouch for the delivered text, so the tool_call's capture is the evidence"
+								: "the file changed between pi's read and its tool_result; pi's line count does not vouch for the delivered text and there is no tool_call capture, so the read is not recorded",
 					});
 				}
-				const deliveredRecord = {
-					filePath: deliveredFilePath,
-					requestedOffset,
-					requestedLimit: requestedLimit ?? deliveredLimit,
-					effectiveOffset: requestedOffset,
-					effectiveLimit: delivered?.lineCount ?? deliveredLimit,
-					expandedByLsp: false,
-					...(delivered?.lineHashes && { lineHashes: delivered.lineHashes }),
-					...(fallbackHashes && { lineHashes: fallbackHashes }),
-					turnIndex: runtime.turnIndex,
-					writeIndex: runtime.peekWriteIndex(),
-					timestamp: Date.now(),
-				};
-				deps.readGuard.recordRead(deliveredRecord, {
-					...(nativeReadToolCallId && {
-						supersedes: { toolCallId: nativeReadToolCallId },
-					}),
-					stampFileTime: !raced,
-				});
+				const evidence =
+					raced && !delivered
+						? capture && {
+								effectiveOffset: capture.effectiveOffset,
+								effectiveLimit: capture.effectiveLimit,
+								lineHashes: capture.lineHashes,
+							}
+						: {
+								effectiveOffset: requestedOffset,
+								effectiveLimit: delivered?.lineCount ?? deliveredLimit,
+								lineHashes: delivered?.lineHashes,
+							};
+				if (evidence) {
+					const deliveredRecord = {
+						filePath: deliveredFilePath,
+						requestedOffset,
+						requestedLimit: requestedLimit ?? deliveredLimit,
+						effectiveOffset: evidence.effectiveOffset,
+						effectiveLimit: evidence.effectiveLimit,
+						expandedByLsp: false,
+						...(evidence.lineHashes && { lineHashes: evidence.lineHashes }),
+						turnIndex: runtime.turnIndex,
+						writeIndex: runtime.peekWriteIndex(),
+						timestamp: Date.now(),
+					};
+					deps.readGuard.recordRead(deliveredRecord, {
+						...(nativeReadToolCallId && {
+							supersedes: { toolCallId: nativeReadToolCallId },
+						}),
+						stampFileTime: !raced,
+					});
+				}
 			}
 		}
 	}
