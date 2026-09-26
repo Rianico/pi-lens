@@ -1687,9 +1687,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				});
 				// #3524: another writer moved the file after the tool_call's stamp,
 				// so the disk may not be what pi delivered. The delivered text is
-				// then the evidence (at most `deliveredLimit` of its lines, which
-				// leaves out pi's trailing continuation notice), and the stamp stays
-				// where it was.
+				// then the evidence, and the stamp stays where it was. Its line
+				// count is pi's own (truncation, then the requested limit), which
+				// leaves out pi's trailing continuation notice and never consults
+				// the disk that moved.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
 				const delivered = raced
 					? deliveredLineEvidence(
@@ -1697,7 +1698,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 								.map((part) => (part.type === "text" ? (part.text ?? "") : ""))
 								.join("\n"),
 							requestedOffset,
-							deliveredLimit,
+							truncation?.outputLines ?? requestedLimit,
 						)
 					: undefined;
 				if (raced) {

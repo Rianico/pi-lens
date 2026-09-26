@@ -740,6 +740,37 @@ describe("#3524: a native read's evidence is the delivered text", () => {
 		}
 	});
 
+	it("credits every delivered line when another writer shortened the file during the read", async () => {
+		const env = setupTestEnvironment("rg-3524-shortened-");
+		try {
+			const file = fixture(env.tmpDir, "s.ts", lines(6).join("\n"));
+			const runtime = newRuntime(env.tmpDir);
+			await piRead(
+				runtime,
+				file,
+				{ offset: 1, limit: 6 },
+				{
+					gate: () =>
+						writeNow(
+							file,
+							lines(6)
+								.filter((_, i) => i !== 1)
+								.join("\n"),
+						),
+				},
+			);
+			// Another writer inserts a line on top: line 6 holds "line6" again,
+			// exactly what the agent was shown there.
+			writeNow(file, ["INSERTED", ...diskLines(file)].join("\n"));
+			expect(diskLines(file)[5]).toBe("line6");
+			const edit = await positionalEdit(runtime, file, [[6, 6, "agent6"]]);
+			expect(edit.reason).toBeUndefined();
+			expect(edit.blocked).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("does not credit pi's continuation notice as delivered lines", async () => {
 		const env = setupTestEnvironment("rg-3524-notice-");
 		try {
