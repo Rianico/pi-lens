@@ -376,6 +376,11 @@ export function appendProjectChangeAllocated(
 ): void {
 	const logPath = getProjectChangeLogPath(cwd);
 	fs.mkdirSync(path.dirname(logPath), { recursive: true });
+	// #3577: fold the log up to its current size before taking the lock, so the
+	// read under it covers only the lines appended meanwhile. The first edit
+	// after a timed-out session_start read has no cursor, and read the whole
+	// log while holding the lock (0.9 s at 150 MB).
+	readChangeLogMaxSeq(logPath);
 	const append = (locked: boolean) => {
 		const entry = build(readChangeLogMaxSeq(logPath));
 		const line = locked ? entry : { ...entry, unlocked: true as const };

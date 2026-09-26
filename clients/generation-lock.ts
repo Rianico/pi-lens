@@ -24,7 +24,11 @@ import { randomInt } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { incrementDegradationCount } from "./degradation-ledger.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 
 const GENERATION = /^lock\.(\d+)(\.released)?$/;
 
@@ -259,12 +263,31 @@ export function tryAcquireGeneration(
 	return hold;
 }
 
+// #3578: per lock directory, the holder a wait last ran out on, named by its
+// top generation file and the `<pid> <ms>` it holds. Only a later holder
+// writes another name, so a match is that same holder, still inside.
+const timedOutHolders = new BoundedFifoMap<string, string>(16);
+
+function topGenerationHolder(dir: string): string | undefined {
+	try {
+		const top = topGeneration(fs.readdirSync(dir));
+		return `lock.${top} ${fs.readFileSync(generationPath(dir, top), "utf8").trim()}`;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Run `op` holding the lock at `dir`, retrying after a 5-25 ms synchronous
  * backoff until `waitMs` runs out (#3509, #3511). The caller keeps its hold
  * far below `staleMs`, the lease after which another process takes over.
  * `held: false` means the wait ran out or a filesystem error other than
  * contention stopped acquisition (`cause`); `op` did not run.
+ *
+ * #3578: once a wait has run out on a holder, a later call that finds the
+ * same holder still inside tries once and returns without waiting again. A
+ * new holder gets the full wait; a holder past its lease is taken over on
+ * that first try.
  */
 export function withGenerationLockSync<T>(
 	dir: string,
@@ -272,6 +295,7 @@ export function withGenerationLockSync<T>(
 	op: () => T,
 ): { held: true; value: T } | { held: false; cause?: unknown } {
 	const deadline = Date.now() + timing.waitMs;
+	let timedOutHolder = timedOutHolders.get(dir);
 	for (;;) {
 		let hold: GenerationHold | undefined;
 		try {
@@ -287,7 +311,22 @@ export function withGenerationLockSync<T>(
 				releaseGeneration(hold);
 			}
 		}
-		if (Date.now() >= deadline) return { held: false };
+		if (timedOutHolder !== undefined) {
+			if (topGenerationHolder(dir) === timedOutHolder) {
+				recordDegradationOnce({
+					kind: "generation-lock-wait-skipped",
+					subject: path.resolve(dir),
+					reason: `did not wait: ${timedOutHolder} still holds the lock after an earlier wait ran out`,
+				});
+				return { held: false };
+			}
+			timedOutHolder = undefined;
+		}
+		if (Date.now() >= deadline) {
+			const holder = topGenerationHolder(dir);
+			if (holder !== undefined) timedOutHolders.set(dir, holder);
+			return { held: false };
+		}
 		Atomics.wait(
 			new Int32Array(new SharedArrayBuffer(4)),
 			0,
