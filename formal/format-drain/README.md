@@ -39,6 +39,10 @@ writes the next session's state), #3529 (the drain's LSP sync).
     when the phase settles.
   - With `FixQueueHold`, an abandoned child keeps the hold until it has
     written.
+- **`/new`** (or fork, resume, quit) resets the session state and retires the
+  LSP service (`resetLSPService`). The next touch opens a fresh document, so
+  a drain touch after the reset would spawn a server for the next session
+  (review round 1, F1). The model closes the LSP document at `NewSession`.
 - **Another pi-lens process** can format F. Its formatter runs outside this
   process's queue (`ExtWrites`).
 
@@ -54,7 +58,9 @@ bit. So a formatter that writes back stale bytes shows up as a missing edit.
 | `FixGen` | #3528: `captureSessionGeneration` before the claim; the requeue, autofix and format bookkeeping go through `guardedWrite` |
 | `FixStamp` | #3529: the apply loop passes `result.fileReadStamp` to `resyncLspFile`; the post-exit send carries its own read's stamp |
 | `FixOrphanSync` | #3529: once an abandoned phase and its abandoned formatters have settled, a fresh stamped read of F is resynced (`runtime-agent-end.ts` ~614). The read and the send are separate steps, as in the code |
-| `GenDropsAll` | mutant only: the generation guard drops every write |
+| `LspGen` | #3528 r1 F1: the drain's LSP sends (the in-hook format and autofix resyncs and the post-exit resync) run only while its session is current |
+| `StartGen` | #3528 r1 F1: after `/new`, the format worker and the autofix loop start no new file; that write's sync would be skipped |
+| `GenDropsAll` | mutant only: the session guard drops every write and every drain send |
 
 ## Invariants
 
@@ -62,9 +68,9 @@ bit. So a formatter that writes back stale bytes shows up as a missing edit.
 |---|---|
 | `NoLostEdit` | the drain never overwrites an agent edit (pi `docs/extensions.md` ~1925) |
 | `HonestFormatClaim` | what the drain reports as its format (`summary.changed`, the notice, the `fixes` provenance, `recordWritten`) holds no agent edit |
-| `LspMatchesDisk` | once quiet, the LSP document holds the bytes on disk; this is also the stamp filter's no-drop direction |
+| `LspMatchesDisk` | once quiet, an open LSP document holds the bytes on disk; this is also the no-drop direction of the stamp filter and of the session guard on the drain's sends. A retired service has no open document until its session's next touch |
 | `NoBlindAllow` | an edit is admitted only after this session showed the agent F |
-| `NoCrossSessionWrite` | a drain claimed in one session writes none of the next session's state (catalog shape 22) |
+| `NoCrossSessionWrite` | a drain claimed in one session writes none of the next session's state (catalog shape 22), including a send into its fresh LSP service |
 | `NoOwnDrop` | a drain still in its own session keeps every session write (shape 54, the generation guard's no-drop direction) |
 
 ## Results
@@ -82,21 +88,24 @@ change that drops it turns the check red.
 | `OrphanLostEdit` | fixed code (#3527), the bound abandons the child | pass | 459 |
 | `OverlapLsp` | fixed code (#3529) | pass | 342 |
 | `OrphanLsp` | fixed code (#3529) | pass | 459 |
-| `Straddle` | fixed code (#3528), `/new` during the drain | pass | 458 |
-| `StraddleState` | fixed code (#3528), `/new` and an abandoned child | pass | 1,256 |
-| `Fix` | all fix parts; overlap, orphan and `/new` on | pass | 1,809 |
-| `FixWide` | all fix parts, 3 edits, 6 ops, 3 runs | pass | 39,572 |
-| `FixNoQueue` | without `FixQueue` (the drain before #3561) | violated `NoLostEdit` | 598 |
-| `FixNoQueueClaim` | the same, checking the claim | violated `HonestFormatClaim` | 357 |
-| `FixNoHold` | the hold released at the bound | violated `NoLostEdit` | 769 |
-| `FixNoGen` | without `FixGen` (the code before #3528) | violated `NoBlindAllow` | 950 |
-| `FixNoGenState` | the same, checking session state | violated `NoCrossSessionWrite` | 153 |
-| `MutGenDropsAll` | the guard drops every write | violated `NoOwnDrop` | 184 |
-| `FixNoStamp` | without `FixStamp` (the code before #3529) | violated `LspMatchesDisk` | 900 |
-| `FixNoOrphanSync` | without `FixOrphanSync` (the code before #3529) | violated `LspMatchesDisk` | 270 |
-| `MutNoReset` | non-vacuity: `/new` keeps the read guard | violated `NoBlindAllow` | 369 |
-| `FixMtime` | residual #3520: the mtime fallback on | violated `NoBlindAllow` | 420 |
-| `FixExtProcess` | residual: another pi-lens process formats F | violated `NoLostEdit` | 181 |
+| `Straddle` | fixed code (#3528), `/new` during the drain | pass | 519 |
+| `StraddleState` | fixed code (#3528), `/new` and an abandoned child | pass | 1,358 |
+| `Fix` | all fix parts; overlap, orphan and `/new` on | pass | 1,808 |
+| `FixWide` | all fix parts, 3 edits, 6 ops, 3 runs | pass | 35,589 |
+| `FixNoQueue` | without `FixQueue` (the drain before #3561) | violated `NoLostEdit` | 826 |
+| `FixNoQueueClaim` | the same, checking the claim | violated `HonestFormatClaim` | 429 |
+| `FixNoHold` | the hold released at the bound | violated `NoLostEdit` | 869 |
+| `FixNoGen` | without `FixGen` (the code before #3528) | violated `NoBlindAllow` | 882 |
+| `FixNoGenState` | the same, checking session state | violated `NoCrossSessionWrite` | 200 |
+| `FixNoLspGen` | without `LspGen` (the round-0 code of this PR) | violated `NoCrossSessionWrite` | 540 |
+| `FixNoStartGen` | without `StartGen`: the old drain formats a file the new session has open | violated `LspMatchesDisk` | 1,413 |
+| `MutGenDropsAll` | the guard drops every write | violated `NoOwnDrop` | 176 |
+| `MutGenDropsAllLsp` | the guard drops every drain send | violated `LspMatchesDisk` | 501 |
+| `FixNoStamp` | without `FixStamp` (the code before #3529) | violated `LspMatchesDisk` | 1,007 |
+| `FixNoOrphanSync` | without `FixOrphanSync` (the code before #3529) | violated `LspMatchesDisk` | 322 |
+| `MutNoReset` | non-vacuity: `/new` keeps the read guard | violated `NoBlindAllow` | 332 |
+| `FixMtime` | residual #3520: the mtime fallback on | violated `NoBlindAllow` | 431 |
+| `FixExtProcess` | residual: another pi-lens process formats F | violated `NoLostEdit` | 170 |
 
 Distinct states at the violation for the violated configs.
 
@@ -112,4 +121,8 @@ Distinct states at the violation for the violated configs.
 - **#3520** (`FixMtime`): the read guard's mtime fallback admits a
   session-2 edit from the drain's write alone. It needs its own fix.
 - **The actionable-warnings phase** at the end of the drain writes through
-  its own mutation context and is not modelled.
+  its own mutation context and is not modelled; it is among the unguarded
+  drain writers filed as #3576.
+- **A session end without a generation bump** (`session_shutdown`, the idle
+  reset retiring the LSP service): the model's `NewSession` always bumps the
+  generation. The retire-without-bump check is #3576.
