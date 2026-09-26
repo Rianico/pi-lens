@@ -27,7 +27,11 @@ import { setHostFileMutationQueueLoader } from "../../clients/file-mutation-queu
 import { FormatService } from "../../clients/format-service.js";
 import { HOOK_WALL_BUDGET_MS } from "../../clients/hook-budgets.js";
 import * as clientModule from "../../clients/lsp/client.js";
-import { LSPService } from "../../clients/lsp/index.js";
+import {
+	getLSPService,
+	LSPService,
+	resetLSPService,
+} from "../../clients/lsp/index.js";
 import { handleAgentEnd } from "../../clients/runtime-agent-end.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
@@ -122,6 +126,8 @@ const lsp = vi.hoisted(() => ({
 	service: undefined as unknown,
 	drainTouch: Promise.resolve() as Promise<void>,
 	drainTouchesWaiting: 0,
+	/** Serve the drain the real `getLSPService()` singleton instead of the gate. */
+	realService: undefined as undefined | (() => unknown),
 	getServersForFileWithConfig: vi.fn(),
 	createLSPClient: vi.fn(),
 }));
@@ -153,6 +159,7 @@ vi.mock("../../clients/lsp-lazy.js", async (importOriginal) => {
 		loadLspService: async () => ({
 			...(await actual.loadLspService()),
 			getLSPService: () => {
+				if (lsp.realService) return lsp.realService() as LSPService;
 				const service = lsp.service as LSPService;
 				return makeLspServiceDouble({
 					supportsLSP: (fp: string) => service.supportsLSP(fp),
@@ -603,6 +610,7 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		lsp.service = service;
 		lsp.drainTouch = Promise.resolve();
 		lsp.drainTouchesWaiting = 0;
+		lsp.realService = undefined;
 		// The queued edit's own pipeline sync of the unformatted bytes.
 		await service.touchFile(filePath, "const x=1\n", {
 			diagnostics: "none",
@@ -612,6 +620,8 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 	});
 
 	afterEach(() => {
+		if (lsp.realService) resetLSPService({ reason: "session_shutdown" });
+		lsp.realService = undefined;
 		lsp.getServersForFileWithConfig.mockReset();
 		lsp.createLSPClient.mockReset();
 	});
@@ -772,6 +782,119 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		expect(wire.at(-1)).toBe(disk());
 	});
 
+	describe("a drain whose session was replaced touches no language server (#3528 r1 F1)", () => {
+		/**
+		 * `/new` or quit while the drain runs: session_start / session_shutdown
+		 * bump the generation and retire the LSP service, so the next
+		 * `getLSPService()` builds a fresh one and a touch spawns its server.
+		 */
+		function replaceSession(): number {
+			runtime.resetForSession(Date.now());
+			resetLSPService({ reason: "session_shutdown" });
+			return lsp.createLSPClient.mock.calls.length;
+		}
+
+		it("the post-exit resync is skipped and recorded as stale-session", async () => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			lsp.realService = getLSPService;
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.agent_settled + 1);
+			await drain;
+			const spawnsBefore = replaceSession();
+			c.openWrite();
+			await c.wrote;
+			await waitFor(postExitRows, (rows) => rows.length > 0, {
+				yieldControl: tick,
+				timeoutMs: 2_000,
+			});
+			expect(lsp.createLSPClient.mock.calls.length - spawnsBefore).toBe(0);
+			expect(postExitRows()).toEqual([
+				expect.objectContaining({
+					metadata: { outcome: "stale-session" },
+				}),
+			]);
+			expect(staleWriteSubjects()).toContain(`runtime-session:${filePath}`);
+		});
+
+		it("no-drop: in its own session the post-exit resync runs and spawns the server", async () => {
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			lsp.realService = getLSPService;
+			resetLSPService({ reason: "session_shutdown" });
+			const spawnsBefore = lsp.createLSPClient.mock.calls.length;
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.agent_settled + 1);
+			await drain;
+			c.openWrite();
+			await c.wrote;
+			await waitFor(postExitRows, (rows) => rows.length > 0, {
+				yieldControl: tick,
+				timeoutMs: 2_000,
+			});
+			expect(lsp.createLSPClient.mock.calls.length - spawnsBefore).toBe(1);
+			expect(postExitRows()).toEqual([
+				expect.objectContaining({ metadata: { outcome: "synced" } }),
+			]);
+		});
+
+		it("the in-hook format resync is skipped", async () => {
+			lsp.realService = getLSPService;
+			const c = armChild({ write: true });
+			const drain = handleAgentEnd(drainDeps());
+			await c.didRead;
+			const spawnsBefore = replaceSession();
+			c.openWrite();
+			await drain;
+			expect(fs.readFileSync(filePath, "utf8")).toBe("const x = 1\n");
+			expect(lsp.createLSPClient.mock.calls.length - spawnsBefore).toBe(0);
+		});
+
+		it("the in-hook autofix resync is skipped", async () => {
+			lsp.realService = getLSPService;
+			const { fixer, parked, resume } = gatedBiome();
+			writeBiomeAgreement();
+			runtime.deferMutation(
+				filePath,
+				env.tmpDir,
+				"edit",
+				env.tmpDir,
+				"autofix",
+			);
+			flags.add("no-autoformat");
+			const drain = handleAgentEnd(
+				drainDeps({ biomeClient: fixer, ruffClient: noRuff }),
+			);
+			await parked.p;
+			const spawnsBefore = replaceSession();
+			resume.open();
+			await drain;
+			expect(fs.readFileSync(filePath, "utf8")).toBe("let x=1\n");
+			expect(lsp.createLSPClient.mock.calls.length - spawnsBefore).toBe(0);
+		});
+	});
+
+	it("the post-exit row names resyncLspFile's early return, not synced (#3528 r1 F1)", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		flags.add("no-lsp");
+		const c = armChild({ write: true });
+		const drain = handleAgentEnd(drainDeps());
+		await c.didRead;
+		await vi.advanceTimersByTimeAsync(HOOK_WALL_BUDGET_MS.agent_settled + 1);
+		await drain;
+		c.openWrite();
+		await c.wrote;
+		await waitFor(postExitRows, (rows) => rows.length > 0, {
+			yieldControl: tick,
+			timeoutMs: 2_000,
+		});
+		expect(postExitRows()).toEqual([
+			expect.objectContaining({ metadata: { outcome: "no-lsp" } }),
+		]);
+	});
+
 	it("the post-exit resync of a file the child removed records the failure instead of rejecting (#3529)", async () => {
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 		child.removeAfterWrite = true;
@@ -789,7 +912,7 @@ describe("#3529: the drain's LSP sync ends on the bytes on disk", () => {
 		expect(postExitRows()).toEqual([
 			expect.objectContaining({
 				filePath,
-				metadata: expect.objectContaining({ outcome: "failed" }),
+				metadata: expect.objectContaining({ outcome: "read-failed" }),
 			}),
 		]);
 	});
