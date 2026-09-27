@@ -383,13 +383,49 @@ function tryAcquireBoundedLock(
 	return "legacy-held";
 }
 
-// #3594: per generation directory, the holder a wait last ran out on, named
-// by its top generation file and the `<pid> <ms>` it holds — the same shape
-// as `withGenerationLockSync`'s own map (#3578). Only a later holder writes
-// another name, so a match is that same holder, still on top. An unreadable
-// holder is `undefined`, which never matches (a first wait is never
-// skipped).
+// #3594: per generation directory, the holder a wait last ran out on. Only a
+// later holder writes another name, so a match is that same holder, still
+// there. An unreadable holder is `undefined`, which never matches (a first
+// wait is never skipped).
+//
+// Round 2 (review F1): the remembered name is one of two shapes, chosen by
+// {@link currentHolderIdentity} from the CURRENT retry's own outcome, not a
+// fixed choice per lock — `tryAcquireBoundedLock` has two contended outcomes
+// and they name different things:
+//   - "busy": the generation itself is held. Named by its top generation
+//     file, `lock.<n> <pid> <ms>` (`topGenerationHolder`).
+//   - "legacy-held": this call took and released its own fresh generation,
+//     but the pre-#3476 bridge file (`lockPath` itself) is live. Named by
+//     THAT file's own contents (`legacy <token>`).
+// A generation has only a 5s lease (`UNREADABLE_LOCK_STALE_MS`) and no
+// heartbeat, so a holder stuck past 5s is taken over by the next contender's
+// always-run first try — which then finds the SAME live pid still holding
+// the bridge file, and returns "legacy-held". Remembering only the busy
+// shape left that (the normal state of a holder stuck more than 5s) with no
+// memory at all: `topGenerationHolder` named a fresh, released generation on
+// every call, never matching, so every call after the first ~3s paid the
+// full wait again (round 1's miss — probed and reported in review).
 const timedOutHolders = new BoundedFifoMap<string, string | undefined>(16);
+
+/**
+ * The name a remembered holder needs to match, for the outcome `hold` names.
+ * `undefined` (unreadable file, race with a release) never matches — the
+ * caller's `timedOutHolder !== undefined` check on the REMEMBERED value
+ * already guards the first-wait case; this is the same safety for the
+ * CURRENT read.
+ */
+function currentHolderIdentity(
+	dir: string,
+	lockPath: string,
+	hold: "busy" | "legacy-held",
+): string | undefined {
+	if (hold === "busy") return topGenerationHolder(dir);
+	try {
+		return `legacy ${fs.readFileSync(lockPath, "utf8")}`;
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Acquire a bounded synchronous cross-process file lock.
@@ -406,21 +442,20 @@ const timedOutHolders = new BoundedFifoMap<string, string | undefined>(16);
  * lock until that process exits, as before #3476. Removing the bridge
  * (#3489) gives live holders the UNREADABLE_LOCK_STALE_MS lease.
  *
- * #3594: once a wait has run out on the generation-lock's top holder, a
- * later call that finds the same holder still on top tries once (the
- * `tryAcquireBoundedLock` call below always runs at least once) and falls
- * back at once, exactly as a timed-out wait does — throwing, or returning
- * `null` under `onContention: "skip-log"`. A new holder, or one whose
- * generation aged past its lease, gets the full wait again. The check is
- * keyed on the top generation FILE's own identity (`lock.<n> <pid> <ms>`),
- * not on which of `tryAcquireBoundedLock`'s two contended outcomes ("busy":
- * the generation itself is held; "legacy-held": this call took and released
- * its own fresh generation, but the pre-#3476 bridge file is held) produced
- * it: a "legacy-held" retry always creates its own new generation with a
- * fresh timestamp, so it can never coincide with a remembered holder's name,
- * and distinguishing the two outcomes here could not be shown to change any
- * observable behavior (AGENTS.md: a guard that cannot be made to red does
- * not need to exist).
+ * #3594: once a wait has run out on the current holder, a later call that
+ * finds the SAME holder still there tries once (the `tryAcquireBoundedLock`
+ * call below always runs at least once) and falls back at once, exactly as a
+ * timed-out wait does — throwing, or returning `null` under
+ * `onContention: "skip-log"`. A genuinely new holder gets the full wait
+ * again. "The same holder" is named by {@link currentHolderIdentity} from
+ * the CURRENT retry's own outcome (round 2, review F1): a generation has
+ * only a 5s lease and no heartbeat, so a holder stuck past 5s is taken over
+ * by the next contender's own first try, which then finds the pre-#3476
+ * bridge file still held by that same live pid ("legacy-held") — the
+ * NORMAL state of a holder stuck more than a few seconds, not an edge case.
+ * Naming only the generation-file identity left that state unrecognized on
+ * every later call (a released, re-taken-over generation is a fresh name
+ * every time), so the skip stopped firing again after roughly one lease.
  */
 export function acquireBoundedPidFileLock(
 	lockPath: string,
@@ -460,7 +495,7 @@ export function acquireBoundedPidFileLock(
 		}
 		if (
 			timedOutHolder !== undefined &&
-			topGenerationHolder(dir) === timedOutHolder
+			currentHolderIdentity(dir, lockPath, hold) === timedOutHolder
 		) {
 			recordDegradationOnce({
 				kind: "bounded-pid-lock-wait-skipped",
@@ -474,7 +509,7 @@ export function acquireBoundedPidFileLock(
 			throw new Error(options.timeoutMessage);
 		}
 		if (Date.now() >= deadline) {
-			timedOutHolders.set(dir, topGenerationHolder(dir));
+			timedOutHolders.set(dir, currentHolderIdentity(dir, lockPath, hold));
 			if (options.onContention === "skip-log") {
 				options.logContention();
 				return null;
