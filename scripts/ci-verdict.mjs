@@ -168,7 +168,7 @@
  * `restResolveRequiredCheckNames` below.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
 	isAdvisoryCheck,
@@ -1000,25 +1000,52 @@ async function restGet(
 	}
 	const text = await response.text();
 	if (!response.ok) {
-		throw Object.assign(new Error(`GitHub REST API error for ${path}`), {
-			stderr: `HTTP ${response.status}: ${text.slice(0, 300)} (${path})`,
-		});
+		// F2 (review round 2): the status and a body excerpt now live in
+		// `.message` too, not only `.stderr` -- `run()`'s outer catch prints
+		// only `error.message` (never `.stderr`), so a bare "GitHub REST API
+		// error for <path>" with no status was indistinguishable from any
+		// other REST failure. This is what made F1's 401 opaque: the printed
+		// line never said "401". Probed: the token is never in this excerpt
+		// (GitHub's own error bodies never echo the Authorization header).
+		const excerpt = text.slice(0, 300);
+		throw Object.assign(
+			new Error(
+				`GitHub REST API error for ${path}: HTTP ${response.status}: ${excerpt}`,
+			),
+			{ stderr: `HTTP ${response.status}: ${excerpt} (${path})` },
+		);
 	}
 	return text.length > 0 ? JSON.parse(text) : {};
 }
 
 /**
- * GitHub's REST `mergeable_state` enum down to the three-value set
- * `computeVerdict` already understands from `gh pr view --json mergeable`
- * ("MERGEABLE", "CONFLICTING", "UNKNOWN"). Only the "dirty" ->
- * "CONFLICTING" mapping matters to `computeVerdict` (its own doc comment:
+ * GitHub's REST `mergeable`/`mergeable_state` fields down to the
+ * three-value set `computeVerdict` already understands from
+ * `gh pr view --json mergeable` ("MERGEABLE", "CONFLICTING", "UNKNOWN"). Only
+ * the CONFLICTING mapping matters to `computeVerdict` (its own doc comment:
  * everything else defers to the check rows) -- "clean"/"unstable"/"blocked"/
- * "unknown"/"draft"/"has_hooks" all fall through to "UNKNOWN" rather than
- * risk a wrong-direction MERGEABLE guess for a state this script has never
- * needed to distinguish.
+ * "unknown"/"draft"/"has_hooks" (with `mergeable` true or null) all fall
+ * through to "UNKNOWN" rather than risk a wrong-direction MERGEABLE guess
+ * for a state this script has never needed to distinguish.
+ *
+ * F6 (review round 2): `mergeable === false` ALSO maps to CONFLICTING, not
+ * only `mergeable_state === "dirty"`. GitHub's REST docs document
+ * `mergeable_state` as covering more values than the classic `dirty`/`clean`
+ * pair (`"draft"` for an undrafted-but-unmergeable PR, `"blocked"` for one
+ * held by branch protection, neither of which is a genuine merge conflict)
+ * -- `mergeable: false` is the one boolean GitHub gives that means "these
+ * two branches cannot be merged" regardless of which `mergeable_state`
+ * string happens to be attached. Reading only `dirty` risked a stale-green
+ * read on a conflicted PR reported through one of those other states, the
+ * exact #2552 shape this file's `gh`-path CONFLICTING handling already
+ * guards against.
  */
 export function mapRestMergeableState(pullRequest) {
-	if (pullRequest?.mergeable_state === "dirty") return "CONFLICTING";
+	if (
+		pullRequest?.mergeable_state === "dirty" ||
+		pullRequest?.mergeable === false
+	)
+		return "CONFLICTING";
 	if (pullRequest?.mergeable === true) return "MERGEABLE";
 	return "UNKNOWN";
 }
@@ -1117,6 +1144,79 @@ function probeGh() {
 	} catch (error) {
 		return !isGhMissingError(error);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// F1 (review round 2): Node's global `fetch` ignores `HTTPS_PROXY` by
+// default. In the Claude Code cloud container -- the exact environment
+// #3497 is about -- `GH_TOKEN` is a short-lived PLACEHOLDER the egress proxy
+// swaps for the real credential in flight; a `fetch` that bypasses the proxy
+// sends the placeholder straight to GitHub and gets a real, well-formed 401.
+// Live-probed in this session: `GH_TOKEN=<placeholder> node -e 'fetch(...)'`
+// -> 401; the identical call under `NODE_USE_ENV_PROXY=1` -> 200. That flag
+// cannot be set mid-process (probed: assigning `process.env.NODE_USE_ENV_PROXY`
+// after startup has no effect -- Node reads it once at bootstrap), so a
+// confirmed-REST run that finds a proxy configured re-execs itself once with
+// the flag set, via `spawnSync` + `stdio: "inherit"` so the child's real
+// stdout/stderr/exit code pass straight through.
+//
+// The flag itself is NEWER than this repo's own `engines` floor: probed
+// directly against Node v22.19.0 (`package.json`'s `>=22.19.0`) via a
+// throwaway `nvm install 22.19.0` in this session -- `node --use-env-proxy`
+// reports "bad option" and `NODE_USE_ENV_PROXY=1` is silently ignored (still
+// 401) -- while v22.22.2 (this session's own runtime) honors it. The agent
+// proxy's own operator README (`/root/.ccr/README.md`, "Tool ignores the
+// proxy entirely") independently states the same boundary: "Node's built-in
+// fetch (run that command with NODE_USE_ENV_PROXY=1 on Node >= 22.21)". A
+// re-exec below that version would silently no-op back into the exact 401
+// misread it exists to fix, so `nodeSupportsUseEnvProxy` gates it: below the
+// boundary, `main()` fails closed with an explicit, actionable message
+// instead of a re-exec that changes nothing.
+// ---------------------------------------------------------------------------
+
+/**
+ * True when the running Node honors `NODE_USE_ENV_PROXY` for the global
+ * `fetch` (probed boundary: v22.19.0 does not, v22.22.2 does; the agent
+ * proxy's own README independently states ">= 22.21"). Any LATER major is
+ * assumed to carry it forward (Node does not remove flags across majors),
+ * so only `major < 22` or `major === 22 && (minor, patch) < (21, 0)` read
+ * false.
+ */
+export function nodeSupportsUseEnvProxy(versionString = process.version) {
+	const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(versionString ?? ""));
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	if (major > 22) return true;
+	if (major < 22) return false;
+	return minor >= 21;
+}
+
+export const REEXEC_RUN = "run";
+export const REEXEC_REEXEC = "reexec";
+export const REEXEC_VERSION_TOO_OLD = "version-too-old";
+
+/**
+ * Pure decision for `main()` (#3497 F1): re-exec with `NODE_USE_ENV_PROXY=1`
+ * only when this run will actually use the REST transport (a `gh`-transport
+ * run never needs the proxy fix and must not pay a re-exec), a proxy is
+ * actually configured, the flag is not already set (no re-exec loop), and
+ * this Node version honors the flag once set. `envProxyFlagAlreadySet` is
+ * checked before `nodeSupportsUseEnvProxy` so a caller who sets the flag
+ * explicitly (or a future Node that flips a still-experimental default)
+ * never gets redirected to the version-too-old branch by mistake.
+ */
+export function resolveReexecPlan({
+	usesRestTransport,
+	proxyUrl,
+	envProxyFlagAlreadySet,
+	nodeVersion = process.version,
+}) {
+	if (!usesRestTransport || !proxyUrl || envProxyFlagAlreadySet)
+		return REEXEC_RUN;
+	return nodeSupportsUseEnvProxy(nodeVersion)
+		? REEXEC_REEXEC
+		: REEXEC_VERSION_TOO_OLD;
 }
 
 export function parseArgs(argv) {
@@ -1297,6 +1397,37 @@ export async function run({
 }
 
 async function main() {
+	// F1: decided with the SAME `resolveTransport` call `run()` itself will
+	// make (`usesDefaultGhExec: true`, since `main()` never overrides
+	// `ghExec`) -- so this prediction never diverges from what `run()`
+	// actually does two lines later.
+	const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || null;
+	const plan = resolveReexecPlan({
+		usesRestTransport:
+			resolveTransport(true, resolveGithubToken()) === TRANSPORT_REST,
+		proxyUrl,
+		envProxyFlagAlreadySet: process.env.NODE_USE_ENV_PROXY === "1",
+	});
+	if (plan === REEXEC_VERSION_TOO_OLD) {
+		console.error(
+			`ci-verdict: HTTPS_PROXY is set (${proxyUrl}) but this Node (${process.version}) does not honor NODE_USE_ENV_PROXY (requires >=22.21.0) -- the REST transport cannot reach GitHub through the proxy. Upgrade Node, or run where \`gh\` is on PATH.`,
+		);
+		process.exitCode = EXIT_TRANSPORT;
+		return;
+	}
+	if (plan === REEXEC_REEXEC) {
+		const result = spawnSync(
+			process.execPath,
+			[
+				"--no-warnings",
+				fileURLToPath(import.meta.url),
+				...process.argv.slice(2),
+			],
+			{ stdio: "inherit", env: { ...process.env, NODE_USE_ENV_PROXY: "1" } },
+		);
+		process.exitCode = result.status ?? EXIT_TRANSPORT;
+		return;
+	}
 	process.exitCode = await run();
 }
 

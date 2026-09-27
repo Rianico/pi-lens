@@ -226,6 +226,21 @@ export declare function resolveTransport(
 	probe?: () => boolean,
 ): string;
 
+export declare function nodeSupportsUseEnvProxy(
+	versionString?: string | null,
+): boolean;
+
+export declare const REEXEC_RUN: string;
+export declare const REEXEC_REEXEC: string;
+export declare const REEXEC_VERSION_TOO_OLD: string;
+
+export declare function resolveReexecPlan(options: {
+	usesRestTransport: boolean;
+	proxyUrl: string | null;
+	envProxyFlagAlreadySet: boolean;
+	nodeVersion?: string;
+}): string;
+
 export declare function parseArgs(argv: string[]): {
 	target: string | null;
 	waitSeconds: number | null;

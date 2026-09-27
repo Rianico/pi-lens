@@ -12,9 +12,14 @@ import {
 	isGhMissingError,
 	mapRestMergeableState,
 	MIN_GH_TIMEOUT_MS,
+	nodeSupportsUseEnvProxy,
 	parseOwnerRepoFromGitRemote,
+	REEXEC_REEXEC,
+	REEXEC_RUN,
+	REEXEC_VERSION_TOO_OLD,
 	resolveGithubApiBase,
 	resolveGithubToken,
+	resolveReexecPlan,
 	resolveRepositoryViaGit,
 	resolveRequiredCheckNames,
 	resolveTransport,
@@ -186,6 +191,20 @@ describe("mapRestMergeableState (#3497)", () => {
 			expect(
 				mapRestMergeableState({ mergeable: null, mergeable_state: state }),
 			).toBe("UNKNOWN");
+		},
+	);
+
+	// F6 (review round 2): mergeable=false is a genuine merge conflict no
+	// matter which mergeable_state string is attached to it -- a conflicted
+	// PR reported through a state other than "dirty" (e.g. "draft" for an
+	// undrafted-but-unmergeable PR, "blocked" for one branch-protection
+	// holds) must not fall through to UNKNOWN and read as fine.
+	it.each(["draft", "blocked", "unstable", "unknown", undefined])(
+		"maps mergeable=false to CONFLICTING even when mergeable_state=%s (not dirty)",
+		(state) => {
+			expect(
+				mapRestMergeableState({ mergeable: false, mergeable_state: state }),
+			).toBe("CONFLICTING");
 		},
 	);
 
@@ -435,6 +454,92 @@ describe("resolveTransport (#3497)", () => {
 	// by the PR body's mutation transcript, not restated here.
 });
 
+// F1 (review round 2): Node's global fetch ignores HTTPS_PROXY, and the
+// agent proxy in THIS container swaps a placeholder GH_TOKEN for the real
+// credential only when the proxy is actually used -- a direct fetch sends
+// the placeholder and GitHub returns a real, well-formed 401. Verified
+// live, in this session, against the real GitHub API through the real
+// proxy (transcripts in the PR body):
+//   GH_TOKEN=<placeholder> node -e 'fetch(".../user", {Bearer GH_TOKEN})' -> 401
+//   NODE_USE_ENV_PROXY=1 node -e '...same...'                             -> 200
+// and the version boundary, via a throwaway `nvm install 22.19.0` (this
+// repo's own `engines` floor) in this same session:
+//   node --use-env-proxy                        -> "bad option" (flag does not exist)
+//   NODE_USE_ENV_PROXY=1 node -e '...same...'    -> still 401 (flag silently ignored)
+// matching the agent proxy's own README ("NODE_USE_ENV_PROXY=1 on Node >= 22.21").
+describe("nodeSupportsUseEnvProxy (#3497 F1)", () => {
+	it.each(["v22.21.0", "v22.21.5", "v22.22.2", "v23.0.0", "v24.0.0"])(
+		"%s is supported",
+		(version) => {
+			expect(nodeSupportsUseEnvProxy(version)).toBe(true);
+		},
+	);
+
+	it.each(["v22.19.0", "v22.20.9", "v21.99.0", "v20.0.0", "v0.1.2"])(
+		"%s (below the probed boundary) is not supported",
+		(version) => {
+			expect(nodeSupportsUseEnvProxy(version)).toBe(false);
+		},
+	);
+
+	it("an unparseable version string is not supported", () => {
+		expect(nodeSupportsUseEnvProxy("not-a-version")).toBe(false);
+		expect(nodeSupportsUseEnvProxy(null)).toBe(false);
+		expect(nodeSupportsUseEnvProxy("")).toBe(false);
+	});
+
+	it("defaults to process.version (this session's own runtime) when called with no argument", () => {
+		expect(nodeSupportsUseEnvProxy()).toBe(
+			nodeSupportsUseEnvProxy(process.version),
+		);
+	});
+});
+
+describe("resolveReexecPlan (#3497 F1)", () => {
+	const base = {
+		usesRestTransport: true,
+		proxyUrl: "http://127.0.0.1:46561",
+		envProxyFlagAlreadySet: false,
+		nodeVersion: "v22.22.2",
+	};
+
+	it("re-execs only when REST is used, a proxy is set, the flag isn't set yet, and this Node supports it", () => {
+		expect(resolveReexecPlan(base)).toBe(REEXEC_REEXEC);
+	});
+
+	it("runs directly when the transport is gh, even with a proxy configured", () => {
+		expect(resolveReexecPlan({ ...base, usesRestTransport: false })).toBe(
+			REEXEC_RUN,
+		);
+	});
+
+	it("runs directly when no proxy is configured", () => {
+		expect(resolveReexecPlan({ ...base, proxyUrl: null })).toBe(REEXEC_RUN);
+	});
+
+	it("runs directly (no re-exec loop) once the flag is already set", () => {
+		expect(resolveReexecPlan({ ...base, envProxyFlagAlreadySet: true })).toBe(
+			REEXEC_RUN,
+		);
+	});
+
+	it("reports version-too-old instead of re-execing into a no-op below the boundary", () => {
+		expect(resolveReexecPlan({ ...base, nodeVersion: "v22.19.0" })).toBe(
+			REEXEC_VERSION_TOO_OLD,
+		);
+	});
+
+	// Mutation table, one row per condition in the guard:
+	// - usesRestTransport flipped false -> RUN (proven above).
+	// - proxyUrl flipped null -> RUN (proven above).
+	// - envProxyFlagAlreadySet flipped true -> RUN (proven above, and takes
+	//   priority over the version check so an already-set flag never routes
+	//   to version-too-old by mistake).
+	// - nodeVersion below the boundary -> VERSION_TOO_OLD, not REEXEC
+	//   (proven above) -- the one direction a naive "just re-exec" fix
+	//   would get wrong, silently reproducing F1 on an older Node.
+});
+
 describe("run() — REST transport end to end (#3497)", () => {
 	// PATH is genuinely emptied for the probe's real `gh(["--version"])`
 	// call, so this reproduces "gh not on PATH" deterministically regardless
@@ -528,6 +633,129 @@ describe("run() — REST transport end to end (#3497)", () => {
 			else process.env.GITHUB_TOKEN = originalGithubToken;
 		}
 		expect(exitCode).toBe(EXIT_TRANSPORT);
+	});
+
+	function fakeClock(start = 0) {
+		let now = start;
+		const sleeps: number[] = [];
+		return {
+			now: () => now,
+			sleepImpl: async (ms: number) => {
+				sleeps.push(ms);
+				now += ms;
+			},
+			sleeps,
+		};
+	}
+
+	// F3 (review round 2): restGet's failure contract had NO test coverage --
+	// five mutations (the !response.ok check, the ETIMEDOUT mapping, the
+	// Authorization header, the connect-error stderr text, and the
+	// `HTTP ${status}` text --wait's retry depends on) all stayed green. The
+	// R1 direction matters most: with `!response.ok` neutered, a 401 or 403
+	// falls through to a normal (if malformed) payload parse instead of
+	// throwing, and `run()` would misread it the same way #3491's
+	// `check_suite.completed` wake was misread -- silent PENDING, not a
+	// loud transport failure.
+	it("R1: a 401 on the PR lookup exits 70 with the status in stderr, never a silent pending read", async () => {
+		const gitExec = () => "https://github.com/acme/repo.git\n";
+		const fetchImpl = async () =>
+			new Response(JSON.stringify({ message: "Bad credentials" }), {
+				status: 401,
+			});
+		const stderrLines: string[] = [];
+		let exitCode: number | undefined;
+		await withEmptyPathAndToken(async () => {
+			exitCode = await run({
+				argv: ["2539"],
+				gitExec,
+				fetchImpl,
+				stdout: () => {},
+				stderr: (line: string) => stderrLines.push(line),
+			});
+		});
+		expect(exitCode).toBe(EXIT_TRANSPORT);
+		expect(exitCode).not.toBe(EXIT_PENDING);
+		expect(stderrLines.join("\n")).toContain("401");
+	});
+
+	it("R6: a 502 on the check-runs read retries under --wait (the transient-retry line prints), then exits 70 once the budget is exhausted", async () => {
+		const clock = fakeClock();
+		const stderrLines: string[] = [];
+		const gitExec = () => "https://github.com/acme/repo.git\n";
+		const fetchImpl = async (url: string) => {
+			if (url.includes("/pulls/2539")) {
+				return new Response(
+					JSON.stringify({
+						head: { sha: "c0ffee" },
+						mergeable: true,
+						mergeable_state: "clean",
+					}),
+				);
+			}
+			if (url.includes("/branches/master/protection")) {
+				return new Response("", { status: 403 });
+			}
+			return new Response("Bad Gateway", { status: 502 });
+		};
+		let exitCode: number | undefined;
+		await withEmptyPathAndToken(async () => {
+			exitCode = await run({
+				argv: ["2539", "--wait", "65"],
+				gitExec,
+				fetchImpl,
+				stdout: () => {},
+				stderr: (line: string) => stderrLines.push(line),
+				now: clock.now,
+				sleepImpl: clock.sleepImpl,
+			});
+		});
+		expect(exitCode).toBe(EXIT_TRANSPORT);
+		expect(stderrLines.some((line) => /transient/i.test(line))).toBe(true);
+		expect(stderrLines.some((line) => /HTTP 502/.test(line))).toBe(true);
+		expect(clock.sleeps.length).toBeGreaterThan(0);
+	});
+
+	it("R3: an AbortError from fetchImpl maps to ETIMEDOUT, matching gh's own hung-process code", async () => {
+		const fetchImpl = async () => {
+			const error = new Error("The operation was aborted");
+			error.name = "AbortError";
+			throw error;
+		};
+		await expect(
+			restFetchCheckRunsPayload("acme/repo", "sha", {
+				token: "tok",
+				fetchImpl,
+			}),
+		).rejects.toMatchObject({ code: "ETIMEDOUT" });
+	});
+
+	it("R3: a TimeoutError (AbortSignal.timeout's own name) also maps to ETIMEDOUT", async () => {
+		const fetchImpl = async () => {
+			const error = new Error("The operation timed out");
+			error.name = "TimeoutError";
+			throw error;
+		};
+		await expect(
+			restFetchCheckRunsPayload("acme/repo", "sha", {
+				token: "tok",
+				fetchImpl,
+			}),
+		).rejects.toMatchObject({ code: "ETIMEDOUT" });
+	});
+
+	it("R4: every restGet call carries the Bearer token, never a bare or missing Authorization header", async () => {
+		const seenAuthHeaders: Array<string | undefined> = [];
+		const fetchImpl = async (_url: string, init?: RequestInit) => {
+			const headers = init?.headers as Record<string, string>;
+			seenAuthHeaders.push(headers.Authorization);
+			return new Response(JSON.stringify({ total_count: 0, check_runs: [] }));
+		};
+		await restFetchCheckRunsPayload("acme/repo", "sha", {
+			token: "sekrit-token",
+			fetchImpl,
+		});
+		expect(seenAuthHeaders).toEqual(["Bearer sekrit-token"]);
 	});
 });
 
