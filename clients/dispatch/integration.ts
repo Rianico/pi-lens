@@ -119,6 +119,7 @@ import {
 	type WordIndex,
 } from "../word-index.js";
 import { reconcileCascadeNeighborLspErrors } from "../widget-state.js";
+import { writeOrderToken } from "../write-ordering-guard.js";
 import { findAuxiliaryProfileForSource } from "./auxiliary-lsp.js";
 // Register fact providers. All register eagerly here (the dispatch entry) — the
 // tree-sitter-backed providers included, since the parsing stack loads
@@ -997,6 +998,8 @@ export async function computeCascadeForFile(
 		dbg?: (msg: string) => void;
 		/** Turn/write sequence from RuntimeCoordinator — scopes cascade caches (A5/B10) */
 		turnSeq?: number;
+		/** #3540 r2: the primary edit's order turn, for its widget writes. */
+		orderTurn?: number;
 		writeSeq?: number;
 		/**
 		 * Authoritative workspace root (`PipelineContext.projectRoot`). `cwd` above
@@ -1063,6 +1066,7 @@ export async function computeCascadeForFile(
 			hasBlockers = false,
 			dbg,
 			turnSeq = 0,
+			orderTurn,
 			writeSeq,
 			projectRoot,
 			seqState,
@@ -1072,6 +1076,8 @@ export async function computeCascadeForFile(
 			onWordIndexUpdated,
 			sessionGeneration,
 		} = options;
+		// #3540: the primary edit's widget order, turn first.
+		const widgetOrder = writeOrderToken(orderTurn, writeSeq);
 
 		ensureCascadeTurnScope(turnSeq);
 
@@ -1899,7 +1905,7 @@ export async function computeCascadeForFile(
 				reconcileCascadeNeighborLspErrors(
 					neighborPath,
 					cascadeReconcilableLspErrors(entry.diags, neighborPath),
-					writeSeq,
+					widgetOrder,
 					entry.ts,
 				);
 
@@ -1981,6 +1987,10 @@ export async function computeCascadeForFile(
 					// #3481: stamped before the read; the touches below run after awaits,
 					// and the stamp keeps them from landing over a newer write's touch.
 					const readStamp = performance.now();
+					// #3573: the wall-clock twin, the confirmed touch's widget row's
+					// `observedAt`: a dependency written while the touch waits on the
+					// server is then newer than the row.
+					const readAtMs = Date.now();
 					const content = await nodeFs.promises.readFile(neighborPath, "utf8");
 
 					// #458/#1444: tier-aware cascade-lane wait. A Tier-3 silent server
@@ -2239,7 +2249,7 @@ export async function computeCascadeForFile(
 					// see `cascadeReconcilableLspErrors`) so a live biome/ruff/aux finding or
 					// LSP warning survives this errors-only re-check. Keyed by the primary
 					// edit's `writeSeq` so a genuinely newer per-edit write still wins the
-					// WriteOrderingGuard. `observedAt` stays now (a fresh touch). The
+					// WriteOrderingGuard. `observedAt` is the neighbor's read (#3573). The
 					// inconclusive touch, the BOUND-FALSE touch (#1095 — computed against a
 					// diverged disk state), the tier-3-silent skip, the recently-clean
 					// short-circuit, the within-turn cache hit, and the rejected-touch
@@ -2249,7 +2259,8 @@ export async function computeCascadeForFile(
 						reconcileCascadeNeighborLspErrors(
 							neighborPath,
 							cascadeReconcilableLspErrors(rawDiags.diags, neighborPath),
-							writeSeq,
+							widgetOrder,
+							readAtMs,
 						);
 					}
 
@@ -2844,6 +2855,8 @@ export async function dispatchLintWithResult(
 		projectRoot?: string;
 		/** Ordered per-file pipeline token, when called from tool_result. */
 		writeIndex?: number;
+		/** #3568: the tool_result handler's session. */
+		sessionGeneration?: GenerationHandle;
 		/** Runtime telemetry identity, when known (#1448) — see
 		 * DispatchContext.telemetryModel's doc. */
 		telemetryModel?: string;
@@ -2864,6 +2877,7 @@ export async function dispatchLintWithResult(
 		options?.writeIndex,
 		options?.telemetryModel,
 		options?.telemetryProvider,
+		options?.sessionGeneration,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
 	// #2243 item 2: release the pin when the dispatch settles.

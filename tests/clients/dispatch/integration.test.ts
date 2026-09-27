@@ -297,6 +297,28 @@ describe("Dispatch Integration", () => {
 			expect(ctx?.telemetryModel).toBe("claude-sonnet-4-5");
 			expect(ctx?.telemetryProvider).toBe("anthropic");
 		});
+
+		it("passes the tool_result's session through to the dispatch context (#3568)", async () => {
+			// A collect-later runner defers its result through this handle
+			// (runner-collect-later.test.ts pins the drop); a severed hop here
+			// leaves that guard inert in production.
+			const sessionGeneration = {
+				generation: 3,
+				isCurrent: () => true,
+				guardedWrite: <T>(_subject: string, write: () => T) => write(),
+			};
+			await dispatchLintWithResult(
+				"app.ts",
+				"/project",
+				{ getFlag: () => false },
+				undefined,
+				undefined,
+				{ sessionGeneration },
+			);
+
+			const ctx = vi.mocked(dispatchForFile).mock.calls.at(-1)?.[0];
+			expect(ctx?.sessionGeneration).toBe(sessionGeneration);
+		});
 	});
 
 	describe("shouldDispatch", () => {

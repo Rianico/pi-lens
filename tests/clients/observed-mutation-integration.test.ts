@@ -588,8 +588,9 @@ describe("#2430 item 3 — the settled sweep is wired ahead of the deferred drai
 			"await runObservedSettledSweepSafely(ctx)",
 		);
 		const drainAt = indexSource.indexOf("await runDeferredMutationDrain(ctx)");
+		// #3576: the refresh runs through the settle's session guard.
 		const refreshAt = indexSource.indexOf(
-			"await refreshObservedLedgerSafely(ctx)",
+			"() => refreshObservedLedgerSafely(ctx)",
 		);
 		expect(sweepAt).toBeGreaterThan(-1);
 		expect(drainAt).toBeGreaterThan(sweepAt);
@@ -1313,6 +1314,138 @@ describe("#2464 review round 3 — F2: the observed dispatch targets a RECORDED 
 				"1 path(s) not dispatched",
 			);
 		} finally {
+			_setObservedTimeBoundsForTests({});
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#3568: the observed path's dispatches share the handler's session", () => {
+	it("a later observed path dispatched after session_start carries the session its handler entered in", async () => {
+		// index.ts abandons a handler at its bound without cancelling it. The
+		// observed loop awaits each path's dispatch before the next, so a
+		// replacement during path 1 used to hand path 2 session 2's generation,
+		// and its cascade touch and admission then landed in session 2.
+		const env = setupTestEnvironment("pi-lens-3568-observed-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		_setObservedTimeBoundsForTests({ captureMs: 30_000, settleMs: 30_000 });
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const gated = gatePipeline(vi.mocked(runPipeline) as never);
+		try {
+			const targetDir = path.join(env.tmpDir, "codemod-target");
+			fs.mkdirSync(targetDir, { recursive: true });
+			const files = ["a.ts", "b.ts"].map((name) => {
+				const filePath = path.join(targetDir, name);
+				fs.writeFileSync(filePath, SOURCE);
+				return filePath;
+			});
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const entered = runtime.sessionGeneration;
+			const event = {
+				toolName: "dir_codemod_3568",
+				toolCallId: "call-3568-observed",
+				input: { path: targetDir, rule: "rename" },
+				content: [{ type: "text", text: "rewrote 2 files" }],
+			};
+			await handleToolCall(
+				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+			);
+			for (const filePath of files)
+				fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			const handler = handleToolResult(
+				toolResultDeps({ event, runtime, cacheManager }),
+			);
+			for (let i = 0; i < 200 && gated.contexts.length < 1; i++)
+				await flushAsyncWork(1);
+			expect(gated.contexts).toHaveLength(1);
+			// `/new` while path 1 is analysed.
+			runtime.resetForSession();
+			gated.release(0, 1);
+			for (let i = 0; i < 200 && gated.contexts.length < 2; i++)
+				await flushAsyncWork(1);
+			gated.release(1, 2);
+			await handler;
+			const sessions = gated.contexts.map((ctx) => {
+				const handle = ctx.sessionGeneration as {
+					generation: number;
+					isCurrent(): boolean;
+				};
+				return { generation: handle.generation, current: handle.isCurrent() };
+			});
+			expect(sessions).toEqual([
+				{ generation: entered, current: false },
+				{ generation: entered, current: false },
+			]);
+		} finally {
+			ungatePipeline(vi.mocked(runPipeline) as never);
+			_setObservedTimeBoundsForTests({});
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("after /reload, each observed path's dispatch carries the order turn, not the session's restarted turn (#3540 r2)", async () => {
+		// The widget's write guard outlives `/reload`; a per-path token drawn
+		// from the session's turn would rank below session 1's.
+		const env = setupTestEnvironment("pi-lens-3540-observed-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		_setObservedTimeBoundsForTests({ captureMs: 30_000, settleMs: 30_000 });
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const gated = gatePipeline(vi.mocked(runPipeline) as never);
+		try {
+			const targetDir = path.join(env.tmpDir, "codemod-target");
+			fs.mkdirSync(targetDir, { recursive: true });
+			const files = ["a.ts", "b.ts"].map((name) => {
+				const filePath = path.join(targetDir, name);
+				fs.writeFileSync(filePath, SOURCE);
+				return filePath;
+			});
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			for (let turn = 0; turn < 3; turn += 1) runtime.beginTurn();
+			runtime.resetForSession();
+			runtime.beginTurn();
+			const event = {
+				toolName: "dir_codemod_3540",
+				toolCallId: "call-3540-observed",
+				input: { path: targetDir, rule: "rename" },
+				content: [{ type: "text", text: "rewrote 2 files" }],
+			};
+			await handleToolCall(
+				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+			);
+			for (const filePath of files)
+				fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			const handler = handleToolResult(
+				toolResultDeps({ event, runtime, cacheManager }),
+			);
+			for (let i = 0; i < 200 && gated.contexts.length < 1; i++)
+				await flushAsyncWork(1);
+			gated.release(0, 1);
+			for (let i = 0; i < 200 && gated.contexts.length < 2; i++)
+				await flushAsyncWork(1);
+			gated.release(1, 2);
+			await handler;
+			expect(runtime.turnIndex).toBe(1);
+			expect(
+				gated.contexts.map((ctx) => {
+					const telemetry = ctx.telemetry as {
+						turnIndex: number;
+						orderTurn: number;
+					};
+					return [telemetry.turnIndex, telemetry.orderTurn];
+				}),
+			).toEqual([
+				[1, runtime.writeOrderTurn],
+				[1, runtime.writeOrderTurn],
+			]);
+			expect(runtime.writeOrderTurn).toBe(5);
+		} finally {
+			ungatePipeline(vi.mocked(runPipeline) as never);
 			_setObservedTimeBoundsForTests({});
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;

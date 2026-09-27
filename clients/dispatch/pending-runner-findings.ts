@@ -2,6 +2,7 @@
 
 import type { RunnerResult } from "./types.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
+import type { GenerationHandle } from "../generation-guard.js";
 
 export interface PendingRunnerFindings {
 	filePath: string;
@@ -25,9 +26,24 @@ const MAX_PENDING_RUNNER_FINDINGS = 50;
 export function deferRunnerFindings(
 	entry: Omit<PendingRunnerFindings, "result"> & {
 		promise: Promise<RunnerResult>;
+		/**
+		 * #3568: the dispatch's session. session_start clears this store in the
+		 * same tick it bumps the generation, so an entry deferred after that is
+		 * one the next session's turn end must not drain.
+		 */
+		session?: GenerationHandle;
 	},
 ): void {
-	const tracked: PendingRunnerPromise = { ...entry, settled: false };
+	const { session, ...owned } = entry;
+	if (
+		session !== undefined &&
+		session.guardedWrite(`${entry.runnerId}:${entry.filePath}`, () => true) ===
+			undefined
+	) {
+		void entry.promise.catch(() => undefined);
+		return;
+	}
+	const tracked: PendingRunnerPromise = { ...owned, settled: false };
 	// Attach exactly once at ownership time. Re-attaching at every turn end
 	// accumulates handlers on a promise that may never settle (#2122 F8).
 	void tracked.promise.then(

@@ -430,6 +430,55 @@ describe("Pipeline", () => {
 			tmpDir,
 			expect.objectContaining({ sessionGeneration }),
 		);
+		// #3568: and the dispatch, whose collect-later runner defers its result
+		// to a turn end through the same handle
+		// (tests/clients/dispatch/runner-collect-later.test.ts pins the drop).
+		expect(dispatchLintWithResult).toHaveBeenCalledWith(
+			filePath,
+			tmpDir,
+			expect.anything(),
+			undefined,
+			expect.anything(),
+			expect.objectContaining({ sessionGeneration }),
+		);
+	});
+
+	it("hands the cascade the dispatch's order turn beside its session turn (#3540 r2)", async () => {
+		// The cascade's widget reconcile orders by the order turn, which a
+		// session reset never restarts; `turnSeq` (the session's turn) keeps
+		// scoping its caches. If this hop drops `orderTurn`, the reconcile is
+		// unordered in production.
+		const filePath = createTempFile(tmpDir, "cascade-order-turn.ts", "x");
+		vi.mocked(dispatchLintWithResult).mockResolvedValue({
+			diagnostics: [],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		});
+
+		await runPipeline(
+			createMockContext(filePath, {
+				telemetry: {
+					model: "m",
+					sessionId: "s",
+					turnIndex: 1,
+					orderTurn: 6,
+					writeIndex: 2,
+				},
+			}),
+			createMockDeps(),
+		);
+
+		expect(computeCascadeForFile).toHaveBeenCalledWith(
+			filePath,
+			tmpDir,
+			expect.objectContaining({ turnSeq: 1, orderTurn: 6, writeSeq: 2 }),
+		);
 	});
 
 	describe("Format phase", () => {

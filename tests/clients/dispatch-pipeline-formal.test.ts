@@ -29,7 +29,10 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import {
 	clearWidgetState,
+	exportWidgetState,
 	getFileDiagnostics,
+	reconcileScanDiagnostics,
+	recordRunner,
 } from "../../clients/widget-state.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -126,6 +129,21 @@ vi.mock("../../clients/formatters-lazy.js", async (importOriginal) => {
 });
 
 import { dispatchLintWithResult } from "../../clients/dispatch/integration.js";
+import {
+	COLLECT_LATER_THRESHOLD_MS,
+	observeRunnerLatency,
+	resetObservedRunnerLatency,
+} from "../../clients/dispatch/collect-later-tier.js";
+import {
+	createDispatchContext,
+	dispatchForFile,
+	RunnerRegistry,
+} from "../../clients/dispatch/dispatcher.js";
+import { FactStore } from "../../clients/dispatch/fact-store.js";
+import {
+	drainPendingRunnerFindings,
+	resetPendingRunnerFindings,
+} from "../../clients/dispatch/pending-runner-findings.js";
 import { getLSPService } from "../../clients/lsp/index.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
@@ -458,6 +476,292 @@ describe("formal/dispatch-pipeline replays", () => {
 		}
 	});
 
+	// #3540: `writeIndex` restarts at every beginTurn, so the widget's guard
+	// must order a turn-2 write after every turn-1 write of the same file.
+	it("widget order (#3540): a file's first edit in turn 2 replaces its turn-1 widget verdict", async () => {
+		const env = setupTestEnvironment("tla-widget-turns-");
+		try {
+			const filePath = path.join(env.tmpDir, "a.ts");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			vi.mocked(dispatchLintWithResult).mockImplementation(
+				async (fp, _cwd, _pi, _ranges, _log, options) => {
+					const rev = revisionOf(fp as string);
+					// The real dispatcher records each runner under the token the
+					// pipeline hands it (`createDispatchContext` -> `recordRunner`).
+					recordRunner(
+						fp as string,
+						"tsc",
+						`ran-${rev}`,
+						0,
+						0,
+						options?.writeIndex,
+					);
+					return (
+						rev === "v3" ? blocking(fp as string, "v3") : clean(rev)
+					) as never;
+				},
+			);
+			const runnerStatus = () =>
+				exportWidgetState()
+					.files.find((f) => f.filePath === filePath)
+					?.runners.find(([id]) => id === "tsc")?.[1].status;
+			for (const rev of ["v1", "v2", "v3"]) {
+				fs.writeFileSync(filePath, `export const x = '${rev}';\n`);
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, rev),
+				} as never);
+			}
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual(["BLOCKER-FROM-v3"]);
+			expect(runnerStatus()).toBe("ran-v3");
+			runtime.beginTurn();
+			fs.writeFileSync(filePath, "export const x = 'v4';\n");
+			await handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, "v4"),
+			} as never);
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+			expect(runnerStatus()).toBe("ran-v4");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("widget order (#3540): an older same-turn pipeline that settles last still does not replace the newer edit's widget verdict", async () => {
+		const run = await olderSettlesLast({ v1: "blocker", v2: "clean" });
+		try {
+			expect(
+				(getFileDiagnostics(run.filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+		} finally {
+			run.cleanup();
+		}
+	});
+
+	it("widget order (#3540): a turn-1 pipeline that settles after a turn-2 pipeline of the same file started does not write the widget", async () => {
+		const env = setupTestEnvironment("tla-widget-turn-late-");
+		try {
+			const filePath = path.join(env.tmpDir, "a.ts");
+			const other = path.join(env.tmpDir, "b.ts");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			const entered = { v1: gate(), v2: gate() };
+			const release = { v1: gate(), v2: gate() };
+			vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+				const rev = revisionOf(fp as string);
+				if (rev === "v1" || rev === "v2") {
+					entered[rev].open();
+					await release[rev].p;
+				}
+				return (
+					rev === "v1" ? blocking(fp as string, rev) : clean(rev)
+				) as never;
+			});
+			// Two writes of another file first: a.ts's turn-1 token is w=3.
+			for (const id of ["o1", "o2"]) {
+				fs.writeFileSync(other, `export const o = '${id}';\n`);
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", other, id),
+				} as never);
+			}
+			fs.writeFileSync(filePath, "export const x = 'v1';\n");
+			const late = handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, "c1"),
+			} as never);
+			await entered.v1.p;
+			runtime.beginTurn();
+			// a.ts's first edit in turn 2 (w=1) has started its analysis.
+			fs.writeFileSync(filePath, "export const x = 'v2';\n");
+			const newer = handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, "c2"),
+			} as never);
+			await entered.v2.p;
+			release.v1.open();
+			await late;
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+			release.v2.open();
+			await newer;
+			expect(
+				(getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+			).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #3540 r2 (F1): the widget's write guards outlive `resetForSession` — a
+	// `/reload` keeps the widget, and a stale session-1 write can land after
+	// `/new` cleared it. The token's turn half is an order turn that a session
+	// reset never restarts, so session 1's turn 5 never outranks session 2.
+	describe("widget order across a session reset (#3540 r2)", () => {
+		const widget = (filePath: string) =>
+			(getFileDiagnostics(filePath) ?? []).map((d) => d.message);
+
+		function scriptVerdicts(verdicts: Record<string, "clean" | "blocker">) {
+			vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+				const rev = revisionOf(fp as string);
+				return (
+					verdicts[rev] === "blocker" ? blocking(fp as string, rev) : clean(rev)
+				) as never;
+			});
+		}
+
+		async function edit(
+			runtime: RuntimeCoordinator,
+			filePath: string,
+			bytes: string,
+		) {
+			fs.writeFileSync(filePath, bytes);
+			return handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, bytes),
+			} as never);
+		}
+
+		/**
+		 * Session 1 runs five turns; in turn 5 another file's two edits come
+		 * first, so a.ts's dispatch draws write index 3.
+		 */
+		async function fiveTurns(runtime: RuntimeCoordinator, dir: string) {
+			for (let turn = 0; turn < 5; turn += 1) runtime.beginTurn();
+			const other = path.join(dir, "b.ts");
+			await edit(runtime, other, "export const o = 'o1';\n");
+			await edit(runtime, other, "export const o = 'o2';\n");
+		}
+
+		it("A: after /reload, session 2's first clean edit replaces session 1's turn-5 widget blocker", async () => {
+			const env = setupTestEnvironment("tla-widget-reload-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				scriptVerdicts({ v1: "blocker", v2: "clean" });
+				await fiveTurns(runtime, env.tmpDir);
+				await edit(runtime, filePath, "export const x = 'v1';\n");
+				expect(widget(filePath)).toEqual(["BLOCKER-FROM-v1"]);
+				// /reload: session_start resets the runtime and keeps the widget.
+				runtime.resetForSession();
+				runtime.beginTurn();
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				expect(widget(filePath)).toEqual([]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("A no-drop: in the same session, turn 6's clean edit replaces the turn-5 widget blocker", async () => {
+			const env = setupTestEnvironment("tla-widget-reload-nodrop-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				scriptVerdicts({ v1: "blocker", v2: "clean" });
+				await fiveTurns(runtime, env.tmpDir);
+				await edit(runtime, filePath, "export const x = 'v1';\n");
+				expect(widget(filePath)).toEqual(["BLOCKER-FROM-v1"]);
+				runtime.beginTurn();
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				expect(widget(filePath)).toEqual([]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		/**
+		 * A session-1 turn-5 pipeline parks in its dispatch; `between` runs
+		 * before it is released (a `/new`, or a turn boundary); then session 2
+		 * (or turn 6) edits the file clean.
+		 */
+		async function parkedTurnFive(
+			between: (runtime: RuntimeCoordinator) => void,
+		) {
+			const env = setupTestEnvironment("tla-widget-parked-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				await fiveTurns(runtime, env.tmpDir);
+				const entered = gate();
+				const release = gate();
+				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+					const rev = revisionOf(fp as string);
+					if (rev === "v1") {
+						entered.open();
+						await release.p;
+						return blocking(fp as string, rev) as never;
+					}
+					return clean(rev) as never;
+				});
+				const parked = edit(runtime, filePath, "export const x = 'v1';\n");
+				await entered.p;
+				between(runtime);
+				release.open();
+				// index.ts' bound abandoned it; its widget write lands now.
+				await parked;
+				runtime.beginTurn();
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				return widget(filePath);
+			} finally {
+				env.cleanup();
+			}
+		}
+
+		it("B: a session-1 pipeline released after /new plants no token that outranks session 2's clean edit", async () => {
+			expect(
+				await parkedTurnFive((runtime) => {
+					// /new: session_start resets the runtime and clears the widget.
+					runtime.resetForSession();
+					clearWidgetState();
+				}),
+			).toEqual([]);
+		});
+
+		it("B no-drop: in the same session, a turn-5 pipeline released at the turn boundary is replaced by turn 6's clean edit", async () => {
+			expect(await parkedTurnFive(() => {})).toEqual([]);
+		});
+
+		it("mixed producers: after /reload, a pipeline verdict drawn after a lens reservation in the same turn is not dropped", async () => {
+			const env = setupTestEnvironment("tla-widget-mixed-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				scriptVerdicts({ v1: "clean", v2: "blocker" });
+				await fiveTurns(runtime, env.tmpDir);
+				await edit(runtime, filePath, "export const x = 'v1';\n");
+				runtime.resetForSession();
+				runtime.beginTurn();
+				// lsp_diagnostics' reservation (index.ts injects this), then a
+				// confirmed clean for the file...
+				expect(
+					reconcileScanDiagnostics(
+						filePath,
+						[],
+						true,
+						runtime.nextWriteOrderToken(),
+					),
+				).toBe(true);
+				// ...then the agent's next edit of it blocks.
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				expect(widget(filePath)).toEqual(["BLOCKER-FROM-v2"]);
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
 	it("session straddle (#3506 r1 F8): an old session's handler that settles after session_start records nothing into the new session", async () => {
 		const env = setupTestEnvironment("tla-inline-session-");
 		try {
@@ -542,6 +846,253 @@ describe("formal/dispatch-pipeline replays", () => {
 		} finally {
 			env.cleanup();
 		}
+	});
+
+	// ── #3568: a handler index.ts abandoned, resuming after session_start ─────
+	describe("#3568: a tool_result handler that straddles a session replacement", () => {
+		/** A clean verdict carrying one fixable and one code-quality warning. */
+		function withWarnings(filePath: string, label: string) {
+			const warning = (rule: string, fixable: boolean) => ({
+				id: `eslint:${rule}:${label}`,
+				tool: "eslint",
+				rule,
+				message: `${rule.toUpperCase()}-FROM-${label}`,
+				filePath,
+				line: 1,
+				column: 1,
+				severity: "warning",
+				semantic: "warning",
+				fixable,
+			});
+			return {
+				...clean(label),
+				warnings: [warning("no-var", true), warning("complexity", false)],
+			};
+		}
+		const warningsOf = (runtime: RuntimeCoordinator) => ({
+			actionable: runtime.peekActionableWarnings().map((w) => w.message),
+			quality: runtime.peekCodeQualityWarnings().map((w) => w.message),
+		});
+		const staleSubjects = () =>
+			getDegradationSummary()
+				.filter((group) => group.kind === "generation-guard-stale-write")
+				.flatMap((group) => group.latestReasons.map((r) => r.subject));
+
+		it("a session-1 handler's warnings, settling after session_start, do not land in session 2's turn", async () => {
+			const env = setupTestEnvironment("tla-3568-warnings-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				const entered = gate();
+				const release = gate();
+				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+					entered.open();
+					await release.p;
+					return withWarnings(fp as string, "v1") as never;
+				});
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				const late = handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await entered.p;
+				runtime.resetForSession();
+				runtime.beginTurn();
+				resetDegradationLedger();
+				release.open();
+				await late;
+				expect(warningsOf(runtime)).toEqual({ actionable: [], quality: [] });
+				expect(staleSubjects()).toEqual([`runtime-session:${filePath}`]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("no-drop (shape 54): a handler that stays in its session records its warnings", async () => {
+			const env = setupTestEnvironment("tla-3568-warnings-own-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp) => withWarnings(fp as string, "v1") as never,
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				expect(warningsOf(runtime)).toEqual({
+					actionable: ["NO-VAR-FROM-v1"],
+					quality: ["COMPLEXITY-FROM-v1"],
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("a handler parked before its dispatch captures its session at entry, so its verdict does not land in session 2", async () => {
+			const env = setupTestEnvironment("tla-3568-entry-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp) =>
+						({
+							...blocking(fp as string, "v1"),
+							warnings: withWarnings(fp as string, "v1").warnings,
+						}) as never,
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				// Parked on the on-demand clients bound, before any capture the
+				// dispatch took until #3568.
+				const late = handleToolResult({
+					...deps(runtime, noBiome, { resident: false }),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await bootstrapGate.parked(1);
+				runtime.resetForSession();
+				runtime.beginTurn();
+				resetDegradationLedger();
+				bootstrapGate.release();
+				await late;
+				expect(inlineSummaries(runtime)).toEqual([]);
+				expect(runtime.gitGuardHasBlockers).toBe(false);
+				expect(warningsOf(runtime)).toEqual({ actionable: [], quality: [] });
+				expect(staleSubjects()).toContain(`runtime-session:${filePath}`);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("no-drop (shape 54): a handler parked before its dispatch in its own session records its verdict", async () => {
+			const env = setupTestEnvironment("tla-3568-entry-own-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp) => blocking(fp as string, "v1") as never,
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				const own = handleToolResult({
+					...deps(runtime, noBiome, { resident: false }),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await bootstrapGate.parked(1);
+				bootstrapGate.release();
+				await own;
+				expect(inlineSummaries(runtime)).toEqual([
+					{ writeIndex: 1, blocker: "BLOCKER-FROM-v1" },
+				]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		/**
+		 * The collect-later runner through the real dispatcher: the dispatch
+		 * double does with the pipeline's options what `dispatchLintWithResult`
+		 * does (`tests/clients/dispatch/integration.test.ts` pins that hop),
+		 * then runs an inline runner the case parks and a collect-later runner
+		 * the dispatcher defers after it.
+		 */
+		async function deferAcrossReplacement(replace: boolean) {
+			const env = setupTestEnvironment("tla-3568-runner-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.beginTurn();
+				resetPendingRunnerFindings();
+				observeRunnerLatency({
+					projectRoot: env.tmpDir,
+					runnerId: "fixture-runner",
+					durationMs: COLLECT_LATER_THRESHOLD_MS + 1,
+				});
+				const entered = gate();
+				const release = gate();
+				const registry = new RunnerRegistry();
+				registry.register({
+					id: "gate-runner",
+					appliesTo: ["jsts"],
+					priority: 1,
+					run: async () => {
+						entered.open();
+						await release.p;
+						return { status: "succeeded", diagnostics: [], semantic: "none" };
+					},
+				});
+				registry.register({
+					id: "fixture-runner",
+					appliesTo: ["jsts"],
+					priority: 2,
+					run: async () => ({
+						status: "succeeded",
+						diagnostics: [],
+						semantic: "warning",
+					}),
+				});
+				vi.mocked(dispatchLintWithResult).mockImplementation(
+					async (fp, cwd, pi, ranges, _log, options) => {
+						const ctx = createDispatchContext(
+							fp as string,
+							cwd as string,
+							pi as never,
+							new FactStore(),
+							true,
+							ranges,
+							options?.projectRoot,
+							options?.writeIndex,
+							options?.telemetryModel,
+							options?.telemetryProvider,
+							options?.sessionGeneration,
+						);
+						await dispatchForFile(
+							ctx,
+							[{ mode: "all", runnerIds: ["gate-runner", "fixture-runner"] }],
+							registry,
+						);
+						return clean("v1") as never;
+					},
+				);
+				fs.writeFileSync(filePath, "export const x = 'v1';\n");
+				const handler = handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c1"),
+				} as never);
+				await entered.p;
+				if (replace) {
+					// session_start: the store is cleared and the generation bumped
+					// in one tick (runtime-session.ts).
+					resetPendingRunnerFindings();
+					runtime.resetForSession();
+					runtime.beginTurn();
+				}
+				release.open();
+				await handler;
+				// Session 2's turn end drains the store.
+				return (await drainPendingRunnerFindings(0)).map((e) => e.runnerId);
+			} finally {
+				resetObservedRunnerLatency();
+				resetPendingRunnerFindings();
+				env.cleanup();
+			}
+		}
+
+		it("a session-1 handler's collect-later runner, deferred after session_start, is not drained by session 2's turn end", async () => {
+			expect(await deferAcrossReplacement(true)).toEqual([]);
+		});
+
+		it("no-drop (shape 54): a handler that stays in its session defers its collect-later runner to its turn end", async () => {
+			expect(await deferAcrossReplacement(false)).toEqual(["fixture-runner"]);
+		});
 	});
 
 	// ── #3506: pi-lens' own writers inside pi's mutation queue ────────────────
@@ -697,6 +1248,107 @@ describe("formal/dispatch-pipeline replays", () => {
 			} finally {
 				env.cleanup();
 			}
+		});
+
+		/**
+		 * #3559: edit A's fixer is parked in its availability probe; edit B
+		 * records a blocker at turn 1, w=2; the turn ends; A's fixer then fixes
+		 * B's bytes and re-tokens. `fixed` is the dispatch verdict on the fixed
+		 * bytes (v3). `afterReload` (#3540 r2) runs the replay in a second
+		 * session whose turn restarted while the order turn did not.
+		 */
+		async function reTokenAcrossTurn(
+			fixed: "blocker" | "clean",
+			afterReload = false,
+		) {
+			const env = setupTestEnvironment("tla-fixer-token-turn-");
+			try {
+				writeBiomeAgreement(env.tmpDir);
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				if (afterReload) {
+					for (let turn = 0; turn < 3; turn += 1) runtime.beginTurn();
+					runtime.resetForSession();
+				}
+				runtime.beginTurn();
+				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+					const bytes = fs.readFileSync(fp as string, "utf8");
+					if (bytes.includes("const a"))
+						return (
+							fixed === "blocker" ? blocking(fp as string, "v3") : clean("v3")
+						) as never;
+					const rev = bytes.includes("E2") ? "v2" : "v1";
+					return blocking(fp as string, rev) as never;
+				});
+				const probing = gate();
+				const probed = gate();
+				const fixer = {
+					isSupportedFile: () => true,
+					ensureAvailable: async () => {
+						probing.open();
+						await probed.p;
+						return true;
+					},
+					fixFileAsync: async (fp: string) => {
+						const before = fs.readFileSync(fp, "utf8");
+						fs.writeFileSync(fp, before.replace("var ", "const "));
+						const after = fs.readFileSync(fp, "utf8");
+						return {
+							success: true,
+							changed: before !== after,
+							fixed: before !== after ? 1 : 0,
+						};
+					},
+				} as unknown as BiomeClient;
+				fs.writeFileSync(filePath, "var a = 1;\n");
+				const write = handleToolResult({
+					...deps(runtime, fixer),
+					event: ev("write", filePath, "c1"),
+				} as never);
+				await probing.p;
+				fs.writeFileSync(filePath, "var a = 1;\nexport const E2 = 2;\n");
+				await handleToolResult({
+					...deps(runtime, noBiome),
+					event: ev("edit", filePath, "c2"),
+				} as never);
+				expect(inlineSummaries(runtime)).toEqual([
+					{ writeIndex: 2, blocker: "BLOCKER-FROM-v2" },
+				]);
+				runtime.beginTurn();
+				probed.open();
+				await write;
+				expect(fs.readFileSync(filePath, "utf8")).toBe(
+					"const a = 1;\nexport const E2 = 2;\n",
+				);
+				return {
+					inline: inlineSummaries(runtime),
+					widget: (getFileDiagnostics(filePath) ?? []).map((d) => d.message),
+				};
+			} finally {
+				env.cleanup();
+			}
+		}
+
+		it("FixerQueueNoReToken across turns (#3559): a pipeline that re-tokens after its turn ended records its fixed-bytes verdict under the new turn", async () => {
+			expect(await reTokenAcrossTurn("blocker")).toEqual({
+				inline: [{ writeIndex: 1, blocker: "BLOCKER-FROM-v3" }],
+				widget: ["BLOCKER-FROM-v3"],
+			});
+		});
+
+		it("FixerQueueNoReToken across turns (#3559, #3540 r2): after /reload, the re-token orders by the order turn, not the session's turn", async () => {
+			expect(await reTokenAcrossTurn("blocker", true)).toEqual({
+				inline: [{ writeIndex: 1, blocker: "BLOCKER-FROM-v3" }],
+				widget: ["BLOCKER-FROM-v3"],
+			});
+		});
+
+		it("FixerQueueNoReToken across turns (#3559): a re-tokened clean verdict on the fixed bytes clears the older turn's blocker", async () => {
+			expect(await reTokenAcrossTurn("clean")).toEqual({
+				inline: [],
+				widget: [],
+			});
 		});
 
 		it("FixerQueue (#3506): a queued pipeline whose fixer changed nothing keeps its handler's token, so the newer edit's verdict stands", async () => {

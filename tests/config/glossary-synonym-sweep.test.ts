@@ -1194,7 +1194,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/client.ts": 2,
 		// #3506: the re-token rewrites `ctx.telemetry` (22 -> 26); the field
 		// is the context's own name, so it is routed, not renamed, here.
-		"clients/pipeline.ts": 26,
+		// #3540 r2: 26 -> 27, the cascade reads `ctx.telemetry?.orderTurn`
+		// beside the `turnSeq`/`writeSeq` it already reads from the same field.
+		"clients/pipeline.ts": 27,
 		"clients/runtime-tool-result.ts": 1,
 	},
 	version: {
@@ -1210,7 +1212,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/installer/managed-tool-refresh.ts": 24,
 		"clients/knip-client.ts": 8,
 		"clients/lens-events.ts": 4,
-		"clients/lsp/client.ts": 35,
+		// #3505 (b): the workspace pull binds an item by the LSP report's own
+		// `version` field (35 -> 38), a protocol name that cannot be renamed.
+		"clients/lsp/client.ts": 38,
 		"clients/lsp/diagnostic-binding.ts": 1,
 		"clients/lsp/edits.ts": 24,
 		"clients/lsp/index.ts": 6,
@@ -1247,7 +1251,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"index.ts": 4,
 	},
 	warning: {
-		"clients/actionable-warnings.ts": 63,
+		// #3576: 63 -> 65. The quickfix pass's session check skips the loop's
+		// `warning` like its sibling skips (its id and its file as the ledger
+		// subject); the loop variable is not this fix's to rename.
+		"clients/actionable-warnings.ts": 65,
 		"clients/ast-grep-client.ts": 4,
 		"clients/code-quality-warnings.ts": 32,
 		"clients/dispatch/runners/rubocop.ts": 1,

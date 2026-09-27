@@ -503,6 +503,10 @@ export const wallClockBudgetInclude = [
 	// #3322: the Sonar gate CLI's exit codes and rendered stdout/stderr are the
 	// process-boundary contract; keep its real child out of the fork storm.
 	"tests/scripts/sonar-master-gate.test.ts",
+	// #3592 round 2 F1: the driver's own temporal-dead-zone regression only
+	// exists in its real top-level execution order; a real child process
+	// against a throwaway git fixture is the only thing that reproduces it.
+	"tests/scripts/stryker-diff.test.ts",
 	// #2586 review F1: proves the ACTUAL stdout bytes supply-host-provided-deps.mjs
 	// prints (real child process, flake-shape admission).
 	"tests/scripts/supply-host-provided-deps.test.ts",
