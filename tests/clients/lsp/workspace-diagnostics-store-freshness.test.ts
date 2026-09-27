@@ -35,16 +35,23 @@ import {
 	setupTestEnvironment,
 } from "../test-utils.js";
 
-const { getServersForFileWithConfig, createLSPClient, warm } = vi.hoisted(
-	() => ({
+const { getServersForFileWithConfig, createLSPClient, warm, logLatency } =
+	vi.hoisted(() => ({
 		getServersForFileWithConfig: vi.fn(),
 		createLSPClient: vi.fn(),
 		warm: {
 			attached: false,
 			diagnostics: vi.fn(),
 		},
-	}),
-);
+		logLatency: vi.fn(),
+	}));
+// A pass-through, so every row still reaches the real logger.
+vi.mock("../../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../../clients/latency-logger.js")>();
+	logLatency.mockImplementation(actual.logLatency);
+	return { ...actual, logLatency };
+});
 vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
 	...(await importOriginal()),
 	getServersForFileWithConfig,
@@ -386,6 +393,13 @@ describe("formal/store-freshness workspace-cache replays (#3505)", () => {
 	// binding under test is the production one. The concurrent writer lands
 	// while the server is answering.
 	describe("a workspace pull answer is cached only when bound to bytes pi-lens sent (#3505 b)", () => {
+		/** `pullUnbound` of each `lsp_workspace_diagnostics` row logged. */
+		const sweepRowPullUnbound = () =>
+			logLatency.mock.calls
+				.map(([row]) => row)
+				.filter((row) => row.phase === "lsp_workspace_diagnostics")
+				.map((row) => row.metadata?.pullUnbound);
+
 		function pullClient(opts: { sent: boolean; writeDuringAnswer: boolean }) {
 			const state = createMockState({
 				serverId: "typescript",
@@ -446,8 +460,11 @@ describe("formal/store-freshness workspace-cache replays (#3505)", () => {
 					process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
 					try {
 						const pulls = pullClient({ sent, writeDuringAnswer: true });
+						logLatency.mockClear();
 						await sweep();
 						expect(pulls()).toBe(1);
+						// The sweep row counts the answers it would not cache.
+						expect(sweepRowPullUnbound()).toEqual([sent ? 0 : 2]);
 						await sweep();
 						expect(pulls()).toBe(2);
 					} finally {
@@ -464,7 +481,9 @@ describe("formal/store-freshness workspace-cache replays (#3505)", () => {
 				process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
 				try {
 					const pulls = pullClient({ sent: true, writeDuringAnswer: false });
+					logLatency.mockClear();
 					await sweep();
+					expect(sweepRowPullUnbound()).toEqual([0]);
 					await sweep();
 					expect(pulls()).toBe(1);
 					const entry =

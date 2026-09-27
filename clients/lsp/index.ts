@@ -9858,6 +9858,17 @@ export class LSPService {
 				results.flatMap((result) => result.unconfirmedServerIds ?? []),
 			),
 		].sort((a, b) => Number(a > b) - Number(a < b));
+		// #3505 (b): pull answers not bound to bytes pi-lens sent. The record
+		// loop below delivers but does not cache them (and drops the entry each
+		// supersedes), so a pull sweep that caches nothing says so here.
+		let pullUnbound = 0;
+		for (const result of results) {
+			if (
+				pullAnsweredFiles.has(result.filePath) &&
+				result.contentHash === undefined
+			)
+				pullUnbound += 1;
+		}
 		logLatency({
 			type: "phase",
 			phase: "lsp_workspace_diagnostics",
@@ -9876,6 +9887,7 @@ export class LSPService {
 				timedOutFiles,
 				unconfirmedByReason,
 				partiallyCoveredFiles,
+				pullUnbound,
 				...(unconfirmedServerIds.length > 0 && { unconfirmedServerIds }),
 				aborted: signal?.aborted ?? false,
 			},
