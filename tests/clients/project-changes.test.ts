@@ -419,6 +419,165 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 	});
 
 	/**
+	 * Total bytes, and the size of each individual call, `readChangeLogMaxSeq`
+	 * reads from `logPath`'s own fd, locked or not. A mutable object — callers
+	 * read `.bytesRead`/`.reads` AFTER the read happens, never destructure it
+	 * (the count is only correct as a live reference: this closure keeps
+	 * mutating the SAME object after the caller's own destructure would have
+	 * copied out a stale primitive).
+	 */
+	function watchReadsOf(): { bytesRead: number; reads: number[] } {
+		const state = { bytesRead: 0, reads: [] as number[] };
+		const logFds = new Set<number>();
+		patchFs(
+			"openSync",
+			(real) =>
+				((...args: Parameters<typeof real>) => {
+					const fd = real(...args);
+					if (String(args[0]) === logPath) logFds.add(fd);
+					return fd;
+				}) as typeof real,
+		);
+		patchFs(
+			"readSync",
+			(real) =>
+				((...args: Parameters<typeof real>) => {
+					const read = (real as (...a: unknown[]) => number)(...args);
+					if (logFds.has(args[0] as number)) {
+						state.bytesRead += read;
+						state.reads.push(read);
+					}
+					return read;
+				}) as typeof real,
+		);
+		return state;
+	}
+
+	/**
+	 * Recurrence: #3594 item 2 (#3577 option 3). #3595 (item 1 of #3594's own
+	 * batch) took the first-allocation read outside the lock, but left it a
+	 * full FORWARD read of the whole log — #3577's evidence measured 0.83-1.17s
+	 * at 150 MB. `readChangeLogMaxSeq`'s log has one hard invariant already
+	 * pinned by `project-changes-seq-properties.test.ts`'s `monotonicLog`
+	 * property: every line's seq is strictly above every line before it. The
+	 * log's LAST complete line therefore always carries the true max — no walk
+	 * over the lines before it is needed to find it.
+	 */
+	it("the first allocation scans backward for the last line instead of reading the whole log (#3594 item 2, #3577 option 3)", () => {
+		nodeFs.mkdirSync(path.dirname(logPath), { recursive: true });
+		let existing = "";
+		for (let seq = 1; seq <= 5_000; seq++) existing += logLine(seq);
+		nodeFs.writeFileSync(logPath, existing);
+		const fileSize = nodeFs.statSync(logPath).size;
+
+		const counts = watchReadsOf();
+		const runtime = new RuntimeCoordinator();
+		runtime.seedProjectSequence(0); // the timed-out read's cold seed
+		expect(edit(runtime, "a.ts").projectSeq).toBe(5_001);
+		// A bounded backward scan reads one small window near the end, not the
+		// whole file: comfortably under a tenth of it, and under an absolute
+		// cap regardless of how large the log grows.
+		expect(counts.bytesRead).toBeLessThan(fileSize / 10);
+		expect(counts.bytesRead).toBeLessThan(20_000);
+	});
+
+	/**
+	 * The gate that chooses the tail scan is "nothing of this file accounted
+	 * for yet" (`cursor.bytes === 0`), not "the file happens to be large" — so
+	 * a SECOND allocation in the same session, already seeded by the first,
+	 * must stay on the existing cheap incremental read (only the bytes
+	 * appended since), not pay a fresh tail scan on every call.
+	 */
+	it("a later allocation this session reads only the bytes appended since, not a fresh tail scan (#3594 item 2)", () => {
+		nodeFs.mkdirSync(path.dirname(logPath), { recursive: true });
+		let existing = "";
+		for (let seq = 1; seq <= 5_000; seq++) existing += logLine(seq);
+		nodeFs.writeFileSync(logPath, existing);
+
+		const runtime = new RuntimeCoordinator();
+		runtime.seedProjectSequence(0);
+		expect(edit(runtime, "a.ts").projectSeq).toBe(5_001); // seeds the cursor
+
+		const counts = watchReadsOf();
+		expect(edit(runtime, "b.ts").projectSeq).toBe(5_002);
+		// Only the one freshly appended line (plus its own second, in-lock
+		// read of nothing new) — nowhere near a fresh tail-scan window.
+		expect(counts.bytesRead).toBeLessThan(1_000);
+	});
+
+	/**
+	 * Correctness at the sizes the window-growth loop's own edge lives at: an
+	 * empty log, one line, and two lines — the cases where "the window covers
+	 * the whole file" (`start === 0`) is reached on the FIRST attempt.
+	 */
+	it.each([
+		["empty log", 0, 1],
+		["a single line", 1, 2],
+		["two lines", 2, 3],
+	])(
+		"allocates correctly from %s (#3594 item 2)",
+		(_label, seeded, expected) => {
+			nodeFs.mkdirSync(path.dirname(logPath), { recursive: true });
+			let existing = "";
+			for (let seq = 1; seq <= seeded; seq++) existing += logLine(seq);
+			nodeFs.writeFileSync(logPath, existing);
+
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(0);
+			expect(edit(runtime, "a.ts").projectSeq).toBe(expected);
+		},
+	);
+
+	/**
+	 * A single line long enough that the initial 4 KB window does not reach
+	 * its own start: `tailMaxSeq` must grow the window (doubling) rather than
+	 * mis-read a truncated line or silently fall through to `undefined`
+	 * (which would fall back to the full read — correct, but not what this
+	 * case is proving).
+	 */
+	it("allocates correctly when the log's only line is longer than the initial scan window (#3594 item 2)", () => {
+		nodeFs.mkdirSync(path.dirname(logPath), { recursive: true });
+		// Padded well past a few doublings of the initial window, so a mutant
+		// that stops trusting "the window now covers the whole file" (no
+		// preceding newline needed once `start === 0`) and instead falls back
+		// to a single full-size read reads a size this test can tell apart
+		// from a genuine window growth sequence.
+		const longPath = path.join(cwd, "src", `${"pad".repeat(20_000)}.ts`);
+		nodeFs.writeFileSync(
+			logPath,
+			`${JSON.stringify({
+				seq: 7,
+				timestamp: new Date(0).toISOString(),
+				sessionId: "older-session",
+				turnIndex: 0,
+				source: "agent-edit",
+				filePath: longPath,
+				fileSeq: 7,
+			})}\n`,
+		);
+		const size = nodeFs.statSync(logPath).size;
+		expect(size).toBeGreaterThan(32_768);
+
+		const counts = watchReadsOf();
+		const runtime = new RuntimeCoordinator();
+		runtime.seedProjectSequence(0);
+		expect(edit(runtime, "a.ts").projectSeq).toBe(8);
+		// The FIRST attempt uses the small initial window, not a single
+		// full-size read — proof the growth loop ran rather than the tail
+		// scan silently declining and falling back to a plain forward read
+		// (which reads the WHOLE size in its one and only call).
+		expect(counts.reads[0]).toBeLessThanOrEqual(4_096);
+		expect(counts.reads.length).toBeGreaterThan(1);
+		// The LAST attempt (window grown to cover the whole file) is accepted
+		// on its own: a mutant that stops trusting "no preceding newline is
+		// needed once the window covers byte 0" falls through to the OLD
+		// full-size fallback read instead, reading the file's full size a
+		// SECOND time right after the window already grew to cover it.
+		expect(counts.reads.at(-1)).toBe(size);
+		expect(counts.reads.filter((n) => n === size)).toHaveLength(1);
+	});
+
+	/**
 	 * Recurrence: an allocator that trusts the read taken before the lock. A
 	 * sibling that held the lock appended in between, and would share its seq.
 	 */

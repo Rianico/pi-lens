@@ -327,6 +327,63 @@ export function appendProjectChange(
 	fs.appendFileSync(logPath, `${JSON.stringify(entry)}\n`, "utf-8");
 }
 
+// #3594 (#3577 option 3): the initial backward-scan window for `tailMaxSeq`.
+// One log line is normally well under 1 KB (a fixed set of scalar fields
+// plus one file path); 4 KB leaves generous room for a long path so the
+// common case resolves in the FIRST read, with the loop below growing it
+// (doubling) only for a genuinely long line.
+const TAIL_SCAN_WINDOW_BYTES = 4_096;
+
+/**
+ * The seq of the log's LAST complete line, via a bounded backward scan
+ * instead of reading the file forward from byte 0 (#3577 option 3, applied
+ * in place of the plain "read it all" first-allocation fallback #3595/#3577
+ * option 1 left on the main thread). Read `clients/project-changes-seq-properties.test.ts`'s
+ * `monotonicLog` property: every line's own seq is strictly above every
+ * line before it in the file, an invariant that property suite already
+ * pins under fast-check's own interleavings — so the LAST complete line
+ * always carries the log's true max seq, and scanning further back can
+ * never find a higher one.
+ *
+ * `fd`'s position is untouched (every read is by explicit offset); `size`
+ * is the caller's own `fstatSync` read, taken once under the SAME
+ * `readChangeLogMaxSeq` call this backs, so the file cannot have grown
+ * between them. Grows the window until it contains one newline-terminated
+ * line with a newline (or the start of the file) before it, doubling up to
+ * `size` itself. Returns `undefined` — the caller's cue to fall back to the
+ * full forward read — for an empty file, a file with no parseable line at
+ * all (a corrupt log, or every attempt racing an in-progress append whose
+ * trailing bytes are still incomplete), or an unparseable last line.
+ */
+function tailMaxSeq(fd: number, size: number): number | undefined {
+	let window = Math.min(TAIL_SCAN_WINDOW_BYTES, size);
+	for (;;) {
+		const start = size - window;
+		const buf = Buffer.alloc(window);
+		if (window > 0) fs.readSync(fd, buf, 0, window, start);
+		const text = buf.toString("utf-8");
+		// The file's own trailing newline — or a partial line an
+		// in-progress writer hasn't terminated yet — leaves nothing after
+		// the LAST `\n` that this reader trusts.
+		const lastNewline = text.lastIndexOf("\n");
+		if (lastNewline !== -1) {
+			const priorNewline = text.lastIndexOf("\n", lastNewline - 1);
+			// A line start is trustworthy either right after a PRIOR
+			// newline this same window already captured, or at byte 0 of
+			// the file once the window covers all of it (`start === 0`) —
+			// otherwise the window's own start may have split the line, so
+			// the text before `lastNewline` cannot be trusted as complete.
+			if (priorNewline !== -1 || start === 0) {
+				const lineStart = priorNewline === -1 ? 0 : priorNewline + 1;
+				const line = text.slice(lineStart, lastNewline).trim();
+				return line ? parseChangeLine(line)?.seq : undefined;
+			}
+		}
+		if (start === 0) return undefined; // whole file scanned; nothing usable
+		window = Math.min(window * 2, size);
+	}
+}
+
 function readChangeLogMaxSeq(logPath: string): number {
 	let fd: number;
 	try {
@@ -338,6 +395,27 @@ function readChangeLogMaxSeq(logPath: string): number {
 	try {
 		const cursor = changeLogCursors.get(logPath) ?? { bytes: 0, maxSeq: 0 };
 		const size = fs.fstatSync(fd).size;
+		// #3594: an UNSEEDED cursor (nothing of this file accounted for yet —
+		// the first allocation of a session whose `session_start` read has not
+		// landed, #1162) is the one case a bounded tail scan can replace
+		// entirely: the log's monotonic-seq invariant (see `tailMaxSeq`'s own
+		// doc comment) makes the last line's seq exactly what a full forward
+		// read-and-fold would have produced as the max, without reading or
+		// parsing every line before it. A SEEDED cursor (every later
+		// allocation this session) already reads only the bytes appended since
+		// its own last read, which is cheap regardless of file size — the
+		// branch below is untouched for that case.
+		if (cursor.bytes === 0 && size > 0) {
+			const tail = tailMaxSeq(fd, size);
+			if (tail !== undefined) {
+				cursor.bytes = size;
+				cursor.maxSeq = tail;
+				changeLogCursors.set(logPath, cursor);
+				return cursor.maxSeq;
+			}
+			// Fall through to the full forward read below — the safe direction
+			// for a tail scan that could not trust what it found.
+		}
 		if (size > cursor.bytes) {
 			const tail = Buffer.alloc(size - cursor.bytes);
 			const read = fs.readSync(fd, tail, 0, tail.length, cursor.bytes);
