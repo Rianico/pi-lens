@@ -68,8 +68,8 @@ describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
 	// before initialization` out of the driver with no report written and
 	// exit code 1 -- the sticky comment renders that as "Stale ... a crash"
 	// rather than the intended zero-mutant advisory. A source-text check on
-	// the driver (see the `measuredTotalMutants` wiring test above) cannot
-	// catch this: the literal text is correct either way, only the ORDER of
+	// the driver cannot catch this: the literal text is correct either
+	// way, only the ORDER of
 	// two statements in the real module differs. This spawns the actual
 	// script against a real, throwaway git repo -- no relative import,
 	// mock, or source-text substitute reproduces a temporal-dead-zone crash.
@@ -118,7 +118,15 @@ describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
 			);
 			// #3592 item 2's own field must survive an early exit too -- null,
 			// since the dry-run measurement never ran, not a crash-shaped absence.
-			expect(report.piLensMutationDiff.measuredTotalMutants).toBeNull();
+			// #3592 item 2: every report carries the dry-run total through
+			// baseMeta (null here: this early exit precedes the measurement). A
+			// behavioural pin, not a source-text one: the mutation lane
+			// instruments this driver's changed lines, so a literal-text check
+			// of them fails inside Stryker's own dry run.
+			expect(report.piLensMutationDiff).toHaveProperty(
+				"measuredTotalMutants",
+				null,
+			);
 		} finally {
 			rmSync(fixtureRepo, { recursive: true, force: true });
 		}
@@ -378,26 +386,6 @@ describe("stryker diff wall-clock budget", () => {
 		expect(driver).toContain("--budget-minutes");
 		expect(driver).toContain("mutationRangePatterns");
 		expect(driver).toContain("describeStrykerFailure");
-	});
-
-	it("#3592 item 2: persists the dry-run measurement's total into baseMeta, so every report carries it", () => {
-		// Recurrence this guards against: baseMeta is the ONE function every
-		// writeReport call goes through (see the driver's own writeReport
-		// docstring). Reading `costEstimate` there rather than at each
-		// individual call site is what makes "every report" true without
-		// repeating the field at 8 different writeReport call sites -- a
-		// per-call-site version could drift (a future report added without
-		// it). This is a top-level script this suite cannot import (see the
-		// stated exception above); the render-side comparison this field
-		// feeds is fully mutation-proved as a pure function in
-		// mutation-report-render.test.ts.
-		expect(driver).toContain(
-			"measuredTotalMutants: costEstimate?.totalMutants ?? null,",
-		);
-		// It must be read inside baseMeta itself, not duplicated at each call
-		// site -- the field name appears exactly once as an object-literal key.
-		const occurrences = driver.split("measuredTotalMutants:").length - 1;
-		expect(occurrences).toBe(1);
 	});
 
 	it("wires the resample loop through planResample and decideMutationOutcome, not a hand-rolled duplicate (#3531 round 3 R2-1/R2-2)", () => {
