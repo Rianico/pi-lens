@@ -327,92 +327,6 @@ export function appendProjectChange(
 	fs.appendFileSync(logPath, `${JSON.stringify(entry)}\n`, "utf-8");
 }
 
-// #3594 (#3577 option 3): the initial backward-scan window for `tailMaxSeq`.
-// One log line is normally well under 1 KB (a fixed set of scalar fields
-// plus one file path); 4 KB leaves generous room for a long path so the
-// common case resolves in the FIRST read, with the loop below growing it
-// (doubling) only for a genuinely long line.
-const TAIL_SCAN_WINDOW_BYTES = 4_096;
-
-/**
- * The log's true max seq, via a bounded backward scan instead of reading the
- * file forward from byte 0 (#3577 option 3, applied in place of the plain
- * "read it all" first-allocation fallback #3595/#3577 option 1 left on the
- * main thread).
- *
- * Round 2 (verify): a naive "trust the LAST complete line's own seq" version
- * of this shipped first and broke
- * `tests/clients/project-snapshot-cross-process.test.ts`'s "a line still
- * being written is read once it is complete" — an unlocked writer's line can
- * finish landing in the log AFTER a lower-seq line an unseeded reader already
- * appended past it, so the file's OWN byte order is not always seq order at
- * the exact moment a cold cursor reads it (the codebase's real cross-process
- * concurrency behavior, not merely the `monotonicLog` property's modeled
- * interleavings, which reads through `recordProjectMutation` and never
- * exercises this exact hand-completed-fragment shape). This version instead
- * parses EVERY complete line inside whatever window it reads (free — the
- * bytes are already in memory) and takes their max, then trusts that max
- * ONLY when it is the window's own PHYSICALLY LAST line: the ordinary,
- * overwhelmingly common shape of a healthy append-only log. Finding a HIGHER
- * seq earlier in the window than the last line is itself the disorder
- * signal — it grows the window and re-scans, converging to reading the
- * whole file (matching the OLD full-read algorithm's own take-the-max-over-
- * everything correctness) exactly when disorder is actually present, never
- * when the log is ordinary.
- *
- * `fd`'s position is untouched (every read is by explicit offset); `size`
- * is the caller's own `fstatSync` read, taken once under the SAME
- * `readChangeLogMaxSeq` call this backs, so the file cannot have grown
- * between them. Grows the window (doubling, up to `size`) until it contains
- * at least one complete line whose OWN start this reader can trust — right
- * after a newline the SAME window captured, or byte 0 once the window covers
- * the whole file. Returns `undefined` — the caller's cue to fall back to the
- * full forward read — for an empty file, or a file with no parseable line at
- * all (a corrupt log, or every attempt racing an in-progress append whose
- * trailing bytes are still incomplete on every attempt).
- */
-function tailMaxSeq(fd: number, size: number): number | undefined {
-	let window = Math.min(TAIL_SCAN_WINDOW_BYTES, size);
-	for (;;) {
-		const start = size - window;
-		const buf = Buffer.alloc(window);
-		if (window > 0) fs.readSync(fd, buf, 0, window, start);
-		const text = buf.toString("utf-8");
-		// The file's own trailing newline — or a partial line an
-		// in-progress writer hasn't terminated yet — leaves nothing after
-		// the LAST `\n` that this reader trusts.
-		const lastNewline = text.lastIndexOf("\n");
-		if (lastNewline !== -1) {
-			// The window's FIRST complete line's own start is trustworthy
-			// only right after a newline the SAME window already captured,
-			// or at byte 0 of the file once the window covers it all
-			// (`start === 0`) — otherwise the window's own start may have
-			// split that line, so nothing before the first in-window
-			// newline can be trusted as a complete line's start.
-			const firstNewline = text.indexOf("\n");
-			const linesStart = start === 0 ? 0 : firstNewline + 1;
-			if (linesStart !== -1 && linesStart <= lastNewline) {
-				let max: number | undefined;
-				let lastLineSeq: number | undefined;
-				for (const line of text.slice(linesStart, lastNewline).split("\n")) {
-					const entry = line.trim() ? parseChangeLine(line) : undefined;
-					if (!entry) continue;
-					lastLineSeq = entry.seq;
-					if (max === undefined || entry.seq > max) max = entry.seq;
-				}
-				// Trust it once the window's own physically LAST line IS (at
-				// least tied for) the max found, or once the window already
-				// covers the whole file (there is nothing left to grow into).
-				if (max !== undefined && (max === lastLineSeq || start === 0)) {
-					return max;
-				}
-			}
-		}
-		if (start === 0) return undefined; // whole file scanned; nothing usable
-		window = Math.min(window * 2, size);
-	}
-}
-
 function readChangeLogMaxSeq(logPath: string): number {
 	let fd: number;
 	try {
@@ -424,26 +338,6 @@ function readChangeLogMaxSeq(logPath: string): number {
 	try {
 		const cursor = changeLogCursors.get(logPath) ?? { bytes: 0, maxSeq: 0 };
 		const size = fs.fstatSync(fd).size;
-		// #3594: an UNSEEDED cursor (nothing of this file accounted for yet —
-		// the first allocation of a session whose `session_start` read has not
-		// landed, #1162) is the one case a bounded tail scan can replace: see
-		// `tailMaxSeq`'s own doc comment for what it trusts and why, and when
-		// it instead falls back here to the full forward read (`undefined`).
-		// A SEEDED cursor (every later allocation this session) already reads
-		// only the bytes appended since its own last read, which is cheap
-		// regardless of file size — the branch below is untouched for that
-		// case.
-		if (cursor.bytes === 0 && size > 0) {
-			const tail = tailMaxSeq(fd, size);
-			if (tail !== undefined) {
-				cursor.bytes = size;
-				cursor.maxSeq = tail;
-				changeLogCursors.set(logPath, cursor);
-				return cursor.maxSeq;
-			}
-			// Fall through to the full forward read below — the safe direction
-			// for a tail scan that could not trust what it found.
-		}
 		if (size > cursor.bytes) {
 			const tail = Buffer.alloc(size - cursor.bytes);
 			const read = fs.readSync(fd, tail, 0, tail.length, cursor.bytes);
