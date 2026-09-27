@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { BoundedFifoMap } from "./bounded-cache.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import {
 	type GenerationHold,
 	heartbeatIntervalMs,
@@ -10,6 +12,7 @@ import {
 	recordLegacyLockHeld,
 	releaseGeneration,
 	startGenerationHeartbeat,
+	topGenerationHolder,
 	tryAcquireGeneration,
 } from "./generation-lock.js";
 
@@ -380,6 +383,14 @@ function tryAcquireBoundedLock(
 	return "legacy-held";
 }
 
+// #3594: per generation directory, the holder a wait last ran out on, named
+// by its top generation file and the `<pid> <ms>` it holds — the same shape
+// as `withGenerationLockSync`'s own map (#3578). Only a later holder writes
+// another name, so a match is that same holder, still on top. An unreadable
+// holder is `undefined`, which never matches (a first wait is never
+// skipped).
+const timedOutHolders = new BoundedFifoMap<string, string | undefined>(16);
+
 /**
  * Acquire a bounded synchronous cross-process file lock.
  *
@@ -394,6 +405,22 @@ function tryAcquireBoundedLock(
  * recycled PID from the original owner, so a recycled PID still wedges the
  * lock until that process exits, as before #3476. Removing the bridge
  * (#3489) gives live holders the UNREADABLE_LOCK_STALE_MS lease.
+ *
+ * #3594: once a wait has run out on the generation-lock's top holder, a
+ * later call that finds the same holder still on top tries once (the
+ * `tryAcquireBoundedLock` call below always runs at least once) and falls
+ * back at once, exactly as a timed-out wait does — throwing, or returning
+ * `null` under `onContention: "skip-log"`. A new holder, or one whose
+ * generation aged past its lease, gets the full wait again. The check is
+ * keyed on the top generation FILE's own identity (`lock.<n> <pid> <ms>`),
+ * not on which of `tryAcquireBoundedLock`'s two contended outcomes ("busy":
+ * the generation itself is held; "legacy-held": this call took and released
+ * its own fresh generation, but the pre-#3476 bridge file is held) produced
+ * it: a "legacy-held" retry always creates its own new generation with a
+ * fresh timestamp, so it can never coincide with a remembered holder's name,
+ * and distinguishing the two outcomes here could not be shown to change any
+ * observable behavior (AGENTS.md: a guard that cannot be made to red does
+ * not need to exist).
  */
 export function acquireBoundedPidFileLock(
 	lockPath: string,
@@ -416,6 +443,8 @@ export function acquireBoundedPidFileLock(
 ): (() => void) | null {
 	const token = `${process.pid}:${Date.now()}:${randomUUID()}`;
 	const deadline = Date.now() + options.waitMs;
+	const dir = generationDir(lockPath);
+	const timedOutHolder = timedOutHolders.get(dir);
 	let legacyHeldRecorded = false;
 	for (;;) {
 		const hold = tryAcquireBoundedLock(lockPath, token);
@@ -429,7 +458,23 @@ export function acquireBoundedPidFileLock(
 			legacyHeldRecorded = true;
 			recordLegacyLockHeld(lockPath);
 		}
+		if (
+			timedOutHolder !== undefined &&
+			topGenerationHolder(dir) === timedOutHolder
+		) {
+			recordDegradationOnce({
+				kind: "bounded-pid-lock-wait-skipped",
+				subject: path.resolve(dir),
+				reason: `did not wait: ${timedOutHolder} still holds the lock after an earlier wait ran out`,
+			});
+			if (options.onContention === "skip-log") {
+				options.logContention();
+				return null;
+			}
+			throw new Error(options.timeoutMessage);
+		}
 		if (Date.now() >= deadline) {
+			timedOutHolders.set(dir, topGenerationHolder(dir));
 			if (options.onContention === "skip-log") {
 				options.logContention();
 				return null;

@@ -269,7 +269,13 @@ export function tryAcquireGeneration(
 // unreadable holder is `undefined`, which never matches.
 const timedOutHolders = new BoundedFifoMap<string, string | undefined>(16);
 
-function topGenerationHolder(dir: string): string | undefined {
+/**
+ * The current top generation's `lock.<n> <pid> <ms>` name, or `undefined` if
+ * the directory or its top generation file cannot be read. Exported for
+ * {@link "./bounded-pid-file-lock.js"}'s own #3594 remembered-holder skip,
+ * which keys on the same holder identity against a different lock directory.
+ */
+export function topGenerationHolder(dir: string): string | undefined {
 	try {
 		const top = topGeneration(fs.readdirSync(dir));
 		return `lock.${top} ${fs.readFileSync(generationPath(dir, top), "utf8").trim()}`;

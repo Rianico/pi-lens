@@ -16,6 +16,10 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import {
+	releaseGeneration,
+	tryAcquireGeneration,
+} from "../../clients/generation-lock.js";
 
 const tempDirs: string[] = [];
 
@@ -679,5 +683,209 @@ describe("acquireQuarantinePidFileLock across versions (#3476)", () => {
 		const release = await take(lockPath);
 		expect(release).toBeTypeOf("function");
 		await release?.();
+	});
+});
+
+describe("acquireBoundedPidFileLock: remembered-holder skip (#3594)", () => {
+	function lockIn(): { lockPath: string; gens: string } {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pid-lock-"));
+		tempDirs.push(dir);
+		const lockPath = path.join(dir, "state.lock");
+		return { lockPath, gens: `${lockPath}s` };
+	}
+
+	function degradationCount(kind: string): number {
+		return (
+			getDegradationSummary().find((group) => group.kind === kind)?.count ?? 0
+		);
+	}
+
+	function take(lockPath: string, waitMs: number, retryMs = 10) {
+		return acquireBoundedPidFileLock(lockPath, {
+			waitMs,
+			retryMs,
+			timeoutMessage: "bounded lock timed out",
+			onContention: "skip-log",
+			logContention: () => {},
+		});
+	}
+
+	/**
+	 * Fake time: each `Atomics.wait` backoff advances the fake clock the
+	 * deadline reads, instead of blocking. `slept` is the time the main
+	 * thread would have been blocked. Mirrors the sibling #3578 skip's own
+	 * `fakeBackoff` in `tests/clients/project-changes.test.ts`.
+	 */
+	function fakeBackoff(): { slept: number } {
+		const backoff = { slept: 0 };
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.spyOn(Atomics, "wait").mockImplementation(((
+			_array: unknown,
+			_index: unknown,
+			_value: unknown,
+			timeout?: number,
+		) => {
+			backoff.slept += timeout ?? 0;
+			vi.setSystemTime(Date.now() + (timeout ?? 0));
+			return "timed-out";
+		}) as typeof Atomics.wait);
+		return backoff;
+	}
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+		resetDegradationLedger();
+	});
+
+	/**
+	 * Recurrence: #3578's shape, unapplied here. Every call waited afresh on
+	 * a holder an earlier wait had already run out on: ten calls under a
+	 * stuck holder blocked the main thread for ten full waits.
+	 */
+	it("ten calls under a stuck holder wait once, not ten (#3594)", () => {
+		const { lockPath, gens } = lockIn();
+		const backoff = fakeBackoff();
+		const hold = tryAcquireGeneration(gens, 60_000);
+		expect(hold).toBeDefined();
+		try {
+			for (let i = 0; i < 10; i++) {
+				expect(take(lockPath, 500)).toBeNull();
+			}
+		} finally {
+			if (hold) releaseGeneration(hold);
+		}
+		expect(backoff.slept).toBeGreaterThanOrEqual(500);
+		expect(backoff.slept).toBeLessThan(1_000);
+		expect(degradationCount("bounded-pid-lock-wait-skipped")).toBe(1);
+	});
+
+	it("a new holder after the stuck one gets the full wait again (#3594)", () => {
+		const { lockPath, gens } = lockIn();
+		const backoff = fakeBackoff();
+		const stuck = tryAcquireGeneration(gens, 60_000);
+		expect(stuck).toBeDefined();
+		expect(take(lockPath, 500)).toBeNull();
+		if (stuck) releaseGeneration(stuck);
+
+		const next = tryAcquireGeneration(gens, 60_000);
+		expect(next).toBeDefined();
+		const before = backoff.slept;
+		expect(take(lockPath, 500)).toBeNull();
+		if (next) releaseGeneration(next);
+		expect(backoff.slept - before).toBeGreaterThanOrEqual(500);
+	});
+
+	it("once the stuck holder releases, the next call takes the lock on its first try (#3594)", () => {
+		const { lockPath, gens } = lockIn();
+		const backoff = fakeBackoff();
+		const stuck = tryAcquireGeneration(gens, 60_000);
+		expect(stuck).toBeDefined();
+		expect(take(lockPath, 500)).toBeNull();
+		if (stuck) releaseGeneration(stuck);
+
+		const before = backoff.slept;
+		const release = take(lockPath, 500);
+		expect(release).toBeTypeOf("function");
+		(release as (() => void) | null)?.();
+		expect(backoff.slept).toBe(before);
+	});
+
+	/**
+	 * Mutation direction for dropping `timedOutHolder !== undefined`: without
+	 * it, an unreadable holder (`undefined`) on the FIRST wait would match
+	 * the also-`undefined` "nothing remembered yet" state and skip a wait
+	 * that never happened. Mirrors the sibling #3578 test of the same name in
+	 * `tests/clients/project-changes.test.ts`.
+	 */
+	it("a first wait is never skipped, even when the holder's generation file cannot be read (#3594)", () => {
+		const { lockPath, gens } = lockIn();
+		const backoff = fakeBackoff();
+		const hold = tryAcquireGeneration(gens, 60_000);
+		expect(hold).toBeDefined();
+		const prefix = path.join(gens, "lock.");
+		const realReadFileSync = mutableFs.readFileSync;
+		mutableFs.readFileSync = ((
+			...args: Parameters<typeof realReadFileSync>
+		) => {
+			if (String(args[0]).startsWith(prefix)) {
+				throw Object.assign(new Error("EACCES: permission denied"), {
+					code: "EACCES",
+				});
+			}
+			return realReadFileSync(...args);
+		}) as typeof realReadFileSync;
+		syncBuiltinESMExports();
+		try {
+			expect(take(lockPath, 500)).toBeNull();
+		} finally {
+			mutableFs.readFileSync = realReadFileSync;
+			syncBuiltinESMExports();
+			if (hold) releaseGeneration(hold);
+		}
+		expect(backoff.slept).toBeGreaterThanOrEqual(500);
+	});
+
+	// The skip's throw-on-timeout contract: a skip surfaces exactly like an
+	// ordinary timeout, with THIS call's own message, not a cached one.
+	it("throws with the caller's own timeout message, skipped or not (#3594)", () => {
+		const { lockPath, gens } = lockIn();
+		fakeBackoff();
+		const hold = tryAcquireGeneration(gens, 60_000);
+		expect(hold).toBeDefined();
+		try {
+			expect(() =>
+				acquireBoundedPidFileLock(lockPath, {
+					waitMs: 500,
+					retryMs: 10,
+					timeoutMessage: "first wait timed out",
+				}),
+			).toThrow("first wait timed out");
+			// Skipped: no wait, but the same throwing contract with THIS call's
+			// own message.
+			expect(() =>
+				acquireBoundedPidFileLock(lockPath, {
+					waitMs: 500,
+					retryMs: 10,
+					timeoutMessage: "second wait timed out",
+				}),
+			).toThrow("second wait timed out");
+		} finally {
+			if (hold) releaseGeneration(hold);
+		}
+	});
+
+	/**
+	 * A "legacy-held" retry (the pre-#3476 bridge file is live, not the
+	 * generation) always creates and releases its OWN fresh generation, so
+	 * its top-generation identity never coincides with a holder an earlier
+	 * BUSY wait remembered — the skip's check is unscoped by outcome (see
+	 * the production doc comment), and this is why that is safe.
+	 */
+	it("a live legacy holder is never skipped by an unrelated stuck holder's memory (#3594)", () => {
+		const { lockPath, gens } = lockIn();
+		const backoff = fakeBackoff();
+
+		// First, time out against a busy generation holder so `dir` has a
+		// remembered holder identity.
+		const stuck = tryAcquireGeneration(gens, 60_000);
+		expect(stuck).toBeDefined();
+		expect(take(lockPath, 500)).toBeNull();
+		expect(degradationCount("bounded-pid-lock-wait-skipped")).toBe(0);
+		if (stuck) releaseGeneration(stuck);
+
+		// Now a live legacy-file holder (this process's own pid, so it reads
+		// as alive) blocks the pre-#3476 bridge file instead. Every retry
+		// takes and releases a fresh generation of its own.
+		fs.writeFileSync(lockPath, `${process.pid}:${Date.now()}:older`);
+		const before = backoff.slept;
+		expect(take(lockPath, 500)).toBeNull();
+		expect(backoff.slept - before).toBeGreaterThanOrEqual(500);
+		expect(degradationCount("generation-lock-legacy-held")).toBe(1);
+		// Still exactly one skip recorded — from the busy holder above, not a
+		// false match against the legacy-held churn.
+		expect(degradationCount("bounded-pid-lock-wait-skipped")).toBe(0);
+
+		fs.unlinkSync(lockPath);
 	});
 });
