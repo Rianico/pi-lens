@@ -1401,6 +1401,8 @@ export interface FormatPhaseResult {
 	 */
 	formatUnavailable: Array<{ formatter: string; reason: string }>;
 	fileContent: string | undefined;
+	/** #3574: the bytes `fileContent` was decoded from. */
+	fileBytes: Buffer | undefined;
 	/** #3481: `performance.now()` taken before `fileContent` was read. */
 	fileReadStamp: number;
 	/**
@@ -1503,8 +1505,10 @@ export async function runFormatPhase(
 
 	const fileReadStamp = performance.now();
 	const fileReadAtMs = Date.now();
+	let fileBytes: Buffer | undefined;
 	try {
-		fileContent = nodeFs.readFileSync(filePath, "utf-8");
+		fileBytes = nodeFs.readFileSync(filePath);
+		fileContent = fileBytes.toString("utf-8");
 	} catch {
 		fileContent = undefined;
 	}
@@ -1515,6 +1519,7 @@ export async function runFormatPhase(
 		formatFailures,
 		formatUnavailable,
 		fileContent,
+		fileBytes,
 		fileReadStamp,
 		...(abandoned === undefined ? {} : { abandoned }),
 		fileReadAtMs,
@@ -1623,8 +1628,14 @@ async function analysePipeline(
 	// mtimes against. A write that lands after this read is newer than the
 	// verdict, even when it lands while the dispatch below is still awaited.
 	let analysisReadAtMs = Date.now();
+	// #3574: the bytes `fileContent` was decoded from, kept in step with it. The
+	// inline blocker's size and hash baseline is taken from these: a decoded
+	// string re-encodes a non-UTF-8 byte as three, so a baseline built from it
+	// never matches the file and the blocker self-drifts every turn.
+	let fileBytes: Buffer | undefined;
 	try {
-		fileContent = nodeFs.readFileSync(filePath, "utf-8");
+		fileBytes = nodeFs.readFileSync(filePath);
+		fileContent = fileBytes.toString("utf-8");
 	} catch {
 		// File may not exist (e.g., deleted)
 	}
@@ -1663,6 +1674,7 @@ async function analysePipeline(
 		formattersUsed = formatResult.formattersUsed;
 		formatFailures = formatResult.formatFailures;
 		fileContent = formatResult.fileContent;
+		fileBytes = formatResult.fileBytes;
 		fileReadStamp = formatResult.fileReadStamp;
 		analysisReadAtMs = formatResult.fileReadAtMs;
 		if (formatChanged) {
@@ -1753,8 +1765,10 @@ async function analysePipeline(
 		fileReadStamp = performance.now();
 		analysisReadAtMs = Date.now();
 		try {
-			fileContent = nodeFs.readFileSync(filePath, "utf-8");
+			fileBytes = nodeFs.readFileSync(filePath);
+			fileContent = fileBytes.toString("utf-8");
 		} catch {
+			fileBytes = undefined;
 			fileContent = undefined;
 		}
 	}
@@ -1829,9 +1843,9 @@ async function analysePipeline(
 	// promise can yield to another writer. The blocker evidence below belongs to
 	// this analysis input, not to whatever happens to be on disk when the whole
 	// pipeline returns.
-	const inlineBlockerFileContent = fileContent
+	const inlineBlockerFileContent = fileBytes?.byteLength
 		? (() => {
-				const content = Buffer.from(fileContent, "utf8");
+				const content = fileBytes;
 				return content.byteLength <= 2 * 1024 * 1024
 					? {
 							size: content.byteLength,

@@ -2410,7 +2410,11 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	"tools/lens-diagnostic-mark.ts": 2,
 	// #2846/#2800: the folded LSP probe adds one awaited internal tool path;
 	// it remains bounded by the tool call lifecycle.
-	"tools/lens-diagnostics.ts": 14,
+	// #3573: `getProjectDiagnosticsSnapshotForFullMode` now awaits the fresh
+	// scan it used to return, to reconcile it before its rows reach the
+	// widget. The same promise `formatFullMode`'s `Promise.all` already
+	// awaited, under the same signal: no new wait.
+	"tools/lens-diagnostics.ts": 15,
 	// #2598 lowered both by one: `collectDiagnosticsForFile` and
 	// `openFileBestEffort` each dropped their `await lspService.openFile(…)`
 	// arm — the fallback for "a service shape without touchFile", which the
