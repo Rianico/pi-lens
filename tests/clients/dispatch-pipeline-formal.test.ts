@@ -662,7 +662,7 @@ describe("formal/dispatch-pipeline replays", () => {
 		});
 
 		it("A no-drop: in the same session, turn 6's clean edit replaces the turn-5 widget blocker", async () => {
-			const env = setupTestEnvironment("tla-widget-reload-nd-");
+			const env = setupTestEnvironment("tla-widget-reload-nodrop-");
 			try {
 				const filePath = path.join(env.tmpDir, "a.ts");
 				const runtime = new RuntimeCoordinator();
