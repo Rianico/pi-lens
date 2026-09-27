@@ -361,6 +361,142 @@ describe("renderMutationMarkdown", () => {
 
 		expect(markdown).toContain("3 of an unknown total of mutant(s)");
 	});
+
+	it("#3592 item 2: renders an unsampled, non-partial run as incomplete when it evaluated fewer mutants than the dry run measured", () => {
+		// Recurrence this backstops: if a FUTURE driver change dropped
+		// `meta.partial` on an interrupted-but-unsampled run, the report would
+		// otherwise carry a real (nonzero) `counts`/`score` and render as a
+		// normal, complete scored pass -- silently discarding however many
+		// mutants never ran. `measuredTotalMutants` (the dry run's own
+		// measured count for this candidate range set, persisted into every
+		// report by the driver's `baseMeta`) is the only other in-report
+		// signal that can catch that shape.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: false,
+				measuredTotalMutants: 9,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).toContain("Incomplete run");
+		expect(markdown).toContain("1 mutant(s) were evaluated");
+		expect(markdown).toContain("measured 9");
+		expect(markdown).not.toContain("No survivors.");
+		expect(markdown).not.toContain("100.00");
+	});
+
+	it("#3592 item 2: does NOT flag a sampled run whose evaluated count is legitimately below the measured total", () => {
+		// measuredTotalMutants counts the WHOLE candidate range set, not the
+		// sampled subset actually run -- a sampled, complete run evaluating
+		// fewer mutants than that total is the expected, healthy case.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: true,
+				rangesEvaluated: 2,
+				rangesTotal: 99,
+				measuredTotalMutants: 710,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).not.toContain("Incomplete run");
+		expect(markdown).toContain("100.00");
+	});
+
+	it("#3592 item 2: does NOT flag a genuinely complete, unsampled run whose evaluated count matches the measured total", () => {
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: false,
+				measuredTotalMutants: 1,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).not.toContain("Incomplete run");
+		expect(markdown).toContain("100.00");
+	});
+
+	it("#3592 item 2: does NOT flag a run with no measured total on record (measurement never ran, or its output could not be parsed)", () => {
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: false,
+				measuredTotalMutants: null,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).not.toContain("Incomplete run");
+		expect(markdown).toContain("100.00");
+	});
 });
 
 describe("renderStaleMarkdown (#3531 round 2 T6, round 3/4 R2-4 wording)", () => {

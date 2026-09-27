@@ -106,6 +106,37 @@ export function renderMutationMarkdown(report) {
 		return lines.join("\n");
 	}
 
+	// #3592 item 2: a second, independent backstop from round 4's R3-1 one
+	// above. That one catches a report with 0 total mutants and neither
+	// `zeroMutants` nor `partial` set. This one catches the OTHER shape a
+	// dropped `partial` flag can produce: a run that was cut short AFTER
+	// evaluating SOME mutants (so `total > 0`, the R3-1 backstop does not
+	// fire) but fewer than the dry run measured for this same, unsampled
+	// candidate set -- if a future driver change stopped setting
+	// `meta.partial` on that path, the report would otherwise render as a
+	// normal, complete scored pass with a silently short survivor table.
+	// Only meaningful when NOT sampled: a sampled run legitimately evaluates
+	// fewer mutants than `measuredTotalMutants` (which counts the WHOLE
+	// candidate range set, not just the sampled subset) by design, and no
+	// per-range count exists to compute an expected sampled total (#3592
+	// item 1).
+	const evaluatedMismatch =
+		!meta.partial &&
+		!zeroMutants &&
+		!meta.rangesSampled &&
+		total > 0 &&
+		typeof meta.measuredTotalMutants === "number" &&
+		meta.measuredTotalMutants !== total;
+
+	if (evaluatedMismatch) {
+		lines.push(
+			`**Incomplete run.** This is not a clean pass -- ${total} mutant(s) were evaluated but the dry run measured ${meta.measuredTotalMutants}, and the report carries no partial explanation.`,
+			"",
+		);
+		lines.push(metaTable(meta));
+		return lines.join("\n");
+	}
+
 	const survivors = Object.entries(report.files ?? {}).flatMap(
 		([fileName, file]) =>
 			(file.mutants ?? [])

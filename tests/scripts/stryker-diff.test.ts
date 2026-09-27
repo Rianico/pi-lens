@@ -300,6 +300,26 @@ describe("stryker diff wall-clock budget", () => {
 		expect(driver).toContain("describeStrykerFailure");
 	});
 
+	it("#3592 item 2: persists the dry-run measurement's total into baseMeta, so every report carries it", () => {
+		// Recurrence this guards against: baseMeta is the ONE function every
+		// writeReport call goes through (see the driver's own writeReport
+		// docstring). Reading `costEstimate` there rather than at each
+		// individual call site is what makes "every report" true without
+		// repeating the field at 8 different writeReport call sites -- a
+		// per-call-site version could drift (a future report added without
+		// it). This is a top-level script this suite cannot import (see the
+		// stated exception above); the render-side comparison this field
+		// feeds is fully mutation-proved as a pure function in
+		// mutation-report-render.test.ts.
+		expect(driver).toContain(
+			"measuredTotalMutants: costEstimate?.totalMutants ?? null,",
+		);
+		// It must be read inside baseMeta itself, not duplicated at each call
+		// site -- the field name appears exactly once as an object-literal key.
+		const occurrences = driver.split("measuredTotalMutants:").length - 1;
+		expect(occurrences).toBe(1);
+	});
+
 	it("wires the resample loop through planResample and decideMutationOutcome, not a hand-rolled duplicate (#3531 round 3 R2-1/R2-2)", () => {
 		// Recurrence: planResample and decideMutationOutcome are fully
 		// mutation-proved as pure functions above (every branch reds under a

@@ -196,6 +196,15 @@ function baseMeta(extra) {
 		maxFiles,
 		maxRanges,
 		partial: null,
+		// #3592 item 2: the dry-run measurement's total (set once the
+		// `--dryRunOnly` measurement parses successfully -- see `costEstimate`
+		// above), carried into EVERY report through this one function so the
+		// renderer has something to cross-check a completed run's evaluated
+		// count against, independent of whether `partial`/`zeroMutants` were
+		// correctly set. null before the measurement runs (the early-exit
+		// zero-mutant paths above) or when Stryker's dry-run output could not
+		// be parsed (`parseDryRunCost` returned null).
+		measuredTotalMutants: costEstimate?.totalMutants ?? null,
 		...extra,
 	};
 }
