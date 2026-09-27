@@ -702,6 +702,23 @@ function parseResource(change: Record<string, unknown>): WorkspaceEditOp {
 	throw new Error(`unsupported workspace resource operation: ${String(kind)}`);
 }
 
+/** #3541: the on-disk path of every file a planned edit writes. */
+function plannedDiskPaths(planned: WorkspaceEditOp[]): string[] {
+	return planned.flatMap((op) =>
+		op.kind === "rename"
+			? [uriToDiskPath(op.oldUri), uriToDiskPath(op.newUri)]
+			: [uriToDiskPath(op.uri)],
+	);
+}
+
+/** #3541: the on-disk path of every file `edit` writes (text, create, both rename ends, delete). */
+export function workspaceEditDiskPaths(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): string[] {
+	return plannedDiskPaths(planWorkspaceEdit(edit));
+}
+
 function planWorkspaceEdit(
 	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
 	trackOrigins = false,
@@ -1431,11 +1448,7 @@ export async function applyWorkspaceEdit(
 		// #3541: the read-modify-write of every path runs inside pi's mutation
 		// queue, so an agent edit of one of them cannot land between this
 		// edit's read and its write (and be erased by it).
-		const queuePaths = planned.flatMap((op) =>
-			op.kind === "rename"
-				? [uriToDiskPath(op.oldUri), uriToDiskPath(op.newUri)]
-				: [uriToDiskPath(op.uri)],
-		);
+		const queuePaths = plannedDiskPaths(planned);
 		const queueStart = Date.now();
 		await withHostFileMutationQueues(queuePaths, async () => {
 			logLatency({

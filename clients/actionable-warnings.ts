@@ -12,6 +12,7 @@ import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
 import {
 	applyWorkspaceEdit,
 	StaleWorkspaceEditContentError,
+	workspaceEditDiskPaths,
 } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
@@ -2110,16 +2111,29 @@ export async function applyConservativeActionableWarningFixes(args: {
 					continue;
 				}
 				const edit = selected.edit as Parameters<typeof applyWorkspaceEdit>[0];
+				// #3541: the expected content below covers only the file this fix
+				// read; an edit that also writes another file would apply there at
+				// the server's positions unchecked, so it is not a conservative fix.
+				const target = fs.realpathSync.native(warning.filePath);
+				const writesOtherFile = workspaceEditDiskPaths(edit).some(
+					(diskPath) => {
+						try {
+							return fs.realpathSync.native(diskPath) !== target;
+						} catch {
+							// Not on disk yet (a create): not the file this fix read.
+							return true;
+						}
+					},
+				);
+				if (writesOtherFile) {
+					summary.skipped.push({ id: warning.id, reason: "multi_file_edit" });
+					continue;
+				}
 				const applied = await applyWorkspaceEdit(edit, args.cwd, {
 					// #3541: the code action's positions are the server's view of
-					// `content`; inside pi's queue the edit applies only to it.
-					...(content === undefined
-						? {}
-						: {
-								expectedContent: new Map([
-									[fs.realpathSync(warning.filePath), content],
-								]),
-							}),
+					// `content`; inside pi's queue the edit applies only to it. A
+					// file absent at that read (`content` undefined) expected no bytes.
+					expectedContent: new Map([[target, content ?? ""]]),
 					...(args.mutationContext
 						? {
 								mutationContext: {

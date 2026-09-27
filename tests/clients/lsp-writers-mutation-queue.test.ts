@@ -498,6 +498,88 @@ describe("#3541: the actionable fix applies only to the bytes its code action wa
 });
 
 /**
+ * #3541 review round 3 (R2): the fix's expected content covers only the
+ * warning's own file, the one it read. A preferred quick fix whose edit also
+ * writes another file would apply there at the server's positions unchecked,
+ * so it is skipped before any write.
+ */
+describe("#3541: the actionable fix writes only the warning's own file", () => {
+	it("a quick fix whose edit also changes another file is skipped as multi_file_edit, so an agent edit to that file survives", async () => {
+		const other = path.join(env.tmpDir, "b.ts");
+		fs.writeFileSync(other, "value = 2;\n");
+		const asked = gate();
+		const answer = gate();
+		useActionableFix(async () => {
+			asked.open();
+			await answer.p;
+			return [
+				{
+					...fixIt(),
+					edit: {
+						changes: {
+							...valueEdit(filePath).changes,
+							...valueEdit(other).changes,
+						},
+					},
+				},
+			];
+		});
+		const fix = applyConservativeActionableWarningFixes({
+			cwd: env.tmpDir,
+			report: actionableReport(),
+		});
+		await asked.p;
+		await withFileMutationQueue(other, async () => {
+			fs.writeFileSync(
+				other,
+				`export const AGENT = 2;\n${fs.readFileSync(other, "utf8")}`,
+			);
+		});
+		answer.open();
+		const summary = await fix;
+		expect(fs.readFileSync(other, "utf8")).toBe(
+			"export const AGENT = 2;\nvalue = 2;\n",
+		);
+		expect(fs.readFileSync(filePath, "utf8")).toBe("value = 1;\n");
+		expect(summary).toMatchObject({
+			applied: 0,
+			skipped: [{ id: "eslint:fix", reason: "multi_file_edit" }],
+		});
+	});
+
+	it("a quick fix whose edit also creates a file is skipped as multi_file_edit", async () => {
+		const created = path.join(env.tmpDir, "created.ts");
+		useActionableFix(async () => [
+			{
+				...fixIt(),
+				edit: {
+					documentChanges: [
+						{
+							textDocument: {
+								uri: pathToFileURL(filePath).href,
+								version: null,
+							},
+							edits: valueEdit().changes[pathToFileURL(filePath).href],
+						},
+						{ kind: "create", uri: pathToFileURL(created).href },
+					],
+				},
+			},
+		]);
+		const summary = await applyConservativeActionableWarningFixes({
+			cwd: env.tmpDir,
+			report: actionableReport(),
+		});
+		expect(fs.existsSync(created)).toBe(false);
+		expect(fs.readFileSync(filePath, "utf8")).toBe("value = 1;\n");
+		expect(summary).toMatchObject({
+			applied: 0,
+			skipped: [{ id: "eslint:fix", reason: "multi_file_edit" }],
+		});
+	});
+});
+
+/**
  * #3541 review round 2 (F2): the queue wait is a new blocking point on every
  * LSP edit, so it leaves a latency row a live monitor can read.
  */
