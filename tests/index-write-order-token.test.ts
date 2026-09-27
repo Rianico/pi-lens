@@ -178,5 +178,15 @@ describe("#3540: index.ts reserves diagnostics-tool tokens turn first", () => {
 				]),
 			).toBe(false);
 		});
+
+		it("after /reload, a turn-2 clean clears the blocker session 2 recorded in turn 1 under a higher write index", () => {
+			for (let turn = 0; turn < 5; turn += 1) runtime.beginTurn();
+			runtime.resetForSession();
+			runtime.beginTurn();
+			runtime.recordInlineBlockers(file, "STOP turn 1", 3, ["lsp"]);
+			runtime.beginTurn();
+			expect(runtime.clearInlineBlockers(file, 1)).toBe(true);
+			expect(runtime.getInlineBlockersSnapshot()).toEqual([]);
+		});
 	});
 });

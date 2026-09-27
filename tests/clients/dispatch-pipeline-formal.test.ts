@@ -1254,15 +1254,23 @@ describe("formal/dispatch-pipeline replays", () => {
 		 * #3559: edit A's fixer is parked in its availability probe; edit B
 		 * records a blocker at turn 1, w=2; the turn ends; A's fixer then fixes
 		 * B's bytes and re-tokens. `fixed` is the dispatch verdict on the fixed
-		 * bytes (v3).
+		 * bytes (v3). `afterReload` (#3540 r2) runs the replay in a second
+		 * session whose turn restarted while the order turn did not.
 		 */
-		async function reTokenAcrossTurn(fixed: "blocker" | "clean") {
+		async function reTokenAcrossTurn(
+			fixed: "blocker" | "clean",
+			afterReload = false,
+		) {
 			const env = setupTestEnvironment("tla-fixer-token-turn-");
 			try {
 				writeBiomeAgreement(env.tmpDir);
 				const filePath = path.join(env.tmpDir, "a.ts");
 				const runtime = new RuntimeCoordinator();
 				runtime.projectRoot = env.tmpDir;
+				if (afterReload) {
+					for (let turn = 0; turn < 3; turn += 1) runtime.beginTurn();
+					runtime.resetForSession();
+				}
 				runtime.beginTurn();
 				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
 					const bytes = fs.readFileSync(fp as string, "utf8");
@@ -1324,6 +1332,13 @@ describe("formal/dispatch-pipeline replays", () => {
 
 		it("FixerQueueNoReToken across turns (#3559): a pipeline that re-tokens after its turn ended records its fixed-bytes verdict under the new turn", async () => {
 			expect(await reTokenAcrossTurn("blocker")).toEqual({
+				inline: [{ writeIndex: 1, blocker: "BLOCKER-FROM-v3" }],
+				widget: ["BLOCKER-FROM-v3"],
+			});
+		});
+
+		it("FixerQueueNoReToken across turns (#3559, #3540 r2): after /reload, the re-token orders by the order turn, not the session's turn", async () => {
+			expect(await reTokenAcrossTurn("blocker", true)).toEqual({
 				inline: [{ writeIndex: 1, blocker: "BLOCKER-FROM-v3" }],
 				widget: ["BLOCKER-FROM-v3"],
 			});

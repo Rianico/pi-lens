@@ -443,6 +443,44 @@ describe("Pipeline", () => {
 		);
 	});
 
+	it("hands the cascade the dispatch's order turn beside its session turn (#3540 r2)", async () => {
+		// The cascade's widget reconcile orders by the order turn, which a
+		// session reset never restarts; `turnSeq` (the session's turn) keeps
+		// scoping its caches. If this hop drops `orderTurn`, the reconcile is
+		// unordered in production.
+		const filePath = createTempFile(tmpDir, "cascade-order-turn.ts", "x");
+		vi.mocked(dispatchLintWithResult).mockResolvedValue({
+			diagnostics: [],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		});
+
+		await runPipeline(
+			createMockContext(filePath, {
+				telemetry: {
+					model: "m",
+					sessionId: "s",
+					turnIndex: 1,
+					orderTurn: 6,
+					writeIndex: 2,
+				},
+			}),
+			createMockDeps(),
+		);
+
+		expect(computeCascadeForFile).toHaveBeenCalledWith(
+			filePath,
+			tmpDir,
+			expect.objectContaining({ turnSeq: 1, orderTurn: 6, writeSeq: 2 }),
+		);
+	});
+
 	describe("Format phase", () => {
 		it("defers format by default", async () => {
 			const filePath = createTempFile(tmpDir, "unformatted.ts", "const x=1");
