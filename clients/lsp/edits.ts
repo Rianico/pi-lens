@@ -1189,9 +1189,10 @@ async function preflightWorkspaceEdit(
 		if (!physicalPath)
 			throw new Error(`text edit target does not exist: ${filePath}`);
 		const content = await fs.readFile(physicalPath, "utf-8");
-		const expected =
-			options.expectedContent &&
-			options.expectedContent.get(await fs.realpath(physicalPath));
+		// `?.` skips the realpath when no caller passed expected content.
+		const expected = options.expectedContent?.get(
+			await fs.realpath(physicalPath),
+		);
 		if (expected !== undefined && expected !== content) {
 			incrementDegradationCount({
 				kind: "lsp-edit-stale-content",
