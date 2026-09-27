@@ -102,7 +102,7 @@ describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
 			const result = execFileSync(
 				process.execPath,
 				[driverPath, "--base", "HEAD"],
-				{ cwd: fixtureRepo, encoding: "utf8" },
+				{ cwd: fixtureRepo, encoding: "utf8", timeout: 30_000 },
 			);
 
 			expect(result).toContain("no mutants evaluated");
