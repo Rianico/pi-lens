@@ -426,14 +426,13 @@ function readChangeLogMaxSeq(logPath: string): number {
 		const size = fs.fstatSync(fd).size;
 		// #3594: an UNSEEDED cursor (nothing of this file accounted for yet —
 		// the first allocation of a session whose `session_start` read has not
-		// landed, #1162) is the one case a bounded tail scan can replace
-		// entirely: the log's monotonic-seq invariant (see `tailMaxSeq`'s own
-		// doc comment) makes the last line's seq exactly what a full forward
-		// read-and-fold would have produced as the max, without reading or
-		// parsing every line before it. A SEEDED cursor (every later
-		// allocation this session) already reads only the bytes appended since
-		// its own last read, which is cheap regardless of file size — the
-		// branch below is untouched for that case.
+		// landed, #1162) is the one case a bounded tail scan can replace: see
+		// `tailMaxSeq`'s own doc comment for what it trusts and why, and when
+		// it instead falls back here to the full forward read (`undefined`).
+		// A SEEDED cursor (every later allocation this session) already reads
+		// only the bytes appended since its own last read, which is cheap
+		// regardless of file size — the branch below is untouched for that
+		// case.
 		if (cursor.bytes === 0 && size > 0) {
 			const tail = tailMaxSeq(fd, size);
 			if (tail !== undefined) {
