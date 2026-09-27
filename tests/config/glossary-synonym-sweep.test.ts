@@ -1194,7 +1194,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/client.ts": 2,
 		// #3506: the re-token rewrites `ctx.telemetry` (22 -> 26); the field
 		// is the context's own name, so it is routed, not renamed, here.
-		"clients/pipeline.ts": 26,
+		// #3540 r2: 26 -> 27, the cascade reads `ctx.telemetry?.orderTurn`
+		// beside the `turnSeq`/`writeSeq` it already reads from the same field.
+		"clients/pipeline.ts": 27,
 		"clients/runtime-tool-result.ts": 1,
 	},
 	version: {
