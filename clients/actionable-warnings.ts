@@ -2117,7 +2117,7 @@ export async function applyConservativeActionableWarningFixes(args: {
 						? {}
 						: {
 								expectedContent: new Map([
-									[normalizeMapKey(warning.filePath), content],
+									[fs.realpathSync(warning.filePath), content],
 								]),
 							}),
 					...(args.mutationContext

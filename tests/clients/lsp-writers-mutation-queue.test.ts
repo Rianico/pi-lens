@@ -173,7 +173,7 @@ function useActionableFix(codeAction: () => Promise<unknown[]>) {
 }
 
 /** One autofix-eligible warning on line 1 of F. */
-function actionableReport(): ActionableWarningsReport {
+function actionableReport(reported = filePath): ActionableWarningsReport {
 	return {
 		generatedAt: new Date().toISOString(),
 		scope: "turn_delta",
@@ -184,12 +184,12 @@ function actionableReport(): ActionableWarningsReport {
 		includeLspCodeActions: true,
 		files: [
 			{
-				filePath,
+				filePath: reported,
 				displayPath: "a.ts",
 				warnings: [
 					{
 						id: "eslint:fix",
-						filePath,
+						filePath: reported,
 						displayPath: "a.ts",
 						line: 1,
 						column: 1,
@@ -439,39 +439,54 @@ describe("#3541: the actionable fix applies only to the bytes its code action wa
 			(group) => group.kind === "lsp-edit-stale-content",
 		);
 
-	it("an agent edit made while the code action is computed is not rewritten at the action's stale position; the fix is skipped as stale_content", async () => {
-		const asked = gate();
-		const answer = gate();
-		useActionableFix(async () => {
-			asked.open();
-			await answer.p;
-			return [fixIt()];
-		});
-		const fix = applyConservativeActionableWarningFixes({
-			cwd: env.tmpDir,
-			report: actionableReport(),
-		});
-		await asked.p;
-		// The agent's edit: a line prepended through pi's queue, so line 1 is
-		// no longer the line the code action was computed for.
-		await withFileMutationQueue(filePath, async () => {
-			fs.writeFileSync(
-				filePath,
-				`export const AGENT = 2;\n${fs.readFileSync(filePath, "utf8")}`,
+	// The report may spell F through a symlinked directory; the edit's URI
+	// names the real path. Both must key the same expected content.
+	it.each([
+		["as the edit does", () => filePath],
+		[
+			"through a symlinked directory",
+			() => {
+				const link = path.join(env.tmpDir, "linked");
+				fs.symlinkSync(env.tmpDir, link, "dir");
+				return path.join(link, "a.ts");
+			},
+		],
+	])(
+		"an agent edit made while the code action is computed is not rewritten at the action's stale position; the fix is skipped as stale_content (report spells F %s)",
+		async (_spelling, reportedPath) => {
+			const asked = gate();
+			const answer = gate();
+			useActionableFix(async () => {
+				asked.open();
+				await answer.p;
+				return [fixIt()];
+			});
+			const fix = applyConservativeActionableWarningFixes({
+				cwd: env.tmpDir,
+				report: actionableReport(reportedPath()),
+			});
+			await asked.p;
+			// The agent's edit: a line prepended through pi's queue, so line 1 is
+			// no longer the line the code action was computed for.
+			await withFileMutationQueue(filePath, async () => {
+				fs.writeFileSync(
+					filePath,
+					`export const AGENT = 2;\n${fs.readFileSync(filePath, "utf8")}`,
+				);
+			});
+			answer.open();
+			const summary = await fix;
+			expect(fs.readFileSync(filePath, "utf8")).toBe(
+				"export const AGENT = 2;\nvalue = 1;\n",
 			);
-		});
-		answer.open();
-		const summary = await fix;
-		expect(fs.readFileSync(filePath, "utf8")).toBe(
-			"export const AGENT = 2;\nvalue = 1;\n",
-		);
-		expect(summary).toMatchObject({
-			applied: 0,
-			changedFiles: [],
-			skipped: [{ id: "eslint:fix", reason: "stale_content" }],
-		});
-		expect(staleRows()).toEqual([expect.objectContaining({ count: 1 })]);
-	});
+			expect(summary).toMatchObject({
+				applied: 0,
+				changedFiles: [],
+				skipped: [{ id: "eslint:fix", reason: "stale_content" }],
+			});
+			expect(staleRows()).toEqual([expect.objectContaining({ count: 1 })]);
+		},
+	);
 
 	it("no-drop: with no edit in between, the fix applies and records no stale content", async () => {
 		useActionableFix(async () => [fixIt()]);

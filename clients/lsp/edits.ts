@@ -106,7 +106,9 @@ export interface ApplyWorkspaceEditOptions {
 	observe?: boolean;
 	/**
 	 * #3541: the bytes a caller's edit positions were computed from, keyed by
-	 * normalized path. Checked against the disk inside pi's mutation queue; a
+	 * the file's realpath (a caller and the edit's URI can spell one file
+	 * differently, and `normalizeMapKey` keeps a symlinked directory's
+	 * spelling). Checked against the disk inside pi's mutation queue; a
 	 * mismatch refuses the whole edit with {@link StaleWorkspaceEditContentError}.
 	 */
 	expectedContent?: ReadonlyMap<string, string>;
@@ -1187,7 +1189,9 @@ async function preflightWorkspaceEdit(
 		if (!physicalPath)
 			throw new Error(`text edit target does not exist: ${filePath}`);
 		const content = await fs.readFile(physicalPath, "utf-8");
-		const expected = options.expectedContent?.get(normalizeMapKey(filePath));
+		const expected =
+			options.expectedContent &&
+			options.expectedContent.get(await fs.realpath(physicalPath));
 		if (expected !== undefined && expected !== content) {
 			incrementDegradationCount({
 				kind: "lsp-edit-stale-content",
