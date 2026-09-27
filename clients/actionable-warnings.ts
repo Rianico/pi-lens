@@ -9,7 +9,10 @@ import {
 	stableFindingId,
 } from "./finding-identity.js";
 import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
-import { applyWorkspaceEdit } from "./lsp/edits.js";
+import {
+	applyWorkspaceEdit,
+	StaleWorkspaceEditContentError,
+} from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
 import {
@@ -2107,22 +2110,33 @@ export async function applyConservativeActionableWarningFixes(args: {
 					continue;
 				}
 				const edit = selected.edit as Parameters<typeof applyWorkspaceEdit>[0];
-				const applied = await applyWorkspaceEdit(
-					edit,
-					args.cwd,
-					args.mutationContext
+				const applied = await applyWorkspaceEdit(edit, args.cwd, {
+					// #3541: the code action's positions are the server's view of
+					// `content`; inside pi's queue the edit applies only to it.
+					...(content === undefined
+						? {}
+						: {
+								expectedContent: new Map([
+									[normalizeMapKey(warning.filePath), content],
+								]),
+							}),
+					...(args.mutationContext
 						? {
 								mutationContext: {
 									...args.mutationContext,
 									emitSummary: false,
 								},
 							}
-						: undefined,
-				);
+						: {}),
+				});
 				appliedResults.push(applied);
 				for (const changedFile of applied.files) changedFiles.add(changedFile);
 				summary.applied++;
 			} catch (err) {
+				if (err instanceof StaleWorkspaceEditContentError) {
+					summary.skipped.push({ id: warning.id, reason: "stale_content" });
+					continue;
+				}
 				failedCount++;
 				const partial = (
 					err as {

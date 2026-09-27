@@ -39,6 +39,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 const lsp = vi.hoisted(() => ({ service: undefined as unknown }));
+const { logLatency } = vi.hoisted(() => ({ logLatency: vi.fn() }));
+vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../clients/latency-logger.js")>()),
+	logLatency,
+}));
 vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
 	getLSPService: () => lsp.service,
@@ -48,6 +53,10 @@ import {
 	applyConservativeActionableWarningFixes,
 	type ActionableWarningsReport,
 } from "../../clients/actionable-warnings.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { setHostFileMutationQueueLoader } from "../../clients/file-mutation-queue.js";
 import { setupIncomingHandlers } from "../../clients/lsp/client.js";
 import { applyWorkspaceEdit } from "../../clients/lsp/edits.js";
@@ -133,7 +142,81 @@ async function assertAgentEditSurvives(write: () => Promise<unknown>) {
 	);
 }
 
+/** The quick fix the actionable-warning report offers for line 1. */
+const fixIt = () => ({
+	title: "Fix it",
+	kind: "quickfix",
+	isPreferred: true,
+	edit: valueEdit(),
+});
+
+/**
+ * The agent_end actionable fix's collaborators: eslint agreement evidence
+ * (tool-agreement.ts) and an LSP service whose code action is `codeAction`.
+ */
+function useActionableFix(codeAction: () => Promise<unknown[]>) {
+	fs.writeFileSync(
+		path.join(env.tmpDir, "package.json"),
+		JSON.stringify({ devDependencies: { eslint: "^9.0.0" } }),
+	);
+	fs.writeFileSync(
+		path.join(env.tmpDir, "package-lock.json"),
+		JSON.stringify({
+			packages: { "node_modules/eslint": { version: "9.0.0" } },
+		}),
+	);
+	lsp.service = makeLspServiceDouble({
+		supportsLSP: () => true,
+		openFile: async () => undefined,
+		codeAction,
+	});
+}
+
+/** One autofix-eligible warning on line 1 of F. */
+function actionableReport(): ActionableWarningsReport {
+	return {
+		generatedAt: new Date().toISOString(),
+		scope: "turn_delta",
+		sessionId: "lsp-writer-queue",
+		turnIndex: 1,
+		projectSeqEnd: 1,
+		deltaOnly: true,
+		includeLspCodeActions: true,
+		files: [
+			{
+				filePath,
+				displayPath: "a.ts",
+				warnings: [
+					{
+						id: "eslint:fix",
+						filePath,
+						displayPath: "a.ts",
+						line: 1,
+						column: 1,
+						severity: "warning",
+						tool: "eslint",
+						message: "fixable warning",
+						actions: [
+							{
+								title: "Fix it",
+								hasEdit: true,
+								hasCommand: false,
+								autoFixEligible: true,
+							},
+						],
+						suppressed: false,
+						origin: "lsp",
+					},
+				],
+			},
+		],
+		summary: {} as ActionableWarningsReport["summary"],
+	};
+}
+
 beforeEach(() => {
+	resetDegradationLedger();
+	logLatency.mockClear();
 	env = setupTestEnvironment("pi-lens-lsp-writer-queue-");
 	filePath = path.join(env.tmpDir, "a.ts");
 	fs.writeFileSync(filePath, "value = 1;\n");
@@ -151,71 +234,11 @@ afterEach(() => {
 
 describe("#3541: each LSP writer applies its edit inside pi's mutation queue", () => {
 	it("the agent_end actionable-warning fix does not erase an agent edit made while it applies", async () => {
-		// Project evidence for the eslint tool agreement (tool-agreement.ts).
-		fs.writeFileSync(
-			path.join(env.tmpDir, "package.json"),
-			JSON.stringify({ devDependencies: { eslint: "^9.0.0" } }),
-		);
-		fs.writeFileSync(
-			path.join(env.tmpDir, "package-lock.json"),
-			JSON.stringify({
-				packages: { "node_modules/eslint": { version: "9.0.0" } },
-			}),
-		);
-		lsp.service = makeLspServiceDouble({
-			supportsLSP: () => true,
-			openFile: async () => undefined,
-			codeAction: async () => [
-				{
-					title: "Fix it",
-					kind: "quickfix",
-					isPreferred: true,
-					edit: valueEdit(),
-				},
-			],
-		});
-		const report: ActionableWarningsReport = {
-			generatedAt: new Date().toISOString(),
-			scope: "turn_delta",
-			sessionId: "lsp-writer-queue",
-			turnIndex: 1,
-			projectSeqEnd: 1,
-			deltaOnly: true,
-			includeLspCodeActions: true,
-			files: [
-				{
-					filePath,
-					displayPath: "a.ts",
-					warnings: [
-						{
-							id: "eslint:fix",
-							filePath,
-							displayPath: "a.ts",
-							line: 1,
-							column: 1,
-							severity: "warning",
-							tool: "eslint",
-							message: "fixable warning",
-							actions: [
-								{
-									title: "Fix it",
-									hasEdit: true,
-									hasCommand: false,
-									autoFixEligible: true,
-								},
-							],
-							suppressed: false,
-							origin: "lsp",
-						},
-					],
-				},
-			],
-			summary: {} as ActionableWarningsReport["summary"],
-		};
+		useActionableFix(async () => [fixIt()]);
 		await assertAgentEditSurvives(async () => {
 			const summary = await applyConservativeActionableWarningFixes({
 				cwd: env.tmpDir,
-				report,
+				report: actionableReport(),
 			});
 			expect(summary.applied).toBe(1);
 		});
@@ -401,5 +424,106 @@ describe("#3541: applyWorkspaceEdit enters every path's queue", () => {
 			),
 		]);
 		expect(settled).toHaveLength(1);
+	});
+});
+
+/**
+ * #3541 review round 2 (F1): the actionable fix reads F and asks the server
+ * for a code action before it enters pi's queue. The action's positions are
+ * the server's view of those bytes, so inside the queue the edit must still
+ * meet them on disk, or it is rewritten into whatever an agent edit put there.
+ */
+describe("#3541: the actionable fix applies only to the bytes its code action was computed from", () => {
+	const staleRows = () =>
+		getDegradationSummary().filter(
+			(group) => group.kind === "lsp-edit-stale-content",
+		);
+
+	it("an agent edit made while the code action is computed is not rewritten at the action's stale position; the fix is skipped as stale_content", async () => {
+		const asked = gate();
+		const answer = gate();
+		useActionableFix(async () => {
+			asked.open();
+			await answer.p;
+			return [fixIt()];
+		});
+		const fix = applyConservativeActionableWarningFixes({
+			cwd: env.tmpDir,
+			report: actionableReport(),
+		});
+		await asked.p;
+		// The agent's edit: a line prepended through pi's queue, so line 1 is
+		// no longer the line the code action was computed for.
+		await withFileMutationQueue(filePath, async () => {
+			fs.writeFileSync(
+				filePath,
+				`export const AGENT = 2;\n${fs.readFileSync(filePath, "utf8")}`,
+			);
+		});
+		answer.open();
+		const summary = await fix;
+		expect(fs.readFileSync(filePath, "utf8")).toBe(
+			"export const AGENT = 2;\nvalue = 1;\n",
+		);
+		expect(summary).toMatchObject({
+			applied: 0,
+			changedFiles: [],
+			skipped: [{ id: "eslint:fix", reason: "stale_content" }],
+		});
+		expect(staleRows()).toEqual([expect.objectContaining({ count: 1 })]);
+	});
+
+	it("no-drop: with no edit in between, the fix applies and records no stale content", async () => {
+		useActionableFix(async () => [fixIt()]);
+		const summary = await applyConservativeActionableWarningFixes({
+			cwd: env.tmpDir,
+			report: actionableReport(),
+		});
+		expect(summary).toMatchObject({ applied: 1, skipped: [] });
+		expect(fs.readFileSync(filePath, "utf8")).toBe("const = 1;\n");
+		expect(staleRows()).toEqual([]);
+	});
+});
+
+/**
+ * #3541 review round 2 (F2): the queue wait is a new blocking point on every
+ * LSP edit, so it leaves a latency row a live monitor can read.
+ */
+describe("#3541: applyWorkspaceEdit records its wait for pi's queue", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("an edit queued behind an agent edit records the wait as lsp_edit_queue_wait once it has entered", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(1_000_000);
+		const key = fs.realpathSync(filePath);
+		const queued = gate();
+		setHostFileMutationQueueLoader(async () => ({
+			withFileMutationQueue: <T>(k: string, fn: () => Promise<T>) => {
+				if (k === key) queued.open();
+				return withFileMutationQueue(k, fn);
+			},
+		}));
+		const agentDone = gate();
+		const agent = withFileMutationQueue(filePath, () => agentDone.p);
+		const edit = applyWorkspaceEdit(valueEdit(), env.tmpDir);
+		await queued.p;
+		const waitRows = () =>
+			logLatency.mock.calls
+				.map(([row]) => row as { phase?: string })
+				.filter((row) => row.phase === "lsp_edit_queue_wait");
+		expect(waitRows()).toEqual([]);
+		vi.setSystemTime(1_000_250);
+		agentDone.open();
+		await agent;
+		await edit;
+		expect(waitRows()).toEqual([
+			expect.objectContaining({
+				type: "phase",
+				durationMs: 250,
+				metadata: { paths: 1 },
+			}),
+		]);
 	});
 });

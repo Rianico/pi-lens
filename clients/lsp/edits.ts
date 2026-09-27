@@ -17,6 +17,8 @@ import {
 } from "./position-encoding.js";
 import { recordLspMutation, type LspMutationContext } from "../lsp-mutation.js";
 import { withHostFileMutationQueues } from "../file-mutation-queue.js";
+import { incrementDegradationCount } from "../degradation-ledger.js";
+import { logLatency } from "../latency-logger.js";
 import {
 	detectLineEnding,
 	normalizeToLF,
@@ -102,7 +104,19 @@ export interface ApplyWorkspaceEditOptions {
 	mutationContext?: LspMutationContext;
 	/** Rename flows use one outer bookkeeping record after their resource rename. */
 	observe?: boolean;
+	/**
+	 * #3541: the bytes a caller's edit positions were computed from, keyed by
+	 * normalized path. Checked against the disk inside pi's mutation queue; a
+	 * mismatch refuses the whole edit with {@link StaleWorkspaceEditContentError}.
+	 */
+	expectedContent?: ReadonlyMap<string, string>;
 }
+
+/**
+ * #3541: a file changed between the read an edit was computed from and the
+ * edit's turn in pi's mutation queue. Thrown by the preflight, before any write.
+ */
+export class StaleWorkspaceEditContentError extends Error {}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1173,6 +1187,18 @@ async function preflightWorkspaceEdit(
 		if (!physicalPath)
 			throw new Error(`text edit target does not exist: ${filePath}`);
 		const content = await fs.readFile(physicalPath, "utf-8");
+		const expected = options.expectedContent?.get(normalizeMapKey(filePath));
+		if (expected !== undefined && expected !== content) {
+			incrementDegradationCount({
+				kind: "lsp-edit-stale-content",
+				subject: filePath,
+				reason:
+					"the file changed after the edit was computed from it; the edit was not applied",
+			});
+			throw new StaleWorkspaceEditContentError(
+				`stale text document content for ${filePath}: it changed after the edit was computed`,
+			);
+		}
 		state.content = content;
 		return content;
 	};
@@ -1405,7 +1431,15 @@ export async function applyWorkspaceEdit(
 				? [uriToDiskPath(op.oldUri), uriToDiskPath(op.newUri)]
 				: [uriToDiskPath(op.uri)],
 		);
+		const queueStart = Date.now();
 		await withHostFileMutationQueues(queuePaths, async () => {
+			logLatency({
+				type: "phase",
+				filePath: cwd,
+				phase: "lsp_edit_queue_wait",
+				durationMs: Date.now() - queueStart,
+				metadata: { paths: queuePaths.length },
+			});
 			prepared = await preflightWorkspaceEdit(planned, cwd, options);
 			for (const op of planned) {
 				const size = operationSize(op);

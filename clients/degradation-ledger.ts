@@ -527,6 +527,14 @@ export type DegradationKind =
 	 */
 	| "lsp-document-drift"
 	| "lsp-document-send-order"
+	/**
+	 * #3541: an LSP workspace edit computed from a read of a file met other
+	 * bytes on disk when its turn in pi's mutation queue came (an agent edit
+	 * landed in between), so it was refused before any write rather than
+	 * applied at stale positions. Subject is the file path;
+	 * `incrementDegradationCount` keeps one bounded entry per file.
+	 */
+	| "lsp-edit-stale-content"
 	| "lsp-liveness-probe-unsupported"
 	/**
 	 * A pi-lens `tool_call` handler threw. pi's `emitToolCall` has no
