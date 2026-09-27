@@ -4,6 +4,13 @@ on:
   pull_request:
     branches: [master]
 
+# round 2 T6: without this, pushing twice to the same PR queues two mutation
+# runs; the older one's report can still land (and its comment update fire)
+# AFTER the newer one's, showing a stale head's result as current.
+concurrency:
+  group: mutation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions: {}
 
 jobs:
@@ -36,10 +43,93 @@ jobs:
       # "no mutants evaluated" report never printed. The 30-minute margin covers
       # npm ci, npm run build, Stryker's in-place sandbox restore on SIGTERM, and
       # the report upload. tests/scripts/stryker-diff.test.ts pins the relation.
-      - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6
+      #
+      # #3531 rescope: the driver also mutates clients/**/*.ts, tools/**/*.ts,
+      # mcp/**/*.ts and index.ts (through their compiled .js -- see
+      # scripts/stryker-diff.mjs), building its own tsconfig.mutation.json
+      # source maps internally; no separate build step is needed here for that.
+      #
+      # --head-sha (round 2 T6): a `pull_request` checkout's `git rev-parse
+      # HEAD` is the CI MERGE-REF commit, not the PR's own head -- neither
+      # stable across re-runs once master moves, nor matchable by a reader to
+      # an actual PR commit, and it silently breaks the "the same PR head
+      # always samples the same subset" reproducibility claim the whole
+      # deterministic-seed design rests on.
+      - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6 --head-sha "${{ github.event.pull_request.head.sha }}"
+      # Always runs, even when the step above exited non-zero (a 0-mutant run
+      # is not a step failure by itself, but the driver still exits 1 for a
+      # genuine Stryker failure such as a budget timeout) -- #3531's "a 0-
+      # mutant run must never read as a clean pass" applies to a run that
+      # never got this far too, so the summary has to render regardless.
+      - name: Render job summary
+        if: always()
+        run: node scripts/mutation-report.mjs --out "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: mutation-report
           path: reports/mutation/mutation.json
           if-no-files-found: ignore
+
+  mutation-comment:
+    name: mutation comment (advisory)
+    needs: mutation
+    # Fork PRs: a fork PR's default GITHUB_TOKEN is read-only against this repo
+    # regardless of the `permissions:` block below, so `gh api` POST/PATCH
+    # below would just 403. Skip the whole job rather than let it fail loudly
+    # for something it cannot do; the mutation job's own job summary (written
+    # unconditionally, no token scope needed) still covers a fork PR.
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      # #3151 (install-smoke.yml): the comment target is a pull request;
+      # `issues: write` alone was refused with 403 "Resource not accessible
+      # by integration".
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: mutation-report
+          path: reports/mutation
+        # `mutation`'s own upload step already runs with `if: always()` and
+        # `if-no-files-found: ignore` -- this download step failing (or
+        # finding nothing) means the mutation job produced NO artifact at all
+        # (a crash before writeReport, or the job hit its own 90-minute cap
+        # outright), not that this step should abort.
+        continue-on-error: true
+      - name: Post or update the sticky mutation comment
+        if: hashFiles('reports/mutation/mutation.json') != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/mutation-pr-comment.mjs --pr "${{ github.event.pull_request.number }}"
+      # round 2 T6: when the artifact never existed, the step above never ran
+      # and an EARLIER head's comment -- now about a commit this PR no longer
+      # is -- would otherwise just stay up with nothing marking it stale.
+      #
+      # round 2 R2-4: `needs.mutation.result` (success/failure/cancelled/
+      # skipped) is the one signal this job actually has for WHY the artifact
+      # is missing -- a `mutation` job the new per-PR concurrency group
+      # cancelled reads "cancelled" here, distinct from a genuine crash or
+      # time-cap failure, which reads "failure". This job itself runs either
+      # way (`if: always()` on the job overrides the default needs-skip).
+      - name: Mark the sticky comment stale (no report was produced for this head)
+        if: hashFiles('reports/mutation/mutation.json') == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          node scripts/mutation-pr-comment.mjs --pr "${{ github.event.pull_request.number }}" --stale \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --upstream-result "${{ needs.mutation.result }}"

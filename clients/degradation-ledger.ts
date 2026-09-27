@@ -281,6 +281,13 @@ export type DegradationKind =
 	 */
 	| "generation-lock-stale-takeover"
 	/**
+	 * #3578: a sync generation-lock wait (the change-log and snapshot cache
+	 * locks) was skipped because the holder an earlier wait ran out on is
+	 * still inside. The call fell back as a timed-out wait does. Once per
+	 * session; subject is the lock directory.
+	 */
+	| "generation-lock-wait-skipped"
+	/**
 	 * Failed-first test state was retired only after ENOENT/ENOTDIR evidence,
 	 * retained when the filesystem probe was indeterminate, or evicted at the
 	 * state cap (#2044). Subject is outcome + runner + bounded path, so repeated

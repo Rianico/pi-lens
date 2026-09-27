@@ -1,4 +1,5 @@
 export declare const DEFAULT_MAX_FILES: 6;
+export declare const DEFAULT_MAX_RANGES: 40;
 export declare const MUTATION_BUDGET_MINUTES: 60;
 export declare function capMutationFiles(
 	files: string[],
@@ -10,6 +11,9 @@ export declare function formatCapNotice(
 	skipped: string[],
 ): string;
 export declare const isScriptMutationFile: (file: string) => boolean;
+export declare const isCompiledMutationSource: (file: string) => boolean;
+export declare const isMutationSourceFile: (file: string) => boolean;
+export declare const compiledJsPath: (file: string) => string;
 export declare function mapRelatedTests(
 	changedFiles: string[],
 	options?: {
@@ -37,3 +41,71 @@ export declare function describeStrykerFailure(
 	},
 	budgetMinutes: number,
 ): string;
+export declare function describePartialInterruptCause(
+	result: {
+		status: number | null;
+		signal?: NodeJS.Signals | null;
+		error?: Error & { code?: string };
+	},
+	budgetMinutes: number,
+): string;
+export declare function sampleRangesDeterministically(
+	patterns: string[],
+	limit: number,
+	seed: string,
+): { selected: string[]; sampled: boolean };
+export declare function extractSnippet(
+	sourceLines: string[],
+	location:
+		| {
+				start: { line: number; column: number };
+				end: { line: number; column: number };
+		  }
+		| undefined,
+): string | undefined;
+export declare function buildRunConfig(
+	baseConfig: Record<string, unknown> & { commandRunner?: object },
+	options: { command: string },
+): Record<string, unknown>;
+export declare function parseDryRunCost(
+	output: string,
+): { totalMutants: number; dryRunMs: number } | null;
+export declare function estimateAffordableMutants(args: {
+	remainingMs: number;
+	concurrency: number;
+	dryRunMs: number;
+	safetyFactor?: number;
+}): number;
+export declare function dedupePatterns(patterns: string[]): string[];
+export declare function describeZeroMutantOutcome(args: {
+	sampled: boolean;
+	rangesEvaluated: number;
+	rangesTotal: number;
+	totalMutants: number | null;
+}): string;
+export declare function decideMutationOutcome(args: {
+	interrupted: boolean;
+	mutants: Array<{ status: string }>;
+	sampled: boolean;
+	rangesEvaluated: number;
+	rangesTotal: number;
+	totalMutants: number | null;
+	failureReason?: string;
+	partialReason?: string;
+}): {
+	zeroMutants: { reason: string } | null;
+	partial: { reason: string; evaluated: number; total: number | null } | null;
+};
+export declare function planResample(args: {
+	allPatterns: string[];
+	triedPatterns: string[];
+	keepRangeCount: number;
+	seed: string;
+	attemptsSoFar: number;
+	maxAttempts: number;
+}): { retry: false } | { retry: true; patterns: string[] };
+export declare function augmentAndSummarize(
+	strykerReport: { files?: Record<string, { mutants?: any[] }> },
+	compiledIndexByJsFile: Map<string, { index: object; tsFile: string }>,
+	options?: { readFile?: (file: string) => string },
+): { mutants: any[]; counts: Record<string, number>; score: string };

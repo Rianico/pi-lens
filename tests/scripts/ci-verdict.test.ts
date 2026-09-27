@@ -1158,6 +1158,9 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		"typos (advisory)",
 		"taplo (advisory)",
 		"mutation (advisory)",
+		// #3531: posts the mutation job's survivors as a sticky PR comment;
+		// continue-on-error like the job it reports on, so never gating.
+		"mutation comment (advisory)",
 		"complexity (advisory)",
 		// #2697 item 9: the strictness census lane (two scratch tsconfigs) is advisory.
 		"strictness (advisory)",

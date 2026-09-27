@@ -66,6 +66,31 @@ the cost of not doing so.
    Quote the mutation TABLE, one row per direction per new conditional — a
    single quoted direction proves only that direction, not the guard (#3156
    r2 and #3168 r1 each shipped a one-directional pin under a ticked box).
+   **Read the PR's Stryker report first, once one exists (#3531).** The
+   `Mutation diff` workflow mutates the PR's changed lines under
+   `scripts/**/*.mjs`, `clients/**/*.ts`, `tools/**/*.ts`, `mcp/**/*.ts`, and
+   `index.ts` (the last four through their compiled `.js`, mapped back to
+   `.ts` file:line) and posts a sticky PR comment listing every survivor. A
+   fixer starting a FRESH round from an issue has no PR yet, so there is no
+   comment to read — the report only exists once you push and the workflow
+   runs. If you're returning to an already-open PR for a fix round, read its
+   sticky comment before hand-mutating anything yourself; otherwise, run the
+   driver locally (`node scripts/stryker-diff.mjs --base origin/master
+   --max-files 6`) and read `reports/mutation/mutation.json` with `node
+   scripts/mutation-report.mjs`, or read a downloaded `mutation-report`
+   artifact the same way. Hand-mutate only what Stryker cannot express or
+   didn't get to: a seam the diff didn't touch, a multi-line or
+   cross-statement mutant, a guard on a line the diff's own hunk doesn't
+   cover, a range the deterministic sampler dropped over budget, a file
+   skipped over `--max-files` or with no covering test, or a mutant a
+   **partial** (budget-killed) run never reached. Every survivor Stryker
+   lists on your diff is either killed by a new test in this round or named
+   and justified in the PR body — a survivor left unaddressed with no comment
+   is a finding the next review round will raise. The lane is advisory and
+   can evaluate 0 mutants (over `--max-files`, no covering test, a
+   type-only/comment-only hunk, or a budget timeout) -- its comment always
+   says which, and neither a 0-mutant nor a partial run is ever grounds to
+   skip the hand-mutation table above for whatever they didn't cover.
    Platform rule: a test that asserts a Windows-only property runs ONLY on
    Windows dev boxes; the authoritative Unit tests lane is ubuntu. Every
    `skipIf(process.platform …)` names the lane that runs it or reads

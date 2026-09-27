@@ -2,15 +2,35 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+	augmentAndSummarize,
+	buildRunConfig,
 	capMutationFiles,
+	compiledJsPath,
+	decideMutationOutcome,
+	dedupePatterns,
+	describePartialInterruptCause,
 	describeStrykerFailure,
+	describeZeroMutantOutcome,
+	DEFAULT_MAX_RANGES,
+	estimateAffordableMutants,
+	extractSnippet,
 	formatCapNotice,
+	isCompiledMutationSource,
+	isMutationSourceFile,
 	isScriptMutationFile,
 	mapRelatedTests,
 	MUTATION_BUDGET_MINUTES,
 	mutationRangePatterns,
 	parseChangedLineRanges,
+	parseDryRunCost,
+	planResample,
+	sampleRangesDeterministically,
 } from "../../scripts/lib/stryker-diff.mjs";
+import {
+	buildLineIndex,
+	createTracer,
+	decodeSourceMapRows,
+} from "../../scripts/lib/mutation-source-map.mjs";
 
 const config = readFileSync(
 	resolve(import.meta.dirname, "../../stryker.config.mjs"),
@@ -98,7 +118,7 @@ describe("stryker diff selection", () => {
 		expect(result.selected).toEqual(["scripts/a.mjs", "scripts/m.mjs"]);
 		expect(result.skipped).toEqual(["scripts/z.mjs"]);
 		expect(formatCapNotice(2, 3, result.skipped)).toBe(
-			"capped: 2 of 3 changed scripts mutated; skipped: scripts/z.mjs",
+			"capped: 2 of 3 changed files mutated; skipped: scripts/z.mjs",
 		);
 	});
 
@@ -268,10 +288,736 @@ describe("stryker diff wall-clock budget", () => {
 		// Recurrence: a formatted budget message with no bound on the child is
 		// inert -- the runner still cancels the job. The executable proof is the
 		// quoted budget-expiry transcript in the PR body; this pins the wiring in
-		// the driver, which is a top-level script and cannot be imported.
-		expect(driver).toContain("timeout: budgetMs");
+		// the driver, which is a top-level script and cannot be imported. Round 2:
+		// the literal `timeout: budgetMs` this pinned before is gone -- the
+		// driver now bounds each Stryker child by the BUDGET REMAINING after
+		// time already spent (the dry-run cost measurement, the build), via
+		// `remainingBudgetMs()` -- so this now pins that function's own use as
+		// the timeout, not the removed literal.
+		expect(driver).toContain("timeout: remainingBudgetMs()");
 		expect(driver).toContain("--budget-minutes");
 		expect(driver).toContain("mutationRangePatterns");
 		expect(driver).toContain("describeStrykerFailure");
+	});
+
+	it("wires the resample loop through planResample and decideMutationOutcome, not a hand-rolled duplicate (#3531 round 3 R2-1/R2-2)", () => {
+		// Recurrence: planResample and decideMutationOutcome are fully
+		// mutation-proved as pure functions above (every branch reds under a
+		// direct mutation of scripts/lib/stryker-diff.mjs -- see the PR body's
+		// mutation table), but the driver ITSELF is a top-level script this
+		// suite cannot import and exercise end to end. A real live replay that
+		// forces the sampler onto an empty range and then proves the retry
+		// fires a SECOND real Stryker child needs multi-run Stryker-scale
+		// timing (the review's own #3579 replay at a 15-minute budget ran
+		// ~19 minutes wall-clock end to end, s2-3579.log) -- out of proportion
+		// to prove twice for a loop whose every DECISION point is already
+		// pinned above. This assertion is the stated exception's closest
+		// executable check: the driver actually calls the pinned functions,
+		// not a re-implementation that could silently diverge from them.
+		expect(driver).toContain("planResample({");
+		expect(driver).toContain("decideMutationOutcome({");
+		expect(driver).toContain("MAX_RESAMPLE_ATTEMPTS");
+	});
+
+	it("builds the per-run Stryker config through buildRunConfig, not a hand-rolled duplicate", () => {
+		// Recurrence (round 1 T1): a driver that builds its own config inline
+		// can drift from -- or simply not call -- the tested, guarded
+		// `buildRunConfig` (see the "buildRunConfig" describe block below for
+		// the actual buildCommand-override proof, tested against the generated
+		// object rather than source text).
+		expect(driver).toContain("buildRunConfig(base,");
+		expect(driver).not.toContain("buildCommand:");
+	});
+});
+
+describe("compiled-source mutation targets (#3531 rescope)", () => {
+	it("classifies clients/tools/mcp .ts sources and the root index.ts, excluding tests and .d.ts", () => {
+		expect(isCompiledMutationSource("clients/atomic-write.ts")).toBe(true);
+		expect(isCompiledMutationSource("clients/lsp/inferred-project.ts")).toBe(
+			true,
+		);
+		expect(isCompiledMutationSource("tools/lens-diagnostics.ts")).toBe(true);
+		expect(isCompiledMutationSource("mcp/server.ts")).toBe(true);
+		expect(isCompiledMutationSource("index.ts")).toBe(true);
+
+		expect(isCompiledMutationSource("clients/atomic-write.test.ts")).toBe(
+			false,
+		);
+		expect(isCompiledMutationSource("clients/some-types.d.ts")).toBe(false);
+		expect(isCompiledMutationSource("scripts/lib/ci-checks.mjs")).toBe(false);
+		expect(isCompiledMutationSource("tests/clients/atomic-write.test.ts")).toBe(
+			false,
+		);
+		// Recurrence: mutating the .ts source directly (rather than the
+		// compiled .js the tests execute) produces vacuous mutants -- the
+		// scripts-only classifier must stay false for every compiled class.
+		expect(isScriptMutationFile("clients/atomic-write.ts")).toBe(false);
+	});
+
+	it("computes the compiled sibling with no outDir remap", () => {
+		// Recurrence: tsconfig.build.json has no outDir, so tsc writes .js next
+		// to .ts (verified against a real build, 2026-09-26) -- a compiledJsPath
+		// that assumed a dist/ prefix would point at a file that never exists.
+		expect(compiledJsPath("clients/atomic-write.ts")).toBe(
+			"clients/atomic-write.js",
+		);
+		expect(compiledJsPath("clients/lsp/inferred-project.ts")).toBe(
+			"clients/lsp/inferred-project.js",
+		);
+		expect(compiledJsPath("index.ts")).toBe("index.js");
+	});
+
+	it("is a mutation source file through the union, whether scripted or compiled", () => {
+		expect(isMutationSourceFile("scripts/lib/ci-checks.mjs")).toBe(true);
+		expect(isMutationSourceFile("clients/atomic-write.ts")).toBe(true);
+		expect(isMutationSourceFile("docs/pi-lens-monitor.md")).toBe(false);
+	});
+});
+
+describe("mapRelatedTests generalized to compiled sources", () => {
+	it("matches a compiled source's test import even though tests import the .js specifier", () => {
+		// Recurrence: TypeScript's nodenext resolution (and this repo's own
+		// tests, e.g. tests/index-wiring.test.ts importing "../index.js")
+		// import a compiled source by its .js specifier, never .ts -- the
+		// normalizer must strip both extensions to match them.
+		const result = mapRelatedTests(["clients/atomic-write.ts"], {
+			testFiles: ["tests/clients/gzip-stage-write.test.ts"],
+			readFile: () =>
+				'import { STAGE_TMP_PATTERN } from "../../clients/atomic-write.js";',
+		});
+
+		expect(result.related.get("clients/atomic-write.ts")).toEqual(
+			new Set(["tests/clients/gzip-stage-write.test.ts"]),
+		);
+		expect(result.covered).toEqual(["clients/atomic-write.ts"]);
+	});
+
+	it("matches the conventional tests/<dir>/<name>.test.ts sibling for a compiled source", () => {
+		const result = mapRelatedTests(["clients/atomic-write.ts"], {
+			testFiles: ["tests/clients/atomic-write.test.ts"],
+			readFile: () => "",
+		});
+
+		expect(result.related.get("clients/atomic-write.ts")).toEqual(
+			new Set(["tests/clients/atomic-write.test.ts"]),
+		);
+	});
+
+	it("reports a covered compiled source alongside an uncovered one in the same call", () => {
+		const result = mapRelatedTests(
+			["clients/atomic-write.ts", "clients/uncovered-thing.ts"],
+			{
+				testFiles: ["tests/clients/atomic-write.test.ts"],
+				readFile: () => "",
+			},
+		);
+
+		expect(result.covered).toEqual(["clients/atomic-write.ts"]);
+		expect(result.uncovered).toEqual(["clients/uncovered-thing.ts"]);
+	});
+});
+
+describe("sampleRangesDeterministically (#3531 budget sampling)", () => {
+	it("keeps every pattern unchanged, and reports no sampling, under the limit", () => {
+		const patterns = ["a.js:1-1", "b.js:2-2"];
+		expect(sampleRangesDeterministically(patterns, 5, "sha-1")).toEqual({
+			selected: patterns,
+			sampled: false,
+		});
+	});
+
+	it("is deterministic for the same seed: repeated calls select the identical subset", () => {
+		const patterns = Array.from({ length: 50 }, (_, i) => `f${i}.js:${i}-${i}`);
+		const first = sampleRangesDeterministically(patterns, 10, "head-sha-abc");
+		const second = sampleRangesDeterministically(patterns, 10, "head-sha-abc");
+
+		expect(first.sampled).toBe(true);
+		expect(first.selected).toHaveLength(10);
+		expect(second.selected).toEqual(first.selected);
+	});
+
+	it("samples a different subset for a different seed (a different head SHA)", () => {
+		// Recurrence: a sample that ignores the seed is either fixed (always
+		// the same slice, hiding whichever mutants sort last) or effectively
+		// random (Math.random()) -- neither is reproducible per-PR-head. This
+		// does not prove every seed differs, only that the seed is load-bearing
+		// for at least one representative pair.
+		const patterns = Array.from({ length: 50 }, (_, i) => `f${i}.js:${i}-${i}`);
+		const a = sampleRangesDeterministically(patterns, 10, "sha-aaaa");
+		const b = sampleRangesDeterministically(patterns, 10, "sha-bbbb");
+
+		expect(a.selected).not.toEqual(b.selected);
+	});
+
+	it("preserves the input order of the selected patterns", () => {
+		const patterns = Array.from({ length: 30 }, (_, i) => `f${i}.js:${i}-${i}`);
+		const { selected } = sampleRangesDeterministically(patterns, 10, "seed");
+		const indices = selected.map((pattern) => patterns.indexOf(pattern));
+		expect(indices).toEqual([...indices].sort((x, y) => x - y));
+	});
+
+	it("keeps the run's own default range budget positive and finite", () => {
+		expect(DEFAULT_MAX_RANGES).toBeGreaterThan(0);
+		expect(Number.isFinite(DEFAULT_MAX_RANGES)).toBe(true);
+	});
+});
+
+describe("extractSnippet (survivor original-text extraction)", () => {
+	const sourceLines = [
+		"\tif (!Number.isInteger(maxFiles) || maxFiles < 0) {",
+		'\t\tthrow new RangeError("x");',
+		"\t}",
+	];
+
+	it("slices the exact 1-based column span of a single-line mutant location", () => {
+		// Pinned against a real Stryker report (scripts/lib/stryker-diff.mjs:56,
+		// columns 6-49), 2026-09-26.
+		expect(
+			extractSnippet(sourceLines, {
+				start: { line: 1, column: 6 },
+				end: { line: 1, column: 49 },
+			}),
+		).toBe("!Number.isInteger(maxFiles) || maxFiles < 0");
+	});
+
+	it("truncates a multi-line span to its first line with a marker", () => {
+		expect(
+			extractSnippet(sourceLines, {
+				start: { line: 1, column: 51 },
+				end: { line: 3, column: 2 },
+			}),
+		).toBe("{ … (multi-line)");
+	});
+
+	it("returns undefined when the mutant carries no location", () => {
+		expect(extractSnippet(sourceLines, undefined)).toBeUndefined();
+	});
+});
+
+describe("buildRunConfig (#3531 round 2 T1: the generated config object, not source text)", () => {
+	const fakeBase = {
+		buildCommand: "npm run build",
+		incremental: true,
+		commandRunner: { command: "irrelevant-base-command", other: "kept" },
+		mutate: ["scripts/**/*.mjs", "!scripts/**/*.test.mjs"],
+	};
+
+	it("overrides buildCommand so a rebuild can never clobber an already-instrumented mutant", () => {
+		// Recurrence (round 1 T1): a test that only asserts the driver's SOURCE
+		// TEXT contains "mutation-touch-build.mjs" is satisfied by a comment
+		// mentioning that string and proves nothing about what Stryker
+		// actually runs. This asserts the generated CONFIG OBJECT instead.
+		const generated = buildRunConfig(fakeBase, {
+			command: "real test command",
+		});
+
+		expect(generated.buildCommand).toBe(
+			"node scripts/lib/mutation-touch-build.mjs",
+		);
+		expect(generated.buildCommand).not.toBe(fakeBase.buildCommand);
+	});
+
+	it("sets force:true and preserves the base config's other fields, including incremental", () => {
+		const generated = buildRunConfig(fakeBase, {
+			command: "real test command",
+		});
+
+		expect(generated.force).toBe(true);
+		expect(generated.incremental).toBe(true);
+		expect(generated.mutate).toBe(fakeBase.mutate);
+	});
+
+	it("merges the run command into commandRunner without dropping its other fields", () => {
+		const generated = buildRunConfig(fakeBase, {
+			command: "real test command",
+		});
+
+		expect(generated.commandRunner).toEqual({
+			command: "real test command",
+			other: "kept",
+		});
+	});
+});
+
+describe("parseDryRunCost (#3531 round 2 S2)", () => {
+	it("parses the real mutant count and net dry-run duration Stryker prints", () => {
+		// Pinned against a real --dryRunOnly run, 2026-09-26
+		// (clients/atomic-write.js:1-190).
+		const output = [
+			"Instrumented 1 source file(s) with 39 mutant(s)",
+			"Initial test run succeeded. Ran 1 tests in 2 seconds (net 2758 ms, overhead 0 ms).",
+		].join("\n");
+
+		expect(parseDryRunCost(output)).toEqual({
+			totalMutants: 39,
+			dryRunMs: 2758,
+		});
+	});
+
+	it("parses correctly regardless of which line comes first", () => {
+		const output = [
+			"Initial test run succeeded. Ran 768 tests in 85 seconds (net 84532 ms, overhead 120 ms).",
+			"Instrumented 5 source file(s) with 290 mutant(s)",
+		].join("\n");
+
+		expect(parseDryRunCost(output)).toEqual({
+			totalMutants: 290,
+			dryRunMs: 84532,
+		});
+	});
+
+	it("returns null when either line is missing (an unreadable/changed Stryker output format)", () => {
+		expect(
+			parseDryRunCost("Instrumented 1 source file(s) with 39 mutant(s)"),
+		).toBeNull();
+		expect(
+			parseDryRunCost("Ran 1 tests in 2 seconds (net 2758 ms, overhead 0 ms)"),
+		).toBeNull();
+		expect(parseDryRunCost("")).toBeNull();
+	});
+});
+
+describe("estimateAffordableMutants (#3531 round 2 S2)", () => {
+	it("implements the reviewer's formula: budget × concurrency ÷ dry-run seconds, safety-factored", () => {
+		// 3600s remaining, concurrency 2, 2s dry run, safetyFactor 1 (isolate
+		// the arithmetic from the safety margin): 3600 * 2 / 2 = 3600.
+		expect(
+			estimateAffordableMutants({
+				remainingMs: 3_600_000,
+				concurrency: 2,
+				dryRunMs: 2_000,
+				safetyFactor: 1,
+			}),
+		).toBe(3600);
+	});
+
+	it("applies the safety factor as a multiplier on the raw estimate", () => {
+		expect(
+			estimateAffordableMutants({
+				remainingMs: 3_600_000,
+				concurrency: 2,
+				dryRunMs: 2_000,
+				safetyFactor: 0.5,
+			}),
+		).toBe(1800);
+	});
+
+	it("reproduces the #3579 replay's real blowup: 290 mutants against ~85s dry runs vastly exceeds a 60-minute budget", () => {
+		// Recurrence: round 1's DEFAULT_MAX_RANGES=40 sampled 290 mutants against
+		// this exact measured cost, needing ~3.4h against a 60-minute budget.
+		const allowed = estimateAffordableMutants({
+			remainingMs: 55 * 60_000,
+			concurrency: 2,
+			dryRunMs: 85_000,
+			safetyFactor: 0.7,
+		});
+		expect(allowed).toBeLessThan(290);
+		expect(allowed).toBeGreaterThan(0);
+	});
+
+	it("never returns fewer than 1, even against a dry run that alone exceeds the remaining budget", () => {
+		expect(
+			estimateAffordableMutants({
+				remainingMs: 1000,
+				concurrency: 2,
+				dryRunMs: 999_999,
+			}),
+		).toBe(1);
+	});
+
+	it("never returns fewer than 1 for a degenerate (zero or negative) dry-run duration", () => {
+		expect(
+			estimateAffordableMutants({
+				remainingMs: 60_000,
+				concurrency: 2,
+				dryRunMs: 0,
+			}),
+		).toBe(1);
+	});
+});
+
+describe("dedupePatterns (#3531 round 2 S3)", () => {
+	it("removes an exact duplicate --mutate pattern, keeping first-seen order", () => {
+		// Recurrence: a real #3579 replay produced
+		// clients/instance-reaper.js:215-215 twice (two .ts hunks collapsing
+		// onto the same .js range) -- each duplicate spent a range-budget slot
+		// on a mutant Stryker would test identically the first time.
+		expect(
+			dedupePatterns([
+				"a.js:1-1",
+				"clients/instance-reaper.js:215-215",
+				"b.js:2-2",
+				"clients/instance-reaper.js:215-215",
+			]),
+		).toEqual(["a.js:1-1", "clients/instance-reaper.js:215-215", "b.js:2-2"]);
+	});
+
+	it("is a no-op on an already-unique list", () => {
+		const patterns = ["a.js:1-1", "b.js:2-2"];
+		expect(dedupePatterns(patterns)).toEqual(patterns);
+	});
+});
+
+describe("describePartialInterruptCause (#3531 round 3 R2-4)", () => {
+	it("never says 'no mutants evaluated' -- some mutants WERE, which is why a partial report exists", () => {
+		// Recurrence: the review found the partial reason quoting
+		// describeStrykerFailure's "no mutants evaluated" prefix directly under
+		// the render's own "Partial run -- 8 of 9 evaluated" banner --
+		// self-contradictory.
+		const reason = describePartialInterruptCause(
+			{
+				status: 143,
+				signal: null,
+				error: Object.assign(new Error("spawnSync ETIMEDOUT"), {
+					code: "ETIMEDOUT",
+				}),
+			},
+			60,
+		);
+
+		expect(reason).not.toContain("no mutants evaluated");
+		expect(reason).toContain("60-minute mutation budget expired");
+	});
+
+	it("still names Stryker's own status for a non-timeout interrupt", () => {
+		const reason = describePartialInterruptCause(
+			{ status: 1, signal: null, error: undefined },
+			60,
+		);
+
+		expect(reason).not.toContain("no mutants evaluated");
+		expect(reason).toContain("Stryker status 1");
+	});
+});
+
+describe("describeZeroMutantOutcome (#3531 round 3 R2-1)", () => {
+	it("states the true global fact when the whole changed-range set was tried, unsampled", () => {
+		expect(
+			describeZeroMutantOutcome({
+				sampled: false,
+				rangesEvaluated: 5,
+				rangesTotal: 5,
+				totalMutants: 0,
+			}),
+		).toBe("Stryker found no mutable code in 5 changed range(s)");
+	});
+
+	it("names the sample size and the measured total instead of the false global claim, when sampled", () => {
+		// Recurrence: a real #3579 replay at a 15-minute budget sampled 1 of 99
+		// ranges (a shorthand-property line with 0 mutants) while the
+		// measurement found 710 mutants across all 99 -- "Stryker found no
+		// mutable code in 99 changed range(s)" was false.
+		expect(
+			describeZeroMutantOutcome({
+				sampled: true,
+				rangesEvaluated: 1,
+				rangesTotal: 99,
+				totalMutants: 710,
+			}),
+		).toBe(
+			"0 mutants in 1 sampled of 99 ranges (99 ranges held 710 mutant(s))",
+		);
+	});
+});
+
+describe("decideMutationOutcome (#3531 round 3 R2-2: the driver's three outcome branches, unified and pure)", () => {
+	it("measurement-time: cost.totalMutants === 0 reports a zero-mutant outcome, not a partial or scored one", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants: [],
+			sampled: false,
+			rangesEvaluated: 12,
+			rangesTotal: 12,
+			totalMutants: 0,
+		});
+
+		expect(outcome.partial).toBeNull();
+		expect(outcome.zeroMutants).toEqual({
+			reason: "Stryker found no mutable code in 12 changed range(s)",
+		});
+	});
+
+	it("post-run: mutants.length === 0 after a completed run reports zero, sample-aware", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants: [],
+			sampled: true,
+			rangesEvaluated: 1,
+			rangesTotal: 99,
+			totalMutants: 710,
+		});
+
+		expect(outcome.partial).toBeNull();
+		expect(outcome.zeroMutants).toEqual({
+			reason:
+				"0 mutants in 1 sampled of 99 ranges (99 ranges held 710 mutant(s))",
+		});
+	});
+
+	it("post-run: any mutant evaluated reports neither zero nor partial (a normal scored run)", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: false,
+			mutants: [{ status: "Killed" }],
+			sampled: false,
+			rangesEvaluated: 1,
+			rangesTotal: 1,
+			totalMutants: 1,
+		});
+
+		expect(outcome.zeroMutants).toBeNull();
+		expect(outcome.partial).toBeNull();
+	});
+
+	it("interrupted with mutants.length > 0 reports partial, carrying the partial-specific reason", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: true,
+			mutants: [{ status: "Killed" }, { status: "Killed" }],
+			sampled: false,
+			rangesEvaluated: 1,
+			rangesTotal: 1,
+			totalMutants: 9,
+			failureReason: "mutation diff: no mutants evaluated; budget expired",
+			partialReason: "mutation diff: budget expired",
+		});
+
+		expect(outcome.zeroMutants).toBeNull();
+		expect(outcome.partial).toEqual({
+			reason: "mutation diff: budget expired",
+			evaluated: 2,
+			total: 9,
+		});
+	});
+
+	it("interrupted with no usable partial result (mutants.length === 0) falls back to the failure reason, not describeZeroMutantOutcome's", () => {
+		const outcome = decideMutationOutcome({
+			interrupted: true,
+			mutants: [],
+			sampled: true,
+			rangesEvaluated: 1,
+			rangesTotal: 99,
+			totalMutants: 710,
+			failureReason: "mutation diff: no mutants evaluated; budget expired",
+			partialReason: "mutation diff: budget expired",
+		});
+
+		expect(outcome.partial).toBeNull();
+		expect(outcome.zeroMutants).toEqual({
+			reason: "mutation diff: no mutants evaluated; budget expired",
+		});
+	});
+});
+
+describe("planResample (#3531 round 3 R2-1 fix #3)", () => {
+	it("resamples from only the ranges not yet tried, excluding every proven-empty one", () => {
+		const plan = planResample({
+			allPatterns: ["a.js:1-1", "b.js:2-2", "c.js:3-3", "d.js:4-4"],
+			triedPatterns: ["a.js:1-1"],
+			keepRangeCount: 2,
+			seed: "deadbeef",
+			attemptsSoFar: 0,
+			maxAttempts: 3,
+		});
+
+		if (!plan.retry) throw new Error("expected plan.retry to be true");
+		expect(plan.patterns).toHaveLength(2);
+		expect(plan.patterns).not.toContain("a.js:1-1");
+		for (const pattern of plan.patterns) {
+			expect(["b.js:2-2", "c.js:3-3", "d.js:4-4"]).toContain(pattern);
+		}
+	});
+
+	it("gives up once every range has been tried", () => {
+		const plan = planResample({
+			allPatterns: ["a.js:1-1", "b.js:2-2"],
+			triedPatterns: ["a.js:1-1", "b.js:2-2"],
+			keepRangeCount: 2,
+			seed: "deadbeef",
+			attemptsSoFar: 0,
+			maxAttempts: 3,
+		});
+
+		expect(plan).toEqual({ retry: false });
+	});
+
+	it("gives up once the attempt cap is reached, even with untried ranges remaining", () => {
+		const plan = planResample({
+			allPatterns: ["a.js:1-1", "b.js:2-2", "c.js:3-3"],
+			triedPatterns: ["a.js:1-1"],
+			keepRangeCount: 1,
+			seed: "deadbeef",
+			attemptsSoFar: 3,
+			maxAttempts: 3,
+		});
+
+		expect(plan).toEqual({ retry: false });
+	});
+
+	it("is deterministic: the same seed and tried set resample to the identical subset", () => {
+		const args = {
+			allPatterns: ["a.js:1-1", "b.js:2-2", "c.js:3-3", "d.js:4-4"],
+			triedPatterns: ["a.js:1-1"],
+			keepRangeCount: 2,
+			seed: "9ebbb5da",
+			attemptsSoFar: 0,
+			maxAttempts: 3,
+		};
+
+		expect(planResample(args)).toEqual(planResample({ ...args }));
+	});
+});
+
+describe("augmentAndSummarize (#3531 round 2: shared by the complete AND the partial-report path)", () => {
+	const compiledIndex = new Map();
+
+	it("counts and scores a normal completed report", () => {
+		const report = {
+			files: {
+				"scripts/lib/x.mjs": {
+					mutants: [
+						{
+							id: "0",
+							status: "Killed",
+							mutatorName: "BooleanLiteral",
+							location: undefined,
+						},
+						{
+							id: "1",
+							status: "Survived",
+							mutatorName: "StringLiteral",
+							location: undefined,
+						},
+					],
+				},
+			},
+		};
+
+		const { mutants, counts, score } = augmentAndSummarize(
+			report,
+			compiledIndex,
+			{
+				readFile: () => {
+					throw new Error("no such file");
+				},
+			},
+		);
+
+		expect(mutants).toHaveLength(2);
+		expect(counts).toEqual({ Killed: 1, Survived: 1 });
+		expect(score).toBe("50.00");
+	});
+
+	it("summarizes a PARTIAL (.stryker/incremental.json-shaped) report identically -- fewer mutants, same math", () => {
+		// Recurrence (round 2 S2): a budget kill can leave a real, partial
+		// result (Stryker's own unexpectedExitHandler saves
+		// .stryker/incremental.json, the SAME {files: {mutants: [...]}} shape
+		// as the completed report, just missing the untested mutants entirely
+		// -- verified against a real interrupted run, 2026-09-26: 6 of 9
+		// mutants present, all Killed, the other 3 simply absent from the
+		// array). The driver must summarize whatever DID run, not treat an
+		// incomplete mutant list as an error.
+		const partial = {
+			files: {
+				"clients/string-utils.js": {
+					mutants: [
+						{
+							id: "0",
+							status: "Killed",
+							mutatorName: "ConditionalExpression",
+							location: undefined,
+						},
+						{
+							id: "1",
+							status: "Killed",
+							mutatorName: "EqualityOperator",
+							location: undefined,
+						},
+					],
+					// 7 of the real 9 mutants are simply absent -- not "Pending",
+					// not present-with-null-status, just missing.
+				},
+			},
+		};
+
+		const { mutants, counts, score } = augmentAndSummarize(
+			partial,
+			compiledIndex,
+			{
+				readFile: () => {
+					throw new Error("no such file");
+				},
+			},
+		);
+
+		expect(mutants).toHaveLength(2);
+		expect(counts).toEqual({ Killed: 2 });
+		expect(score).toBe("100.00");
+	});
+
+	it("attaches original source text from the injected readFile, not the real filesystem", () => {
+		const report = {
+			files: {
+				"a.js": {
+					mutants: [
+						{
+							id: "0",
+							status: "Survived",
+							mutatorName: "BooleanLiteral",
+							location: {
+								start: { line: 1, column: 1 },
+								end: { line: 1, column: 5 },
+							},
+						},
+					],
+				},
+			},
+		};
+
+		const { mutants } = augmentAndSummarize(report, compiledIndex, {
+			readFile: () => "true",
+		});
+
+		expect(mutants[0].original).toBe("true");
+	});
+
+	it("maps a survivor to its .ts location, column-aware, for a compiled target", () => {
+		const rawMap = {
+			version: 3,
+			sources: ["fixture.ts"],
+			names: [],
+			mappings: "AAAA",
+		};
+		const index = {
+			...buildLineIndex(decodeSourceMapRows(rawMap)),
+			tracer: createTracer(rawMap),
+		};
+		const byJsFile = new Map([
+			["clients/fixture.js", { index, tsFile: "clients/fixture.ts" }],
+		]);
+		const report = {
+			files: {
+				"clients/fixture.js": {
+					mutants: [
+						{
+							id: "0",
+							status: "Survived",
+							mutatorName: "BooleanLiteral",
+							location: {
+								start: { line: 1, column: 1 },
+								end: { line: 1, column: 5 },
+							},
+						},
+					],
+				},
+			},
+		};
+
+		const { mutants } = augmentAndSummarize(report, byJsFile, {
+			readFile: () => "true",
+		});
+
+		expect(mutants[0].tsLocation).toEqual({
+			fileName: "clients/fixture.ts",
+			line: 1,
+		});
 	});
 });
