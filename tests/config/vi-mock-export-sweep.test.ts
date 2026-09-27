@@ -41,7 +41,28 @@ const BASELINE: Record<string, number> = JSON.parse(
 	),
 );
 
-function scan(): ViMockExportFinding[] {
+/**
+ * #3565: run the detector over every walked file, turning the event loop
+ * between files. `@ast-grep/napi` frees a dropped tree's native memory from a
+ * finalizer that only runs once the loop turns, so a synchronous pass over the
+ * ~1,300-file population held every transient tree it parsed until the case
+ * ended: a 1,973 MB peak beside an 84 MB heap locally, and 2,026-2,049 MB over
+ * 18 CI runs against the 2,048 MB per-worker budget (red at 2,049 MB). One
+ * turn per file measured 930-996 MB, with the same findings and wall time.
+ */
+async function detectAcrossFiles(
+	files: string[],
+	detect: (file: string, source: string) => ViMockExportFinding[],
+): Promise<ViMockExportFinding[]> {
+	const findings: ViMockExportFinding[] = [];
+	for (const { file, source } of readWalkedFiles(files)) {
+		findings.push(...detect(file, source));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	return findings;
+}
+
+function scan(): Promise<ViMockExportFinding[]> {
 	const files = listSourceFiles(TESTS_ROOT, {
 		extensions: [".ts"],
 		exclude: (relative) => relative.startsWith("fixtures/"),
@@ -54,12 +75,12 @@ function scan(): ViMockExportFinding[] {
 	assertNonEmptyScan("#2281 vi.mock export sweep", files.length, 900);
 	// readWalkedFiles: a path that vanished between the walk and the read is
 	// out of the population, not a finding (#3082).
-	return readWalkedFiles(files).flatMap(({ file, source }) =>
+	return detectAcrossFiles(files, (file, source) =>
 		findViMockExportGaps(file, source),
 	);
 }
 
-function scanLatencyLoggerSurface(): ViMockExportFinding[] {
+function scanLatencyLoggerSurface(): Promise<ViMockExportFinding[]> {
 	const files = listSourceFiles(TESTS_ROOT, {
 		extensions: [".ts"],
 		exclude: (relative) => relative.startsWith("fixtures/"),
@@ -71,9 +92,7 @@ function scanLatencyLoggerSurface(): ViMockExportFinding[] {
 	// holds no inline predicate to delete.
 	assertNonEmptyScan("#2281 latency-logger mock surface", files.length, 900);
 	// readWalkedFiles: see `scan()` above (#3082).
-	return readWalkedFiles(files).flatMap(({ file, source }) =>
-		findLatencyLoggerGapsForFile(file, source),
-	);
+	return detectAcrossFiles(files, findLatencyLoggerGapsForFile);
 }
 
 /**
@@ -195,10 +214,10 @@ function compareAgainstBaseline(
 }
 
 describe("#2281 whole-module vi.mock export ratchet", () => {
-	it("keeps every latency-logger mock on the real export surface", () => {
+	it("keeps every latency-logger mock on the real export surface", async () => {
 		// Recurrence guard for #2272 and #2281: a whole-module factory mock can
 		// stay green until an untested production call reaches a newly added export.
-		expect(scanLatencyLoggerSurface()).toEqual([]);
+		expect(await scanLatencyLoggerSurface()).toEqual([]);
 	}, 60_000);
 
 	it("every latency pin carries a reason and the file carries its header", () => {
@@ -1187,8 +1206,8 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it.skipIf(!!process.env.VI_MOCK_EXPORT_REGEN)(
 		"reports every omitted production export and warns on newly omitted exports",
-		() => {
-			const findings = scan();
+		async () => {
+			const findings = await scan();
 			const result = compareAgainstBaseline(findings, BASELINE);
 			if (result.warnings.length > 0)
 				process.stderr.write(
@@ -1204,8 +1223,8 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it.skipIf(!!process.env.VI_MOCK_EXPORT_REGEN)(
 		"baseline entries remain live",
-		() => {
-			const findings = scan();
+		async () => {
+			const findings = await scan();
 			const live = new Set(findings.map(key));
 			const dead = Object.keys(BASELINE).filter((entry) => !live.has(entry));
 			expect(dead).toEqual([]);
@@ -1215,10 +1234,10 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 
 	it.skipIf(!process.env.VI_MOCK_EXPORT_REGEN)(
 		"regenerates the baseline",
-		() => {
+		async () => {
 			fs.writeFileSync(
 				path.join(REPO_ROOT, "tests/support/vi-mock-export-baseline.json"),
-				`${JSON.stringify(baselineFrom(scan()), null, "\t")}\n`,
+				`${JSON.stringify(baselineFrom(await scan()), null, "\t")}\n`,
 			);
 		},
 		60_000,
