@@ -421,7 +421,13 @@ function currentHolderIdentity(
 ): string | undefined {
 	if (hold === "busy") return topGenerationHolder(dir);
 	try {
-		return `legacy ${fs.readFileSync(lockPath, "utf8")}`;
+		// The bridge file's create (`wx`) and its token write are separate
+		// steps (see the doc comment above `acquireBoundedPidFileLock`), so a
+		// reader can meet it empty. An empty read is therefore never a real
+		// holder's identity — `undefined`, like an unreadable one, so it can
+		// never match a later reader's own empty-read coincidence either.
+		const content = fs.readFileSync(lockPath, "utf8");
+		return content ? `legacy ${content}` : undefined;
 	} catch {
 		return undefined;
 	}

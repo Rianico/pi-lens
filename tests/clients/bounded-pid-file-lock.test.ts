@@ -949,4 +949,31 @@ describe("acquireBoundedPidFileLock: remembered-holder skip (#3594)", () => {
 
 		fs.unlinkSync(lockPath);
 	});
+
+	/**
+	 * Recurrence: review round 2's residual edge (R2, "Item 1: verified
+	 * fixed"). The bridge file's create (`wx`) and its token write are
+	 * separate steps, so a reader can meet it empty. An empty read used to
+	 * produce the identity `"legacy "` (a non-`undefined` string) — two such
+	 * reads, from two DIFFERENT holders that both happened to be caught
+	 * empty, would then falsely match each other. Empty is now treated the
+	 * same as unreadable: `undefined`, which never matches.
+	 */
+	it("an empty bridge file is never remembered as a holder's identity (#3594 review R2 residual)", () => {
+		const { lockPath } = lockIn();
+		const backoff = fakeBackoff();
+		// The exact create/token-write gap: exists, empty, fresh mtime — live
+		// (not stale), but with nothing yet written to name a holder.
+		fs.writeFileSync(lockPath, "");
+		expect(take(lockPath, 500)).toBeNull();
+		expect(degradationCount("generation-lock-legacy-held")).toBe(1);
+		// The SAME still-empty bridge gets the full wait again on the next
+		// call too — nothing was remembered for it to (falsely) match.
+		const before = backoff.slept;
+		expect(take(lockPath, 500)).toBeNull();
+		expect(backoff.slept - before).toBeGreaterThanOrEqual(500);
+		expect(degradationCount("bounded-pid-lock-wait-skipped")).toBe(0);
+
+		fs.unlinkSync(lockPath);
+	});
 });
