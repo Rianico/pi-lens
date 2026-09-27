@@ -2532,23 +2532,83 @@ describe("clientRequestWorkspaceDiagnostics content binding (#1104)", () => {
 		});
 	}
 
-	it("fingerprints disk bytes at request time for a 'full' item and returns the hash", async () => {
-		const state = pullSupportState();
-		const filePath = path.join(os.tmpdir(), `pi-lens-1104-${Date.now()}.ts`);
-		const content = "const y = 2;\n";
-		fs.writeFileSync(filePath, content);
-		try {
-			const uri = pathToFileURL(filePath).href;
-			state.connection.sendRequest = vi.fn().mockResolvedValue({
-				items: [{ uri, kind: "full", resultId: "wr1", items: [] }],
-			});
+	// #3505 (b): a "full" item is bound to the bytes pi-lens SENT the server,
+	// never to a read of the disk after the answer. That post-hoc hash
+	// described the post-edit bytes whenever the file was written while the
+	// server was answering, so the sweep cached the pre-edit verdict as bound
+	// to them. Each case writes the file while the request is in flight.
+	describe("binds a 'full' item to the bytes pi-lens sent (#3505 b)", () => {
+		const SENT = "const y = 2;\n";
+		const EDITED = "const y = (\n";
 
-			const report = await clientRequestWorkspaceDiagnostics(state, 1000);
-
-			expect(report?.[0]?.contentHash).toBe(hashDiagnosticContent(content));
-		} finally {
-			fs.rmSync(filePath, { force: true });
+		async function pullWhileEditing(
+			setup: (state: LSPClientState, key: string) => void,
+			itemVersion: number | null,
+		) {
+			const state = pullSupportState();
+			const filePath = path.join(
+				os.tmpdir(),
+				`pi-lens-3505b-${process.pid}-${Math.random().toString(36).slice(2)}.ts`,
+			);
+			fs.writeFileSync(filePath, SENT);
+			try {
+				setup(state, normalizeMapKey(filePath));
+				const uri = pathToFileURL(filePath).href;
+				state.connection.sendRequest = vi.fn(async () => {
+					// A parallel tool call writes while the server answers.
+					fs.writeFileSync(filePath, EDITED);
+					return {
+						items: [
+							{
+								uri,
+								kind: "full",
+								version: itemVersion,
+								resultId: "wr1",
+								items: [],
+							},
+						],
+					};
+				});
+				const report = await clientRequestWorkspaceDiagnostics(state, 1000);
+				return report?.[0]?.contentHash;
+			} finally {
+				fs.rmSync(filePath, { force: true });
+			}
 		}
+
+		const openAndSent =
+			(version: number) => (state: LSPClientState, key: string) => {
+				state.openDocuments.add(key);
+				state.documentContentHashes.set(key, {
+					version,
+					hash: hashDiagnosticContent(SENT),
+				});
+			};
+
+		it("binds an open document's answer at the version pi-lens last sent", async () => {
+			expect(await pullWhileEditing(openAndSent(2), 2)).toBe(
+				hashDiagnosticContent(SENT),
+			);
+		});
+
+		it("leaves the answer unbound when the reported version is not the one pi-lens last sent", async () => {
+			expect(await pullWhileEditing(openAndSent(2), 1)).toBeUndefined();
+			expect(await pullWhileEditing(openAndSent(2), null)).toBeUndefined();
+		});
+
+		it("leaves the answer unbound for a document pi-lens never sent", async () => {
+			expect(await pullWhileEditing(() => {}, 2)).toBeUndefined();
+		});
+
+		it("leaves the answer unbound for a document pi-lens has since closed", async () => {
+			// The sent record outlives the close (`clearDiagnosticsForPath`), but a
+			// closed document is read from disk again by the server.
+			const closed = (state: LSPClientState, key: string) => {
+				openAndSent(2)(state, key);
+				state.openDocuments.delete(key);
+			};
+			expect(await pullWhileEditing(closed, 2)).toBeUndefined();
+		});
 	});
 
 	it("an 'unchanged' item inherits the prior pull's diagnostics + contentHash and echoes previousResultIds on the next request", async () => {
@@ -2557,11 +2617,19 @@ describe("clientRequestWorkspaceDiagnostics content binding (#1104)", () => {
 		fs.writeFileSync(filePath, "const y = 2;\n");
 		try {
 			const uri = pathToFileURL(filePath).href;
+			// #3505 (b): an open document at the sent version, so the first
+			// answer carries a binding for the second to inherit.
+			state.openDocuments.add(normalizeMapKey(filePath));
+			state.documentContentHashes.set(normalizeMapKey(filePath), {
+				version: 1,
+				hash: hashDiagnosticContent("const y = 2;\n"),
+			});
 			const sendRequest = vi.fn().mockResolvedValueOnce({
 				items: [
 					{
 						uri,
 						kind: "full",
+						version: 1,
 						resultId: "wr1",
 						items: [
 							{
@@ -2579,6 +2647,7 @@ describe("clientRequestWorkspaceDiagnostics content binding (#1104)", () => {
 			state.connection.sendRequest = sendRequest;
 			const first = await clientRequestWorkspaceDiagnostics(state, 1000);
 			const firstHash = first?.[0]?.contentHash;
+			expect(firstHash).toBe(hashDiagnosticContent("const y = 2;\n"));
 			expect(first?.[0]?.diagnostics.length).toBe(1);
 
 			sendRequest.mockResolvedValueOnce({

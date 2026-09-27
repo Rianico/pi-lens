@@ -249,6 +249,30 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).not.toContain("| Location |");
 	});
 
+	it("#3592 round 2 F4: renders metaTable's --max-files row on a normal, complete, scored run too", () => {
+		// Recurrence this guards: the FINAL `lines.push(metaTable(meta))` at
+		// the end of a normal scored render (after the survivor table or "No
+		// survivors.") survived PR #3590's own mutation run as `;` -- every
+		// pre-existing test that asserts metaTable content (the --max-files
+		// and no-covering-test rows) does so through the EARLIER,
+		// zero-mutant-branch call to metaTable, never through this one.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				filesSkippedOverCap: ["clients/z.ts"],
+				counts: { Killed: 4 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).toContain("Skipped (over --max-files)");
+		expect(markdown).toContain("clients/z.ts");
+	});
+
 	it("round 3 R2-1: prints the sampling note on the zero-mutant path too, and the sample-aware reason", () => {
 		// Recurrence: a real #3579 replay sampled 1 of 99 ranges (a
 		// shorthand-property line with 0 mutants) while the measurement found
@@ -360,6 +384,230 @@ describe("renderMutationMarkdown", () => {
 		});
 
 		expect(markdown).toContain("3 of an unknown total of mutant(s)");
+	});
+
+	it("#3592 item 2: renders an unsampled, non-partial run as incomplete when it evaluated fewer mutants than the dry run measured", () => {
+		// Recurrence this backstops: if a FUTURE driver change dropped
+		// `meta.partial` on an interrupted-but-unsampled run, the report would
+		// otherwise carry a real (nonzero) `counts`/`score` and render as a
+		// normal, complete scored pass -- silently discarding however many
+		// mutants never ran. `measuredTotalMutants` (the dry run's own
+		// measured count for this candidate range set, persisted into every
+		// report by the driver's `baseMeta`) is the only other in-report
+		// signal that can catch that shape.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: false,
+				measuredTotalMutants: 9,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).toContain("Incomplete run");
+		expect(markdown).toContain("1 mutant(s) were evaluated");
+		expect(markdown).toContain("measured 9");
+		expect(markdown).not.toContain("No survivors.");
+		expect(markdown).not.toContain("100.00");
+	});
+
+	it("#3592 round 2 F3: also flags the OTHER direction of the mismatch -- more evaluated than measured", () => {
+		// The comparison is `!==`, not `<`, on purpose: a data-integrity
+		// anomaly where evaluated exceeds the measured total is just as much
+		// evidence something is wrong with the report as evaluating fewer.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+						{
+							id: "1",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: false,
+				measuredTotalMutants: 1,
+				counts: { Killed: 2 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).toContain("Incomplete run");
+		expect(markdown).toContain("2 mutant(s) were evaluated");
+		expect(markdown).toContain("measured 1");
+	});
+
+	it("#3592 item 2: does NOT flag a sampled run whose evaluated count is legitimately below the measured total", () => {
+		// measuredTotalMutants counts the WHOLE candidate range set, not the
+		// sampled subset actually run -- a sampled, complete run evaluating
+		// fewer mutants than that total is the expected, healthy case.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: true,
+				rangesEvaluated: 2,
+				rangesTotal: 99,
+				measuredTotalMutants: 710,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).not.toContain("Incomplete run");
+		expect(markdown).toContain("100.00");
+	});
+
+	it("#3592 item 2: does NOT flag a genuinely complete, unsampled run whose evaluated count matches the measured total", () => {
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: false,
+				measuredTotalMutants: 1,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).not.toContain("Incomplete run");
+		expect(markdown).toContain("100.00");
+	});
+
+	it("#3592 item 2: does NOT flag a run with no measured total on record (measurement never ran, or its output could not be parsed)", () => {
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Killed",
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: null,
+				rangesSampled: false,
+				measuredTotalMutants: null,
+				counts: { Killed: 1 },
+				score: "100.00",
+			},
+		});
+
+		expect(markdown).not.toContain("Incomplete run");
+		expect(markdown).toContain("100.00");
+	});
+
+	it("#3592 round 2 F2: does NOT flag a genuine PARTIAL run whose evaluated count is legitimately below the measured total", () => {
+		// Recurrence this guards against: `evaluatedMismatch`'s `!meta.partial`
+		// conjunct is what keeps this backstop from firing on a run that IS
+		// supposed to have evaluated fewer mutants than measured -- every
+		// partial run does, by definition (that is what "partial" means).
+		// Without that conjunct, this exact shape (partial set, evaluated <
+		// measuredTotalMutants, unsampled) would render "Incomplete run" and
+		// return BEFORE the partial-run render path or the survivor table are
+		// ever reached, silently dropping both.
+		const markdown = renderMutationMarkdown({
+			files: {
+				"clients/x.js": {
+					mutants: [
+						{
+							id: "0",
+							mutatorName: "BooleanLiteral",
+							replacement: "false",
+							status: "Survived",
+							location: {
+								start: { line: 1, column: 1 },
+								end: { line: 1, column: 5 },
+							},
+						},
+					],
+				},
+			},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234",
+				zeroMutants: null,
+				partial: {
+					reason:
+						"mutation diff: the budget expired before Stryker produced a result",
+					evaluated: 6,
+					total: 9,
+				},
+				rangesSampled: false,
+				measuredTotalMutants: 9,
+				counts: { Survived: 1, Killed: 5 },
+				score: "83.33",
+			},
+		});
+
+		expect(markdown).toContain("Partial run");
+		expect(markdown).not.toContain("Incomplete run");
+		expect(markdown).toContain("#### Survivors (1)");
 	});
 });
 

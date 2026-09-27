@@ -525,6 +525,17 @@ export function resetLspLaunchAvailabilityGeneration(): void {
 	lspLaunchAvailabilityGeneration.bump();
 }
 
+/**
+ * #3576: the LSP service generation, for work that outlives the hook that
+ * started it. `resetLSPService` bumps it on every retire (session_start,
+ * session_shutdown, the idle reset), including the two that do not bump the
+ * runtime session; a stale handle means `getLSPService()` would now build,
+ * and a touch spawn, a server for a service that was retired.
+ */
+export function captureLspServiceGeneration(): GenerationHandle {
+	return lspLaunchAvailabilityGeneration.capture();
+}
+
 function staleLaunch(
 	generation: GenerationHandle,
 	subject: string,

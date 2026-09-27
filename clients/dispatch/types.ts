@@ -11,6 +11,7 @@
  * The dispatcher must handle these semantics consistently.
  */
 
+import type { GenerationHandle } from "../generation-guard.js";
 import type { ExtensionLogLevel } from "../extension-log.js";
 import type { FileKind } from "../file-kinds.js";
 import type { FileRole } from "../file-role.js";
@@ -239,6 +240,12 @@ export interface DispatchContext {
 	readonly modifiedRanges?: ModifiedRange[];
 	/** Ordered per-file pipeline token used by widget reconciliation (#1198). */
 	readonly writeIndex?: number;
+	/**
+	 * #3568: the session a post-write dispatch belongs to. A collect-later
+	 * runner deferred after that session was replaced is not handed to the
+	 * next session's turn end.
+	 */
+	readonly sessionGeneration?: GenerationHandle;
 	/** Model/provider active for this dispatch, when the runtime knows it
 	 * (#1448) — threaded to the worklog append so repair history can be
 	 * attributed. Blank/absent outside a live agent turn (e.g. project scans). */

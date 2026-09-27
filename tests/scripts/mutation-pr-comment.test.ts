@@ -81,6 +81,23 @@ describe("findStickyCommentId", () => {
 		expect(findStickyCommentId(comments, STICKY_MARKER)).toBeNull();
 	});
 
+	it("#3592 item 3: skips a comment with no `user` field at all, rather than throwing (survivor: mutation-pr-comment.mjs:30, comment.user?.login -> comment.user.login)", () => {
+		// Recurrence: none of the pre-#3592 fixtures ever paired a marker-
+		// carrying `body` with a comment that has NO `user` key at all -- the
+		// "no body" case above still sets `user: BOT`. Without the `?.`, a
+		// comment shaped like this (a real possibility from the GitHub API,
+		// e.g. a since-deleted account) throws `TypeError: Cannot read
+		// properties of undefined (reading 'login')` out of `.find`, crashing
+		// the whole lookup instead of just skipping that one comment.
+		const comments = [
+			{ id: 1, body: STICKY_MARKER },
+			{ id: 2, body: STICKY_MARKER, user: BOT },
+		];
+
+		expect(() => findStickyCommentId(comments, STICKY_MARKER)).not.toThrow();
+		expect(findStickyCommentId(comments, STICKY_MARKER)).toBe(2);
+	});
+
 	it("accepts a caller-supplied bot login instead of the default", () => {
 		const comments = [
 			{ id: 1, body: STICKY_MARKER, user: { login: "some-other-bot[bot]" } },

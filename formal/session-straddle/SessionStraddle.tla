@@ -58,6 +58,9 @@ CONSTANTS
     LateAdmit,     \* the session-1 handler admits its compute in any phase,
                    \* including after the reset: index.ts abandons the handler
                    \* at its bound without cancelling it (#3512 r1 B2)
+    EarlyAbandon,  \* the session-1 handler is abandoned BEFORE its dispatch
+                   \* (its clients bound, its claim join, bash recovery) and
+                   \* dispatches in any phase, including after the reset (#3568)
     FixParts       \* the guards, a subset of
                    \*   "settle"                settleCascadeRuns drops on a stale generation
                    \*   "reconcile"             the reconcile's append drops on a stale
@@ -80,6 +83,11 @@ CONSTANTS
                    \*                           generation current when it is recorded
                    \*   "dispatchHoist"         mutant: one dispatch handle reused
                    \*                           across dispatches (session 1's)
+                   \*   "entryCapture"          the session-1 handler's dispatch uses
+                   \*                           the generation it captured at handler
+                   \*                           ENTRY, before its first await (#3568);
+                   \*                           without it, the one current when it
+                   \*                           dispatches
 
 VARIABLES
     phase,      \* "s1" | "s1down" | "s2starting" | "s2"
@@ -105,14 +113,19 @@ VARIABLES
     ovfGen,     \* generation each overflow admission captured
     adm1,       \* the session-1 handler has admitted its compute
     adm2,       \* session 2 has admitted its own compute past the cap
-    admDropped  \* origins the admission guard dropped
+    admDropped, \* origins the admission guard dropped
+    disp1,      \* the session-1 handler has dispatched its pipeline (#3568)
+    d1Gen       \* the generation that dispatch holds (#3568)
 
 vars == <<phase, gen, resets, pending, resolved, runs, touches, settle, snap,
           settleGen, recon, reconGen, drained, dropped, rec2, d2Gen, strayed,
-          dup, delivered, ovf, ovfGen, adm1, adm2, admDropped>>
+          dup, delivered, ovf, ovfGen, adm1, adm2, admDropped, disp1, d1Gen>>
 
 \* The shared UNCHANGED tail of the #3512 variables, for the #3499 actions.
-Rest3512 == <<d2Gen, ovf, ovfGen, adm1, adm2, admDropped>>
+Rest3512 == <<d2Gen, ovf, ovfGen, adm1, adm2, admDropped, disp1, d1Gen>>
+
+\* The #3568 variables, for the #3512 actions that list theirs explicitly.
+Rest3568 == <<disp1, d1Gen>>
 
 \* The generation the session-1 handler captured when it dispatched its
 \* pipeline (writeSession, before the pipeline await), in session 1. Both the
@@ -133,6 +146,7 @@ TypeOK ==
     /\ ovf \subseteq Sess /\ admDropped \subseteq Sess
     /\ adm1 \in BOOLEAN /\ adm2 \in BOOLEAN
     /\ ovfGen \in [Sess -> 0..4]
+    /\ disp1 \in BOOLEAN /\ d1Gen \in 0..4
 
 Init ==
     /\ phase = "s1"
@@ -144,6 +158,8 @@ Init ==
     /\ ovf = IF Overflow /\ ~LateAdmit THEN {1} ELSE {}
     /\ ovfGen = [s \in Sess |-> IF s = 1 THEN Dispatch1Gen ELSE 0]
     /\ adm1 = ~LateAdmit /\ adm2 = FALSE /\ admDropped = {}
+    \* #3568: a handler abandoned before its dispatch has not dispatched yet
+    /\ disp1 = ~EarlyAbandon /\ d1Gen = Dispatch1Gen
     /\ resolved = FALSE
     /\ runs = {}
     /\ touches = {1}            \* and a session-1 tier-3 touch is outstanding
@@ -167,12 +183,25 @@ OvfAppend(o) ==
 \* The session-1 compute resolves. Parked, the settle picks it up; admitted
 \* past the cap, its `.then` appends it in the same microtask run.
 Resolve ==
-    /\ ~resolved
+    /\ disp1 /\ ~resolved
     /\ resolved' = TRUE
     /\ IF 1 \in ovf THEN OvfAppend(1) ELSE UNCHANGED <<ovf, runs, admDropped>>
     /\ UNCHANGED <<phase, gen, resets, pending, touches, settle, snap,
                    settleGen, recon, reconGen, drained, dropped, rec2, d2Gen,
                    strayed, dup, delivered, ovfGen, adm1, adm2>>
+    /\ UNCHANGED Rest3568
+
+\* #3568: the session-1 handler, abandoned before its dispatch, resumes and
+\* dispatches in any phase. Its dispatch holds the generation captured at
+\* handler entry (session 1's), unless it captures when it dispatches.
+Dispatch1 ==
+    /\ EarlyAbandon /\ ~disp1
+    /\ disp1' = TRUE
+    /\ d1Gen' = IF "entryCapture" \in FixParts THEN Dispatch1Gen ELSE gen
+    /\ UNCHANGED <<phase, gen, resets, pending, resolved, runs, touches, settle,
+                   snap, settleGen, recon, reconGen, drained, dropped, rec2,
+                   d2Gen, strayed, dup, delivered, ovf, ovfGen, adm1, adm2,
+                   admDropped>>
 
 \* appendCascadePromise(p, g): under "admission" a stale g drops the
 \* admission on either branch; otherwise the compute is parked or, past the
@@ -192,12 +221,13 @@ Admit(o, g) ==
 \* #3512 r1 B2: the session-1 handler resumes after its pipeline await and
 \* admits (runtime-tool-result.ts -> appendCascadePromise), in any phase.
 Admit1 ==
-    /\ LateAdmit /\ ~adm1
+    /\ LateAdmit /\ disp1 /\ ~adm1
     /\ adm1' = TRUE
-    /\ Admit(1, IF "admissionAtAdmit" \in FixParts THEN gen ELSE Dispatch1Gen)
+    /\ Admit(1, IF "admissionAtAdmit" \in FixParts THEN gen ELSE d1Gen)
     /\ UNCHANGED <<phase, gen, resets, resolved, runs, touches, settle, snap,
                    settleGen, recon, reconGen, drained, dropped, rec2, d2Gen,
                    strayed, dup, delivered, adm2>>
+    /\ UNCHANGED Rest3568
 
 \* A compute admitted past the cap after it resolved: its `.then` fires.
 Fire1 ==
@@ -206,6 +236,7 @@ Fire1 ==
     /\ UNCHANGED <<phase, gen, resets, pending, resolved, touches, settle, snap,
                    settleGen, recon, reconGen, drained, dropped, rec2, d2Gen,
                    strayed, dup, delivered, ovfGen, adm1, adm2>>
+    /\ UNCHANGED Rest3568
 
 \* Session 2's tool_result admits its own compute past the cap, with the
 \* generation its own dispatch captured.
@@ -216,6 +247,7 @@ Admit2 ==
     /\ UNCHANGED <<phase, gen, resets, resolved, runs, touches, settle, snap,
                    settleGen, recon, reconGen, drained, dropped, rec2, d2Gen,
                    strayed, dup, delivered, adm1>>
+    /\ UNCHANGED Rest3568
 
 Resolve2 ==
     /\ 2 \in ovf
@@ -223,6 +255,7 @@ Resolve2 ==
     /\ UNCHANGED <<phase, gen, resets, pending, resolved, touches, settle, snap,
                    settleGen, recon, reconGen, drained, dropped, rec2, d2Gen,
                    strayed, dup, delivered, ovfGen, adm1, adm2>>
+    /\ UNCHANGED Rest3568
 
 \* agent_settled: `void runQuietWindow(...)`, which captures the generation.
 Settled ==
@@ -342,6 +375,7 @@ Dispatch2 ==
     /\ UNCHANGED <<phase, gen, resets, pending, resolved, runs, touches, settle,
                    snap, settleGen, recon, reconGen, drained, dropped, strayed,
                    dup, delivered, ovf, ovfGen, adm1, adm2, admDropped>>
+    /\ UNCHANGED Rest3568
 
 \* Session 2's compute records its own tier-3 touch.
 Record2 ==
@@ -356,10 +390,10 @@ Record2 ==
 \* reset. Its generation is the one its dispatch captured, unless the
 \* "strayRecordCapture" mutant stamps it at record time.
 Stray ==
-    /\ Strays /\ phase = "s2" /\ ~resolved /\ ~strayed
+    /\ Strays /\ phase = "s2" /\ disp1 /\ ~resolved /\ ~strayed
     /\ strayed' = TRUE
     /\ RecordTouch(1, IF "strayRecordCapture" \in FixParts
-                        THEN gen ELSE Dispatch1Gen)
+                        THEN gen ELSE d1Gen)
     /\ UNCHANGED <<phase, gen, resets, pending, resolved, runs, settle, snap,
                    settleGen, recon, reconGen, drained, rec2, dup, delivered>>
     /\ UNCHANGED Rest3512
@@ -391,7 +425,7 @@ Next ==
     \/ Resolve \/ Settled \/ SettleFinish \/ ReconStart \/ ReconFinish
     \/ Shutdown1 \/ StartBegin \/ StartReset \/ DupStart \/ Dispatch2
     \/ Record2 \/ Stray \/ Admit1 \/ Fire1 \/ Admit2 \/ Resolve2 \/ Window2
-    \/ TurnEnd2
+    \/ TurnEnd2 \/ Dispatch1
 
 Spec == Init /\ [][Next]_vars
 

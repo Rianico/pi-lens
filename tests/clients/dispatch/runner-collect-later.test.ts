@@ -11,8 +11,11 @@ import {
 	drainPendingRunnerFindings,
 	deferRunnerFindings,
 	dropStaleRunnerFindings,
+	pendingRunnerFindingsSize,
 	resetPendingRunnerFindings,
 } from "../../../clients/dispatch/pending-runner-findings.js";
+import { createGenerationSource } from "../../../clients/generation-guard.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -267,5 +270,87 @@ describe("observed runner collect-later tier (#2116)", () => {
 				}),
 			]),
 		);
+	});
+
+	describe("#3568: a dispatch that straddles a session replacement", () => {
+		/**
+		 * An inline runner parks the group; the collect-later runner after it is
+		 * deferred only once the gate opens, after the test's `/new`.
+		 */
+		async function deferAfterGate(replace: boolean) {
+			observeRunnerLatency({
+				projectRoot,
+				runnerId: "fixture-runner",
+				durationMs: COLLECT_LATER_THRESHOLD_MS + 1,
+			});
+			let open!: () => void;
+			const gate = new Promise<void>((r) => (open = r));
+			let entered!: () => void;
+			const parked = new Promise<void>((r) => (entered = r));
+			const registry = new RunnerRegistry();
+			registry.register({
+				id: "gate-runner",
+				appliesTo: ["jsts"],
+				priority: 1,
+				run: async () => {
+					entered();
+					await gate;
+					return { status: "succeeded", diagnostics: [], semantic: "none" };
+				},
+			});
+			registry.register({
+				id: "fixture-runner",
+				appliesTo: ["jsts"],
+				priority: 2,
+				run: async () => ({
+					status: "succeeded",
+					diagnostics: [],
+					semantic: "warning",
+				}),
+			});
+			const sessions = createGenerationSource("test-runtime-session");
+			const ctx = createDispatchContext(
+				filePath,
+				projectRoot,
+				{ getFlag: () => false },
+				new FactStore(),
+				undefined,
+				undefined,
+				undefined,
+				1,
+				undefined,
+				undefined,
+				sessions.capture(),
+			);
+			const dispatch = dispatchForFile(
+				ctx,
+				[{ mode: "all", runnerIds: ["gate-runner", "fixture-runner"] }],
+				registry,
+			);
+			await parked;
+			// session_start clears the store and bumps the generation in one tick.
+			if (replace) {
+				resetPendingRunnerFindings();
+				sessions.bump();
+			}
+			open();
+			await dispatch;
+			return pendingRunnerFindingsSize();
+		}
+
+		it("a session-1 dispatch defers no runner into session 2's store", async () => {
+			expect(await deferAfterGate(true)).toBe(0);
+			expect(
+				getDegradationSummary()
+					.filter((entry) => entry.kind === "generation-guard-stale-write")
+					.flatMap((entry) => entry.latestReasons.map((r) => r.subject)),
+			).toEqual([
+				`test-runtime-session:fixture-runner:${normalizeMapKey(filePath)}`,
+			]);
+		});
+
+		it("no-drop (shape 54): a dispatch still in its session defers its runner", async () => {
+			expect(await deferAfterGate(false)).toBe(1);
+		});
 	});
 });

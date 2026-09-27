@@ -257,6 +257,8 @@ interface ToolResultDeps {
 	_readGuardAuthorship?: boolean;
 	/** Internal: synthetic dispatch inherits the parent's ownership decision. */
 	_allowAutonomousWriters?: boolean;
+	/** Internal (#3568): synthetic dispatch inherits the parent's session. */
+	_sessionGeneration?: GenerationHandle;
 }
 
 function ensureToolResultClients(
@@ -800,6 +802,8 @@ async function dispatchPipelineAnalysis(args: {
 	autofixMode: "immediate" | "deferred";
 	modifiedRanges: Array<{ start: number; end: number }> | undefined;
 	writeIndex: number;
+	/** #3540 r2: the order turn `writeIndex` was drawn in. */
+	writeOrderTurn: number;
 	initialStateHash: string;
 	readGuardCorrelationId: string;
 	requestedEditIndexes: number[];
@@ -822,7 +826,7 @@ async function dispatchPipelineAnalysis(args: {
 	allowAutonomousWriters: boolean;
 	/**
 	 * #3512: the session this dispatch belongs to, captured by the caller
-	 * before its first await on the pipeline. The deferred cascade's tier-3
+	 * at handler entry (#3568), before its first await. The deferred cascade's tier-3
 	 * touch and the caller's later admission of that cascade both drop
 	 * through it once the session is replaced.
 	 */
@@ -846,6 +850,7 @@ async function dispatchPipelineAnalysis(args: {
 		autofixMode,
 		modifiedRanges,
 		writeIndex,
+		writeOrderTurn,
 		initialStateHash,
 		readGuardCorrelationId,
 		requestedEditIndexes,
@@ -882,6 +887,7 @@ async function dispatchPipelineAnalysis(args: {
 				sessionId: runtime.telemetrySessionId,
 				turnIndex: runtime.turnIndex,
 				writeIndex,
+				orderTurn: writeOrderTurn,
 				modelId: runtime.telemetryModelId,
 				provider: runtime.telemetryProviderId,
 			},
@@ -912,7 +918,12 @@ async function dispatchPipelineAnalysis(args: {
 				scheduleWordIndexPersist(dispatchCwd, index, dbg);
 			},
 			sessionGeneration,
-			nextWriteIndex: () => runtime.nextWriteIndex(),
+			// #3559: the re-token's turn, read when it is drawn.
+			nextWriteIndex: () => ({
+				turnIndex: runtime.turnIndex,
+				orderTurn: runtime.writeOrderTurn,
+				writeIndex: runtime.nextWriteIndex(),
+			}),
 		},
 		{
 			biomeClient: biomeClient!,
@@ -1195,6 +1206,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		formatBehaviorWarnings,
 	} = deps;
 
+	// #3506 r1 F8, #3568: the session this handler belongs to, captured before
+	// its first await. index.ts' bound abandons a handler without cancelling
+	// it, so any await below can resume after a session_start that restarted
+	// the turn and write counters; a capture taken there would name session 2.
+	const writeSession =
+		deps._sessionGeneration ?? runtime.captureSessionGeneration();
 	const rawFilePath = (event.input as { path?: string }).path;
 	const workspaceRoot = runtime.projectRoot || process.cwd();
 	let bashAuthorshipConfirmed =
@@ -1573,6 +1590,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// records freshness and runs diagnostics, but it cannot format/autofix
 				// or issue an edit-directed blocker/actionable instruction.
 				_allowAutonomousWriters: recognizedAuthoredSet.has(wp),
+				_sessionGeneration: writeSession,
 			});
 			if (syntheticResult) {
 				// #1590: forward verbatim. The synthetic call already charged the
@@ -2163,6 +2181,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							autofixMode: observedAutofixMode,
 							modifiedRanges: undefined,
 							writeIndex: runtime.nextWriteIndex(),
+							writeOrderTurn: runtime.writeOrderTurn,
 							initialStateHash: observedStateHashForPath,
 							readGuardCorrelationId: observedReadGuardCorrelationId,
 							requestedEditIndexes: getRequestedEditIndexes(
@@ -2184,8 +2203,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							// per-path dispatch.
 							allowAutonomousWriters: true,
 							// #3512: this path admits no cascade, so the capture
-							// only guards the cascade's tier-3 touch.
-							sessionGeneration: runtime.captureSessionGeneration(),
+							// only guards the cascade's tier-3 touch. #3568: the
+							// handler's, not one taken after path 1's await.
+							sessionGeneration: writeSession,
 						}),
 						{
 							ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
@@ -2446,12 +2466,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// comes from the runtime, which `message_start`/`session_start` populate —
 	// see the `telemetry:` block handed to `runPipeline` below.
 	const writeIndex = runtime.nextWriteIndex();
-	// #3507: the turn this token was drawn in orders it across turns.
-	const writeTurnIndex = runtime.turnIndex;
-	// #3506 r1 F8: the session the token belongs to. index.ts' bound abandons
-	// this handler without cancelling it, so it can settle after a
-	// session_start that restarted the turn and write counters.
-	const writeSession = runtime.captureSessionGeneration();
+	// #3507: the turn this token was drawn in orders it across turns (#3540
+	// r2: the order turn, which a session reset never restarts).
+	const writeOrderTurn = runtime.writeOrderTurn;
 	let modifiedRanges: Array<{ start: number; end: number }> | undefined;
 	// #2423: ranges a shape adapter resolved from the tool's own input. Only a
 	// classified non-native edit shape sets these — a plain host `edit` carries
@@ -2598,6 +2615,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			autofixMode,
 			modifiedRanges,
 			writeIndex,
+			writeOrderTurn,
 			initialStateHash,
 			readGuardCorrelationId,
 			requestedEditIndexes,
@@ -2752,11 +2770,17 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		runtime.appendCascadePromise(result.cascadePromise, writeSession, filePath);
 	}
 
-	if (result.actionableWarnings?.length) {
-		runtime.recordActionableWarnings(result.actionableWarnings);
+	// #3568: per-turn maps the replacement's reset cleared.
+	const { actionableWarnings, codeQualityWarnings } = result;
+	if (actionableWarnings?.length) {
+		writeSession.guardedWrite(filePath, () =>
+			runtime.recordActionableWarnings(actionableWarnings),
+		);
 	}
-	if (result.codeQualityWarnings?.length) {
-		runtime.recordCodeQualityWarnings(result.codeQualityWarnings);
+	if (codeQualityWarnings?.length) {
+		writeSession.guardedWrite(filePath, () =>
+			runtime.recordCodeQualityWarnings(codeQualityWarnings),
+		);
 	}
 
 	// #484: opt-in per-turn summary collection. Same signals the pipeline
@@ -2817,7 +2841,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					// later `lens_diagnostic_mark` can be applied to this record at turn
 					// end instead of replaying pre-mark text.
 					result.inlineBlockerDiagnostics,
-					writeTurnIndex,
+					// #3559: a re-token's own turn.
+					result.orderTurn ?? writeOrderTurn,
 					// #3503: the freshness baseline is the analysis read.
 					result.analysisReadAtMs,
 				),
@@ -2828,7 +2853,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				runtime.clearInlineBlockers(
 					filePath,
 					result.writeIndex ?? writeIndex,
-					writeTurnIndex,
+					result.orderTurn ?? writeOrderTurn,
 				),
 			) ?? false;
 	}

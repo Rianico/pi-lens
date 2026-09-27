@@ -1,17 +1,36 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
 import {
 	TLA_TOOLS,
+	buildJavaArgs,
 	classifyTlcOutput,
+	computeConcurrency,
 	listModelConfigs,
+	parseConcurrencyArg,
 	parseModelHeader,
 	resolveJarPath,
+	runPool,
 	verdictMatches,
 } from "../../scripts/check-tla-models.mjs";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
+
+/** A promise plus its own resolve, for driving `runPool` step by step. */
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((r) => {
+		resolve = r;
+	});
+	return { promise, resolve };
+}
+
+/** Flush a couple of microtask turns so a resolved promise's `.then` chain runs. */
+async function flushMicrotasks() {
+	await Promise.resolve();
+	await Promise.resolve();
+}
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -136,6 +155,149 @@ describe("resolveJarPath (#3447)", () => {
 		expect(resolveJarPath(undefined, REPO_ROOT)).toBe(
 			path.join(REPO_ROOT, ".cache", "tla2tools.jar"),
 		);
+	});
+});
+
+describe("computeConcurrency (#3572)", () => {
+	it("bounds the pool by the CPU count when there are more configs than cores", () => {
+		expect(computeConcurrency(320, 4)).toBe(4);
+	});
+
+	it("bounds the pool by the config count when there are fewer configs than cores", () => {
+		expect(computeConcurrency(2, 8)).toBe(2);
+	});
+
+	it("floors at 1 even if the host reports zero or negative parallelism", () => {
+		expect(computeConcurrency(320, 0)).toBe(1);
+		expect(computeConcurrency(320, -1)).toBe(1);
+	});
+});
+
+describe("parseConcurrencyArg (#3572)", () => {
+	it("accepts a positive integer", () => {
+		expect(parseConcurrencyArg("4")).toBe(4);
+		expect(parseConcurrencyArg("1")).toBe(1);
+	});
+
+	it("throws on a missing value, so a bad flag fails loudly instead of silently becoming 1 lane", () => {
+		expect(() => parseConcurrencyArg(undefined)).toThrow(
+			/--concurrency must be an integer/,
+		);
+	});
+
+	it("throws on a non-numeric value", () => {
+		expect(() => parseConcurrencyArg("many")).toThrow(
+			/--concurrency must be an integer/,
+		);
+	});
+
+	it("throws on zero, a negative number, or a non-integer", () => {
+		expect(() => parseConcurrencyArg("0")).toThrow();
+		expect(() => parseConcurrencyArg("-1")).toThrow();
+		expect(() => parseConcurrencyArg("2.5")).toThrow();
+	});
+});
+
+describe("buildJavaArgs (#3572, #3517)", () => {
+	it("always emits a literal `-workers 1`, never `auto` and never a caller-supplied count", () => {
+		// #3517: TLC's own thread interleaving under `-workers auto` decides
+		// which invariant a multi-violation config reports first. Every config
+		// is pinned to one worker so the seam has no way to vary this — there
+		// is no parameter left for a caller (main() included) to widen it.
+		const args = buildJavaArgs("/jar", "/meta", "X.cfg", "Mod");
+		const workersIndex = args.indexOf("-workers");
+		expect(workersIndex).toBeGreaterThan(-1);
+		expect(args[workersIndex + 1]).toBe("1");
+	});
+
+	it("runs the config by its basename, from the module's own directory", () => {
+		const args = buildJavaArgs("/jar", "/meta", "X.cfg", "Mod");
+		expect(args).toEqual([
+			"-Djava.io.tmpdir=/meta",
+			"-XX:+UseParallelGC",
+			"-cp",
+			"/jar",
+			"tlc2.TLC",
+			"-workers",
+			"1",
+			"-metadir",
+			"/meta",
+			"-config",
+			"X.cfg",
+			"Mod",
+		]);
+	});
+
+	it("pins the JVM temp dir to the run's own metadir, not the shared OS temp dir", () => {
+		// SANY extracts the TLA+ standard modules to java.io.tmpdir under a
+		// fixed filename, so two concurrent TLC processes sharing the OS temp
+		// dir can race there (#3572: reproduced running the pool over all of
+		// formal/, one `AbortException` in 320 configs). Each run must get its
+		// own tmpdir instead of the JVM default.
+		const args = buildJavaArgs("/jar", "/meta-a", "X.cfg", "Mod");
+		expect(args[0]).toBe("-Djava.io.tmpdir=/meta-a");
+		const other = buildJavaArgs("/jar", "/meta-b", "X.cfg", "Mod");
+		expect(other[0]).toBe("-Djava.io.tmpdir=/meta-b");
+	});
+});
+
+describe("runPool (#3572)", () => {
+	it("never runs more tasks at once than the given concurrency", async () => {
+		const items = [0, 1, 2, 3, 4];
+		const controls = items.map(() => deferred<string>());
+		const started: number[] = [];
+		const task = vi.fn((item: number) => {
+			started.push(item);
+			return controls[item].promise;
+		});
+
+		const resultPromise = runPool(items, 2, task);
+
+		// Two lanes claim their first item synchronously; the rest wait.
+		expect(started).toEqual([0, 1]);
+
+		controls[0].resolve("r0");
+		await flushMicrotasks();
+		expect(started).toEqual([0, 1, 2]);
+
+		controls[1].resolve("r1");
+		await flushMicrotasks();
+		expect(started).toEqual([0, 1, 2, 3]);
+
+		controls[2].resolve("r2");
+		controls[3].resolve("r3");
+		await flushMicrotasks();
+		expect(started).toEqual([0, 1, 2, 3, 4]);
+
+		controls[4].resolve("r4");
+		expect(await resultPromise).toEqual(["r0", "r1", "r2", "r3", "r4"]);
+	});
+
+	it("returns results in input order even when later items finish first", async () => {
+		const items = [0, 1, 2];
+		const controls = items.map(() => deferred<string>());
+		const task = (item: number) => controls[item].promise;
+
+		const resultPromise = runPool(items, 3, task);
+		// Complete item 2 first, then 0, then 1.
+		controls[2].resolve("r2");
+		controls[0].resolve("r0");
+		controls[1].resolve("r1");
+
+		expect(await resultPromise).toEqual(["r0", "r1", "r2"]);
+	});
+
+	it("does not silently drop every task when concurrency is zero", async () => {
+		const task = vi.fn(async (item: number) => `r${item}`);
+		const results = await runPool([0, 1, 2], 0, task);
+		expect(task).toHaveBeenCalledTimes(3);
+		expect(results).toEqual(["r0", "r1", "r2"]);
+	});
+
+	it("does not hang when concurrency exceeds the item count", async () => {
+		const task = vi.fn(async (item: number) => `r${item}`);
+		const results = await runPool([0, 1], 10, task);
+		expect(results).toEqual(["r0", "r1"]);
 	});
 });
 

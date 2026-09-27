@@ -187,6 +187,18 @@ function writeReport(strykerReport, meta) {
 	writeFileSync(REPORT_PATH, JSON.stringify(report, null, 2));
 }
 
+// F1 (#3592 round 2): declared here, BEFORE `baseMeta`, not down at the dry-run
+// measurement site where it used to live. `baseMeta` is called from FOUR
+// early-exit paths above this point (no changed mutation source, no covering
+// test, a source-map build failure, no mutation range) -- every one of them
+// runs before the dry-run measurement, so a `let` declared past `baseMeta`
+// left every early exit in the temporal dead zone: `ReferenceError: Cannot
+// access 'costEstimate' before initialization`, thrown OUT OF baseMeta itself,
+// with no report ever written and the run exiting 1 as a crash rather than 0
+// with a `zeroMutants` report (reproduced live at 69413b03e -- see
+// "no PR-changed lines" in the spawn test below).
+let costEstimate = null;
+
 function baseMeta(extra) {
 	return {
 		generatedAt: new Date().toISOString(),
@@ -196,6 +208,15 @@ function baseMeta(extra) {
 		maxFiles,
 		maxRanges,
 		partial: null,
+		// #3592 item 2: the dry-run measurement's total (set once the
+		// `--dryRunOnly` measurement parses successfully -- see `costEstimate`
+		// above), carried into EVERY report through this one function so the
+		// renderer has something to cross-check a completed run's evaluated
+		// count against, independent of whether `partial`/`zeroMutants` were
+		// correctly set. null before the measurement runs (the early-exit
+		// zero-mutant paths above) or when Stryker's dry-run output could not
+		// be parsed (`parseDryRunCost` returned null).
+		measuredTotalMutants: costEstimate?.totalMutants ?? null,
 		...extra,
 	};
 }
@@ -374,7 +395,6 @@ console.log(measureOutput);
 
 let patterns = allPatterns;
 let sampled = false;
-let costEstimate = null;
 
 if (measureResult.error || measureResult.status !== 0) {
 	// The measurement dry run IS the real run's own dry run (same tests, same
