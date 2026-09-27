@@ -70,7 +70,8 @@ import {
 
 /**
  * Budget: a run is microtasks plus one synchronous change-log append per
- * bookkeeping writer; NUM_RUNS take about 1.1 s here (measured). The seed is
+ * bookkeeping writer and one widget write per widget writer; NUM_RUNS take
+ * about 1.2 s here (measured, #3540 r2). The seed is
  * fixed so the lane is deterministic; raise NUM_RUNS or drop SEED locally to
  * explore. Seeds 1-100 at this NUM_RUNS were green before landing.
  */
