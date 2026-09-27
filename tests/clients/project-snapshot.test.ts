@@ -53,6 +53,7 @@ import {
 	readProjectSnapshotMeta,
 	resetLastNarrowParseDigestForTests,
 	resetProjectSnapshotPersistWorkerForTests,
+	runSnapshotPersistExitFlushForTests,
 	setProjectSnapshotGenerationGateForTests,
 	setProjectSnapshotPromotionSeamForTests,
 	saveProjectSnapshot,
@@ -2051,5 +2052,70 @@ describe("project snapshot worker persist (#958)", () => {
 			);
 			_resetProjectSnapshotParseCacheForTests();
 			expect(loadProjectSnapshot(cwd)?.seq).toBe(5);
+		}));
+
+	/**
+	 * Recurrence this guards: the exit hook's own generation-match check
+	 * (deleted, #3594) duplicated `writeSnapshotBodyOnMainThread`'s own
+	 * `pendingSnapshotIsCurrent` gate. This drives the flush end to end — two
+	 * concurrent saves for one key: the first goes "active" (dispatched to
+	 * the worker), and the second, issued before the worker's async response
+	 * can land, is coalesced into the queue behind it. `latestByKey`'s merge
+	 * must still pick the newer, queued save, and the writer's own gate must
+	 * still be the only thing standing between that pick and the write.
+	 */
+	it("the exit flush writes only the newer of two concurrent saves for one key (#3594)", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			resetProjectSnapshotPersistWorkerForTests();
+			const older = new RuntimeCoordinator();
+			older.seedProjectSequence(5);
+			const newer = new RuntimeCoordinator();
+			newer.seedProjectSequence(6);
+
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime: older }),
+			);
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime: newer }),
+			);
+			// The shape this test needs: one save active on the worker, a
+			// newer one queued behind it — not yet resolved either way.
+			expect(getProjectSnapshotPersistStateForTests(cwd)).toEqual(
+				expect.objectContaining({ active: true, queued: true }),
+			);
+
+			runSnapshotPersistExitFlushForTests();
+
+			_resetProjectSnapshotParseCacheForTests();
+			expect(loadProjectSnapshot(cwd)?.seq).toBe(6);
+			expect(getProjectSnapshotPersistStateForTests(cwd)).toEqual(
+				expect.objectContaining({ active: false, queued: false }),
+			);
+		}));
+
+	/**
+	 * A single save, never coalesced: the ordinary case, uncovered before
+	 * #3594 added `runSnapshotPersistExitFlushForTests`. Proves the flush
+	 * still writes the one pending it has when nothing was queued behind it.
+	 */
+	it("the exit flush writes a single pending save (#3594)", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			resetProjectSnapshotPersistWorkerForTests();
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(9);
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime }),
+			);
+			expect(getProjectSnapshotPersistStateForTests(cwd)).toEqual(
+				expect.objectContaining({ active: true, queued: false }),
+			);
+
+			runSnapshotPersistExitFlushForTests();
+
+			_resetProjectSnapshotParseCacheForTests();
+			expect(loadProjectSnapshot(cwd)?.seq).toBe(9);
 		}));
 });

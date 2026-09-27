@@ -1924,42 +1924,59 @@ function sweepStaleSnapshotStageFiles(cacheDir: string): void {
 	});
 }
 
-// Flush any in-flight worker writes synchronously at process teardown so a body
-// whose worker hasn't promoted yet isn't lost. Sync writes only (no child
-// spawn — the teardown libuv hazard); best-effort.
+/**
+ * Flush any in-flight worker writes synchronously at process teardown so a
+ * body whose worker hasn't promoted yet isn't lost. Sync writes only (no
+ * child spawn — the teardown libuv hazard); best-effort.
+ *
+ * #3594: `latestByKey`'s own construction below already keeps, per key, only
+ * the pending whose generation is the CURRENT one `_snapshotGenerationStates`
+ * holds for that key — the queued map is re-derived from that same state on
+ * every dispatch (`saveProjectSnapshot`), and the in-flight map only ever
+ * holds the dispatch that came right before it, so a superseded generation is
+ * never the survivor here. A generation check this loop used to repeat right
+ * before calling `writeSnapshotBodyOnMainThread` duplicated exactly the gate
+ * that function's own `pendingSnapshotIsCurrent` already runs first — no
+ * second check is needed for it to reach the write.
+ */
+function flushSnapshotPersistsAtExit(): void {
+	_snapshotExiting = true;
+	const latestByKey = new Map<string, PendingSnapshotBody>();
+	for (const pending of _snapshotWorkerRequests.values()) {
+		latestByKey.set(pending.key, pending);
+	}
+	for (const pending of _queuedSnapshotPersists.values()) {
+		const prior = latestByKey.get(pending.key);
+		// Queued work is later admission order. Equal-seq requests deliberately
+		// share a gate generation, so a tie must still select the queued payload.
+		if (!prior || prior.generation <= pending.generation) {
+			latestByKey.set(pending.key, pending);
+		}
+	}
+	_snapshotWorkerRequests.clear();
+	_queuedSnapshotPersists.clear();
+	_activeSnapshotPersists.clear();
+	for (const pending of latestByKey.values()) {
+		writeSnapshotBodyOnMainThread(pending, "exit_hook");
+	}
+	void _snapshotPersistWorker?.terminate();
+}
+
 let _snapshotExitHookInstalled = false;
 function ensureSnapshotPersistExitHook(): void {
 	if (_snapshotExitHookInstalled) return;
 	_snapshotExitHookInstalled = true;
-	process.once("exit", () => {
-		_snapshotExiting = true;
-		const latestByKey = new Map<string, PendingSnapshotBody>();
-		for (const pending of _snapshotWorkerRequests.values()) {
-			latestByKey.set(pending.key, pending);
-		}
-		for (const pending of _queuedSnapshotPersists.values()) {
-			const prior = latestByKey.get(pending.key);
-			// Queued work is later admission order. Equal-seq requests deliberately
-			// share a gate generation, so a tie must still select the queued payload.
-			if (!prior || prior.generation <= pending.generation) {
-				latestByKey.set(pending.key, pending);
-			}
-		}
-		_snapshotWorkerRequests.clear();
-		_queuedSnapshotPersists.clear();
-		_activeSnapshotPersists.clear();
-		for (const pending of latestByKey.values()) {
-			// Only the newest generation per key still matters; older ones are
-			// superseded and their stage files are swept on next launch.
-			if (
-				_snapshotGenerationStates.get(pending.key)?.generation !==
-				pending.generation
-			)
-				continue;
-			writeSnapshotBodyOnMainThread(pending, "exit_hook");
-		}
-		void _snapshotPersistWorker?.terminate();
-	});
+	process.once("exit", flushSnapshotPersistsAtExit);
+}
+
+/**
+ * Test-only: run the real process-exit flush without exiting the process,
+ * so its own generation selection (`latestByKey`) and the writer's gate
+ * (`pendingSnapshotIsCurrent`, inside `writeSnapshotBodyOnMainThread`) can be
+ * driven end to end (#3594) — this loop had no test coverage before.
+ */
+export function runSnapshotPersistExitFlushForTests(): void {
+	flushSnapshotPersistsAtExit();
 }
 
 export function saveProjectSnapshot(
