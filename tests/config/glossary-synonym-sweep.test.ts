@@ -1247,7 +1247,11 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"index.ts": 4,
 	},
 	warning: {
-		"clients/actionable-warnings.ts": 63,
+		// 63 → 65 (#3541): the actionable fix keys its expected content by
+		// `warning.filePath` and reports a stale fix under `warning.id`; both
+		// read the loop's actionable-warning record, which the file names
+		// throughout.
+		"clients/actionable-warnings.ts": 65,
 		"clients/ast-grep-client.ts": 4,
 		"clients/code-quality-warnings.ts": 32,
 		"clients/dispatch/runners/rubocop.ts": 1,
