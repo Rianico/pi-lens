@@ -166,8 +166,9 @@ describe("a clean re-answer evicts a cache-served entry (#1782 defect C)", () =>
 			loadWorkspaceDiagnosticsCache(tmp)?.entries[cacheKeyFor(ghost)];
 		// Pre-fix: the pull's answer for `ghost` was discarded because `ghost` was
 		// not in the touch group, so the entry survived with its blocker intact.
-		expect(entry?.diagnostics ?? []).toHaveLength(0);
-		expect(entry?.count ?? -1).toBe(0);
+		// #3505 (b): the clean answer is not bound to bytes pi-lens sent, so it
+		// is not persisted either; the ghost entry is evicted, not overwritten.
+		expect(entry).toBeUndefined();
 	});
 
 	it("returns exactly one result for the file, and it is the clean one", async () => {

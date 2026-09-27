@@ -146,13 +146,25 @@ jobs:
     name: TLA+ models
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
-    # refs #3447: TLC over formal/*/*.cfg. Measured locally: 166s for 74
-    # configs on 4 cores (the largest, lsp-server-content's two-writer
-    # configs, about 19s each); timeout = floor of 10 min.
-    # refs #3572: the serial run outgrew 10 min (master 551415b28 was cancelled
-    # at 598s with every reached config ok). 20 min is a stopgap until the
-    # per-config timing and parallel lane from #3572 land.
-    timeout-minutes: 20
+    # refs #3572, #3517: TLC over formal/*/*.cfg (330 configs as of this
+    # change), run through a CPU-sized concurrency pool instead of one at a
+    # time (scripts/check-tla-models.mjs). Master's serial run was cancelled
+    # at this job's old 10-minute cap on 551415b28 (job 108489017472, run
+    # 36272506689) at 320 configs: the step ran 598s, and the last config
+    # (store-freshness/WorkspaceOwnStatAfterRead) actually finished 30ms
+    # before the cancel landed — so CI's own dedicated 4-vCPU runner does a
+    # full serial pass of this population in about 600s. #3591 raised this
+    # job to 20 minutes as a stopgap pending this fix.
+    # Estimating the pooled time from that CI evidence rather than from a
+    # local run alone (this box is shared with other agents and swings from
+    # near-idle to load average 45): scaling CI's ~600s serial figure by this
+    # session's own local pooled/serial ratio (measured at ~0.48, i.e. 530s
+    # pooled vs. 1099s serial for the same 320 configs) projects a CI pooled
+    # time of about 290s; the CPU floor (total measured CPU-time, ~1200 CPU-s,
+    # scaled to CI's serial speed and spread over 4 lanes) is about 165s. 12
+    # minutes (720s) gives roughly 2.4x headroom over the 290s estimate — keep
+    # 12; re-tune from a real CI run once this lands.
+    timeout-minutes: 12
     permissions:
       contents: read
 

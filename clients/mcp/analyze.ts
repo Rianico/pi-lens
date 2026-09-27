@@ -441,6 +441,10 @@ export async function analyzeFile(
 	// caller flags win over the default.
 	const host = createMcpHost({ "no-delta": true, ...options.flags }, cwd);
 
+	// #3573: the recorded row's freshness reference, taken before the
+	// analysis's first read (the warm-up's, whose diagnostics the dispatch can
+	// serve), so a write that lands while the analysis runs is newer than it.
+	const observedAt = Date.now();
 	if (options.warmLsp !== false) {
 		await warmLspForFile(absPath, host);
 	}
@@ -473,7 +477,12 @@ export async function analyzeFile(
 		// under the SAME widget-state key a canonical per-edit write already
 		// uses, instead of an orphaned key no reader (raw or normalized) can
 		// reach.
-		recordDiagnostics(normalizeMapKey(absPath), result.diagnostics);
+		recordDiagnostics(
+			normalizeMapKey(absPath),
+			result.diagnostics,
+			undefined,
+			observedAt,
+		);
 		if (result.diagnostics.length > 0) {
 			getDiagnosticTracker().trackShown(result.diagnostics);
 		}

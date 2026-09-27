@@ -1981,6 +1981,10 @@ export async function computeCascadeForFile(
 					// #3481: stamped before the read; the touches below run after awaits,
 					// and the stamp keeps them from landing over a newer write's touch.
 					const readStamp = performance.now();
+					// #3573: the wall-clock twin, the confirmed touch's widget row's
+					// `observedAt`: a dependency written while the touch waits on the
+					// server is then newer than the row.
+					const readAtMs = Date.now();
 					const content = await nodeFs.promises.readFile(neighborPath, "utf8");
 
 					// #458/#1444: tier-aware cascade-lane wait. A Tier-3 silent server
@@ -2239,7 +2243,7 @@ export async function computeCascadeForFile(
 					// see `cascadeReconcilableLspErrors`) so a live biome/ruff/aux finding or
 					// LSP warning survives this errors-only re-check. Keyed by the primary
 					// edit's `writeSeq` so a genuinely newer per-edit write still wins the
-					// WriteOrderingGuard. `observedAt` stays now (a fresh touch). The
+					// WriteOrderingGuard. `observedAt` is the neighbor's read (#3573). The
 					// inconclusive touch, the BOUND-FALSE touch (#1095 — computed against a
 					// diverged disk state), the tier-3-silent skip, the recently-clean
 					// short-circuit, the within-turn cache hit, and the rejected-touch
@@ -2250,6 +2254,7 @@ export async function computeCascadeForFile(
 							neighborPath,
 							cascadeReconcilableLspErrors(rawDiags.diags, neighborPath),
 							writeSeq,
+							readAtMs,
 						);
 					}
 

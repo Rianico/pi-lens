@@ -618,6 +618,12 @@ export interface WorkspaceDiagnosticsCacheContext {
 		 *  `scannedAt`. Omit to stamp now. */
 		scannedAt?: number,
 	): void;
+	/**
+	 * #3505 (b): drop `filePath`'s entry. For a confirmed answer the sweep may
+	 * not persist (a workspace pull not bound to bytes pi-lens sent): the entry
+	 * it supersedes must not stay behind to be replayed.
+	 */
+	forget(filePath: string): void;
 	/** Best-effort disk write of everything recorded so far. Swallows any
 	 * write failure — a failed cache write should never fail the sweep that
 	 * produced the data. Safe to call more than once (subsequent calls are a
@@ -824,6 +830,10 @@ export function createWorkspaceDiagnosticsCacheContext(
 				...(contentHash !== undefined && { contentHash }),
 				...(sizeBytes !== undefined && { sizeBytes }),
 			};
+			dirty = true;
+		},
+		forget(filePath) {
+			delete entries[cacheKeyFor(filePath)];
 			dirty = true;
 		},
 		persist() {

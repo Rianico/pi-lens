@@ -8,7 +8,7 @@ imports (dependency axis). The `TLA+ models` CI job
 (`node scripts/check-tla-models.mjs`) checks every config here against its
 `\* expect:` line.
 
-Issues: #3503, #3504, #3505.
+Issues: #3503, #3504, #3505, #3573, #3574.
 
 ## What the model covers
 
@@ -55,17 +55,17 @@ The clock is explicit, one tick is about 25 ms, and events can share a tick.
 
 | Store | Reference | Taken relative to the read | Gate | Config |
 |---|---|---|---|---|
-| widget-state own file, per entry (`reconcileStaleWidgetFiles`) | `observedAt` = the pipeline's `analysisReadAtMs`, passed to `recordDiagnostics` (#3503); `lsp_diagnostics`' fresh row: its `scannedAt` (#3505) | before | mtime | `WidgetOwnLateStamp`: pass. Mutant `MutWidgetOwnLateStamp` (record-time stamp): violated |
+| widget-state own file, per entry (`reconcileStaleWidgetFiles`) | `observedAt` = the pipeline's `analysisReadAtMs`, passed to `recordDiagnostics` (#3503); `lsp_diagnostics`' fresh row: its `scannedAt` (#3505); `lens_diagnostics mode=full`'s fresh sweep row: the sweep's per-file read stamp, kept through the correlated commit (#3573); `pilens_analyze`: a stamp before its LSP warm-up (#3573); a confirmed active cascade touch: a stamp before the neighbor's read (#3573) | before | mtime | `WidgetOwnLateStamp`: pass. Mutant `MutWidgetOwnLateStamp` (record-time stamp): violated |
 | widget-state dependency axis (`reconcileStaleWidgetDependencyBlockers`, and the turn-end sweep's widget rows via `getWidgetBlockingFilesForSweep`) | same `observedAt` | before | mtime | same shape as `BlockerDepLateStamp` |
 | inline blocker, import axis (`detectDrift`) | `recordedAtMs` = the pipeline's `analysisReadAtMs`, threaded through `recordInlineBlockers` (#3503) | before | mtime, latched | `BlockerDepLateStamp`: pass. Mutant `MutBlockerDepLateStamp`: violated |
-| inline blocker, own file, all-LSP | size+sha256 of the bytes the pipeline analysed | at the read | content | `BlockerLspOwn`: pass, mtime regress included |
+| inline blocker, own file, all-LSP | size+sha256 of the raw bytes the pipeline analysed (#3574: not of a decoded-then-re-encoded string) | at the read | content | `BlockerLspOwn`: pass, mtime regress included |
 | inline blocker, own file, non-LSP | size+sha256, with no mtime fast path (#3504) | at the read | content | `BlockerNonLspOwnFastPath`: pass. Mutant `MutBlockerNonLspOwnFastPath` (late stamp + fast path): violated; `FixBlockerReadStampStrict` (read stamp, fast path kept): violated |
 | workspace-diagnostics cache, own file, per-file sweep | stat mtime+size, taken before the pre-open read or `processFile`'s own read (#3505) | before | eq | `WorkspaceOwnStatAfterRead`: pass. Mutant `MutWorkspaceOwnStatAfterRead`: violated |
-| workspace-diagnostics cache, own file, pull | stat after the answer, and a disk hash taken after the answer | after the server answered | eq | `WorkspaceOwnPullPostHocHash`: **violated** (#3505 part b, not fixed here; `FixWorkspacePullBinding` is the checked fix) |
+| workspace-diagnostics cache, own file, pull | stat after the answer, and the hash of the content pi-lens sent (an open document at the reported version); an answer without that binding is not cached (#3505 b) | after the server answered; the binding at the server's read | eq | `WorkspaceOwnPullPostHocHash`: pass. Mutant `MutWorkspaceOwnPullPostHocHash` (a disk hash taken after the answer): violated; `WorkspaceOwnPullStatBeforeLag` (a stat before the request, no binding): violated |
 | workspace-diagnostics cache, own file, `lsp_diagnostics` | stat before its read | before | eq | the shape `WorkspaceOwnStatAfterRead` now models |
 | workspace-diagnostics cache, own file, coarse mtime | (mtime, size) inside one coarse granule | | eq | `WorkspaceOwnCoarseSameSize`: violated, admitted (#2300) |
 | workspace-diagnostics cache, dependency axis | per-file `scannedAt`, taken before the file's read (a pull: before its request; `lsp_diagnostics`: before its stat) (#3505) | before | mtime | the same unlatched mtime gate as the widget row: `WidgetOwnLateStamp` / `MutWidgetOwnLateStamp` |
-| project-diagnostics snapshot | size+sha256 per file; `scannedAt` after the loop only for rows without a fingerprint | at the read | content | not committed (see below) |
+| project-diagnostics snapshot | size+sha256 per file; `scannedAt` after the loop only for rows without a fingerprint. A fresh scan is checked too before its rows reach the widget (#3573) | at the read | content | not committed (see below) |
 | advisory-provenance (gitleaks/trivy/opengrep/govulncheck `scannedAt`) | `new Date()` at `runScan` entry | before the spawn | mtime | not committed (see below) |
 | late-aux drain | `markedAtMs` | see `formal/late-aux-drain` | | |
 | freshness-cadence | a TTL, not a reference stamp | | | not modelled |
@@ -102,6 +102,18 @@ The fixed code each passing config models, and the replay that pins it
   stamps before its stat and passes the same stamp as its fresh widget
   row's `observedAt` (review round 1); its single-file mode stamps the row
   before its touch (review round 2).
+- `Stamp = "start"` for the other widget writers (#3573):
+  `runWorkspaceDiagnosticsSwept` returns each fresh result with its
+  `scannedAt` as `observedAt`, and `tools/lens-diagnostics.ts` carries it
+  through the correlated commit; `clients/mcp/analyze.ts` stamps before its
+  LSP warm-up; `clients/dispatch/integration.ts` stamps the active cascade
+  touch before the neighbor's read (`tests/tools/lens-diagnostics-read-stamp.test.ts`,
+  `tests/clients/mcp/analyze.test.ts`, `tests/clients/cascade-compute.test.ts`).
+- `Binding = TRUE`, `BindingAt = "read"` for the pull path (#3505 b):
+  `clients/lsp/client.ts` `clientRequestWorkspaceDiagnostics` binds a full
+  item to `documentContentHashes` for an open document at the reported
+  version, and `runWorkspaceDiagnosticsSwept` records a pull answer only with
+  that binding (`forget()` drops the entry an unbound answer supersedes).
 
 ## Results
 
@@ -126,12 +138,12 @@ it varies with worker scheduling.
 | `FixBlockerReadStampStrict` (read stamp, fast path kept) | violated NoStaleServe | 695 | 2.0 |
 | `WorkspaceOwnStatAfterRead` | pass | 156,415 | 4.0 |
 | `MutWorkspaceOwnStatAfterRead` (stat after the read) | violated NoStaleServe | 1,583 | 1.8 |
-| `WorkspaceOwnPullPostHocHash` (pull path, #3505 part b open) | violated NoStaleServe | 1,587 | 1.8 |
-| `FixWorkspacePullBinding` (the checked part b fix) | pass | 206,290 | 4.7 |
-| `WorkspaceOwnPullStatBeforeLag` (part b fix mutant) | violated NoStaleServe | 3,615 | 1.5 |
+| `WorkspaceOwnPullPostHocHash` (pull path, #3505 b) | pass | 206,290 | 5.1 |
+| `MutWorkspaceOwnPullPostHocHash` (disk hash after the answer) | violated NoStaleServe | 863 | 2.5 |
+| `WorkspaceOwnPullStatBeforeLag` (fix mutant: stat before the request, no binding) | violated NoStaleServe | 2,813 | 2.6 |
 | `WorkspaceOwnCoarseSameSize` | violated NoStaleServe (admitted, #2300) | 688 | 1.6 |
 
-Times are from a shared 4-core host at load average 11 (review round 1).
+Times are from a shared 4-core host at load average 11 (review round 1); the three pull-path rows were re-run for #3505 b at load average 6.
 
 ## Traces
 

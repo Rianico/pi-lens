@@ -14,6 +14,7 @@
  * No wall clock: `Date` is faked and pinned per step, and every mtime is set
  * with `utimesSync`.
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
@@ -108,6 +109,21 @@ const noBiome = {
 	isSupportedFile: () => false,
 	ensureAvailable: async () => false,
 };
+
+function pipelineDeps(overrides: {
+	getFormatService?: () => FormatService;
+	biomeClient?: unknown;
+}) {
+	return {
+		biomeClient: (overrides.biomeClient ?? noBiome) as BiomeClient,
+		ruffClient: { isPythonFile: () => false } as never,
+		metricsClient: {} as never,
+		getFormatService:
+			overrides.getFormatService ??
+			(() => ({ recordRead: () => {} }) as unknown as FormatService),
+		fixedThisTurn: new Set<string>(),
+	};
+}
 
 function deps(runtime: RuntimeCoordinator) {
 	return {
@@ -312,21 +328,6 @@ describe("formal/store-freshness replays", () => {
 
 		// No-drop direction: the stamp is the FINAL analysis read, after
 		// pi-lens' own writes, so its own write never demotes its own verdict.
-		function pipelineDeps(overrides: {
-			getFormatService?: () => FormatService;
-			biomeClient?: unknown;
-		}) {
-			return {
-				biomeClient: (overrides.biomeClient ?? noBiome) as BiomeClient,
-				ruffClient: { isPythonFile: () => false } as never,
-				metricsClient: {} as never,
-				getFormatService:
-					overrides.getFormatService ??
-					(() => ({ recordRead: () => {} }) as unknown as FormatService),
-				fixedThisTurn: new Set<string>(),
-			};
-		}
-
 		it("FixReadStamp no-drop (#3503): the --immediate-format write that precedes the read does not drop the row", async () => {
 			const env = setupTestEnvironment("tla-store-format-");
 			try {
@@ -488,5 +489,170 @@ describe("formal/store-freshness replays", () => {
 				}
 			});
 		}
+	});
+
+	// ── #3574: the baseline is the bytes on disk, not a re-encoded decode ────
+	describe("the content baseline is the raw bytes the pipeline read (#3574)", () => {
+		// 0xE9 (Latin-1 "é") is not valid UTF-8: a decode turns it into U+FFFD,
+		// which re-encodes to three bytes, so a baseline taken from the decoded
+		// string is two bytes longer than the file.
+		const latin1 = (text: string) => Buffer.from(text, "latin1");
+		const CAFE = "// café\nexport const z = 1;\n";
+
+		const baselineOf = (bytes: Buffer) => ({
+			size: bytes.byteLength,
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		});
+
+		async function latin1Consumer(env: { tmpDir: string }) {
+			const edit = await editConsumer(env);
+			fs.writeFileSync(edit.filePath, latin1(CAFE));
+			setMtime(edit.filePath, T_READ - 1000);
+			return edit;
+		}
+
+		it("a Latin-1 file with a non-LSP blocker and no edit keeps its blocker across turn end (#3574)", async () => {
+			const env = setupTestEnvironment("tla-store-latin1-");
+			try {
+				const { filePath, runtime } = await latin1Consumer(env);
+				dispatchWith("ast-grep");
+				await handleToolResult({
+					...deps(runtime),
+					event: ev(filePath),
+				} as never);
+				const counts = await turnEndSweep(runtime, env.tmpDir);
+				expect(counts).toMatchObject({ kept: 1, revalidated: 0 });
+				expect(inlineRecord(runtime)).toMatchObject({ stale: false });
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		for (const [label, after] of [
+			["that changes its size", "// cafés\nexport const z = 1;\n"],
+			// 0xE8 decodes to the same U+FFFD as 0xE9: only a hash of the raw
+			// bytes tells the two files apart.
+			["that decodes to the same text", "// cafè\nexport const z = 1;\n"],
+		] as const) {
+			it(`an edit to a Latin-1 file ${label} is demoted for self-drift (#3574)`, async () => {
+				const env = setupTestEnvironment("tla-store-latin1-edit-");
+				try {
+					const { filePath, runtime } = await latin1Consumer(env);
+					dispatchWith("ast-grep", () => {
+						fs.writeFileSync(filePath, latin1(after));
+						setMtime(filePath, T_EDIT);
+					});
+					await handleToolResult({
+						...deps(runtime),
+						event: ev(filePath),
+					} as never);
+					const counts = await turnEndSweep(runtime, env.tmpDir);
+					expect(counts.revalidated).toBe(1);
+					expect(inlineRecord(runtime)).toMatchObject({
+						stale: true,
+						staleReason: "self-drift",
+					});
+				} finally {
+					env.cleanup();
+				}
+			});
+		}
+
+		it("the --immediate-format rewrite's bytes are the baseline (#3574)", async () => {
+			const env = setupTestEnvironment("tla-store-latin1-format-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				fs.writeFileSync(filePath, latin1("// café\nlet value=1\n"));
+				setMtime(filePath, T_READ - 1000);
+				dispatchWith("ast-grep");
+				const formatted = latin1("// café\nlet value = 1;\n");
+				const formatService = {
+					recordRead: () => {},
+					formatFile: async (fp: string) => {
+						fs.writeFileSync(fp, formatted);
+						return {
+							filePath: fp,
+							formatters: [{ name: "biome", success: true, changed: true }],
+							anyChanged: true,
+							allSucceeded: true,
+						};
+					},
+				} as unknown as FormatService;
+				const result = await runPipeline(
+					{
+						filePath,
+						cwd: env.tmpDir,
+						toolName: "edit",
+						autofixMode: "deferred",
+						getFlag: (name: string) =>
+							name === "immediate-format" || name === "no-lsp",
+						dbg: () => {},
+					},
+					pipelineDeps({ getFormatService: () => formatService }),
+				);
+				expect(result.fileModified).toBe(true);
+				expect(result.inlineBlockerFileContent).toEqual(baselineOf(formatted));
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		describe("the immediate autofix", () => {
+			beforeEach(() => {
+				setHostFileMutationQueueLoader(async () => ({ withFileMutationQueue }));
+			});
+			afterEach(() => {
+				setHostFileMutationQueueLoader(undefined);
+			});
+
+			it("the autofix rewrite's bytes are the baseline (#3574)", async () => {
+				const env = setupTestEnvironment("tla-store-latin1-autofix-");
+				try {
+					fs.writeFileSync(
+						path.join(env.tmpDir, "package.json"),
+						JSON.stringify({
+							devDependencies: { "@biomejs/biome": "^2.4.10" },
+						}),
+					);
+					fs.writeFileSync(
+						path.join(env.tmpDir, "package-lock.json"),
+						JSON.stringify({
+							lockfileVersion: 3,
+							packages: {
+								"": {},
+								"node_modules/@biomejs/biome": { version: "2.4.10" },
+							},
+						}),
+					);
+					const filePath = path.join(env.tmpDir, "a.ts");
+					fs.writeFileSync(filePath, latin1("// café\nvar a = 1;\n"));
+					setMtime(filePath, T_READ - 1000);
+					dispatchWith("ast-grep");
+					const fixed = latin1("// café\nconst a = 1;\n");
+					const fixer = {
+						isSupportedFile: () => true,
+						ensureAvailable: async () => true,
+						fixFileAsync: async (fp: string) => {
+							fs.writeFileSync(fp, fixed);
+							return { success: true, changed: true, fixed: 1 };
+						},
+					};
+					const result = await runPipeline(
+						{
+							filePath,
+							cwd: env.tmpDir,
+							toolName: "write",
+							getFlag: (name: string) => name === "no-lsp",
+							dbg: () => {},
+						},
+						pipelineDeps({ biomeClient: fixer }),
+					);
+					expect(result.fileModified).toBe(true);
+					expect(result.inlineBlockerFileContent).toEqual(baselineOf(fixed));
+				} finally {
+					env.cleanup();
+				}
+			});
+		});
 	});
 });
