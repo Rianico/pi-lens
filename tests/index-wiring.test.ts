@@ -181,6 +181,7 @@ import {
 	resetDegradationLedger,
 } from "../clients/degradation-ledger.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
+import { _settleRegistryMutationsForTests } from "../clients/instance-registry.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import {
@@ -1578,6 +1579,12 @@ describe("index.ts extension wiring", () => {
 		});
 
 		it("renders degradations through the shared renderDegradationLines seam, agreeing with pilens_health (#2515 S3)", async () => {
+			// #3498 (PR #3593): an earlier test's session shutdown can leave a
+			// queued registry removal or a superseded registration on the
+			// registry tail, which records its ledger row after a bare reset.
+			// Join the tail first so this test's exact-list assertion only sees
+			// what it records itself.
+			await _settleRegistryMutationsForTests();
 			resetDegradationLedger();
 			try {
 				// `log-sink-rotated` is an INFORMATIONAL kind (see
