@@ -1187,9 +1187,18 @@ export function nodeSupportsUseEnvProxy(versionString = process.version) {
 	if (!match) return false;
 	const major = Number(match[1]);
 	const minor = Number(match[2]);
-	if (major > 22) return true;
-	if (major < 22) return false;
-	return minor >= 21;
+	// N1 (verify round): NOT a simple "any later major carries a flag
+	// forward" boundary -- live-probed (a real Bearer `fetch` against
+	// `api.github.com/user` with `NODE_USE_ENV_PROXY=1`, both in this
+	// session via a throwaway `nvm install 23.11.0` and independently by the
+	// verify reviewer against several 23.x/24.x builds): 22.21.0 and every
+	// probed 24.x -> 200 (flag honored), but 23.11.0 -> still 401 (flag
+	// silently ignored, same as below the 22.21 floor). Node 23 was never an
+	// LTS line, and this flag's rollout evidently skipped it. `major >= 24`
+	// is therefore its own explicit clause, not folded into `major > 22`.
+	if (major >= 24) return true;
+	if (major === 22) return minor >= 21;
+	return false;
 }
 
 export const REEXEC_RUN = "run";
@@ -1396,6 +1405,25 @@ export async function run({
 	}
 }
 
+/**
+ * The `REEXEC_VERSION_TOO_OLD` stderr message (N3, verify round). Takes NO
+ * proxy-URL parameter -- deliberately, not just by omission: a proxy URL can
+ * carry HTTP Basic userinfo (`http://user:pass@host`), probed live on Node
+ * 22.20.0 with `HTTPS_PROXY=http://alice:s3cretpw@127.0.0.1:9` printing that
+ * verbatim to stderr before this fix. The URL is dropped from the message
+ * ENTIRELY rather than redacted: a redaction has to anticipate every shape a
+ * credential can take in a proxy URL (userinfo, a query-string token, a
+ * non-standard scheme), and getting that wrong once is the same leak with
+ * extra confidence. Naming that `HTTPS_PROXY`/`https_proxy` is set is enough
+ * for a human to act on; the value adds nothing this message needs. Exported
+ * as its own function (never taking the URL, not just never printing it) so
+ * a future edit cannot reintroduce the leak by simply adding an argument
+ * here without ALSO changing this signature, which a reviewer reads.
+ */
+export function formatVersionTooOldMessage(nodeVersion = process.version) {
+	return `ci-verdict: HTTPS_PROXY is set but this Node (${nodeVersion}) does not honor NODE_USE_ENV_PROXY (requires >=22.21.0) -- the REST transport cannot reach GitHub through the proxy. Upgrade Node, or run where \`gh\` is on PATH.`;
+}
+
 async function main() {
 	// F1: decided with the SAME `resolveTransport` call `run()` itself will
 	// make (`usesDefaultGhExec: true`, since `main()` never overrides
@@ -1409,9 +1437,7 @@ async function main() {
 		envProxyFlagAlreadySet: process.env.NODE_USE_ENV_PROXY === "1",
 	});
 	if (plan === REEXEC_VERSION_TOO_OLD) {
-		console.error(
-			`ci-verdict: HTTPS_PROXY is set (${proxyUrl}) but this Node (${process.version}) does not honor NODE_USE_ENV_PROXY (requires >=22.21.0) -- the REST transport cannot reach GitHub through the proxy. Upgrade Node, or run where \`gh\` is on PATH.`,
-		);
+		console.error(formatVersionTooOldMessage(process.version));
 		process.exitCode = EXIT_TRANSPORT;
 		return;
 	}

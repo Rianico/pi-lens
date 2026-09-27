@@ -241,6 +241,10 @@ export declare function resolveReexecPlan(options: {
 	nodeVersion?: string;
 }): string;
 
+export declare function formatVersionTooOldMessage(
+	nodeVersion?: string,
+): string;
+
 export declare function parseArgs(argv: string[]): {
 	target: string | null;
 	waitSeconds: number | null;

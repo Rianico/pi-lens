@@ -9,6 +9,7 @@ import {
 	EXIT_SUCCESS,
 	EXIT_TRANSPORT,
 	extractRequiredCheckNames,
+	formatVersionTooOldMessage,
 	isGhMissingError,
 	mapRestMergeableState,
 	MIN_GH_TIMEOUT_MS,
@@ -174,8 +175,14 @@ describe("resolveRepositoryViaGit (#3497)", () => {
 
 describe("mapRestMergeableState (#3497)", () => {
 	it("maps mergeable_state=dirty to CONFLICTING", () => {
+		// N2 (verify round): mergeable is null here, not false -- with
+		// mergeable: false the F6 clause (mergeable === false) alone already
+		// yields CONFLICTING, so neutering THIS clause (mergeable_state ===
+		// "dirty") stayed green under the old fixture. A null mergeable
+		// isolates the dirty-state clause as the only thing that can pass
+		// this assertion.
 		expect(
-			mapRestMergeableState({ mergeable: false, mergeable_state: "dirty" }),
+			mapRestMergeableState({ mergeable: null, mergeable_state: "dirty" }),
 		).toBe("CONFLICTING");
 	});
 
@@ -467,16 +474,31 @@ describe("resolveTransport (#3497)", () => {
 //   node --use-env-proxy                        -> "bad option" (flag does not exist)
 //   NODE_USE_ENV_PROXY=1 node -e '...same...'    -> still 401 (flag silently ignored)
 // matching the agent proxy's own README ("NODE_USE_ENV_PROXY=1 on Node >= 22.21").
+//
+// N1 (verify round): NOT a simple "any later major" boundary. A second
+// throwaway `nvm install 23.11.0` in this same session, same Bearer `fetch`
+// probe, with NODE_USE_ENV_PROXY=1 set: still 401 -- Node 23 (never an LTS
+// line) silently drops the flag, independent of the verify reviewer's own
+// probe across several 23.x/24.x builds (22.21.0 and every 24.x -> 200,
+// 23.11.0 -> 401). `major >= 24` is therefore its own explicit clause.
 describe("nodeSupportsUseEnvProxy (#3497 F1)", () => {
-	it.each(["v22.21.0", "v22.21.5", "v22.22.2", "v23.0.0", "v24.0.0"])(
+	it.each(["v22.21.0", "v22.21.5", "v22.22.2", "v24.0.0", "v24.4.1"])(
 		"%s is supported",
 		(version) => {
 			expect(nodeSupportsUseEnvProxy(version)).toBe(true);
 		},
 	);
 
-	it.each(["v22.19.0", "v22.20.9", "v21.99.0", "v20.0.0", "v0.1.2"])(
-		"%s (below the probed boundary) is not supported",
+	it.each([
+		"v22.19.0",
+		"v22.20.9",
+		"v21.99.0",
+		"v20.0.0",
+		"v0.1.2",
+		"v23.0.0",
+		"v23.11.0",
+	])(
+		"%s (below the probed boundary, or Node 23) is not supported",
 		(version) => {
 			expect(nodeSupportsUseEnvProxy(version)).toBe(false);
 		},
@@ -538,6 +560,133 @@ describe("resolveReexecPlan (#3497 F1)", () => {
 	// - nodeVersion below the boundary -> VERSION_TOO_OLD, not REEXEC
 	//   (proven above) -- the one direction a naive "just re-exec" fix
 	//   would get wrong, silently reproducing F1 on an older Node.
+});
+
+// N3 (verify round, security-relevant): the version-too-old message used to
+// print HTTPS_PROXY verbatim -- probed live on Node 22.20.0 with
+// HTTPS_PROXY=http://alice:s3cretpw@127.0.0.1:9, stderr printed
+// "HTTPS_PROXY is set (http://alice:s3cretpw@127.0.0.1:9)". Fixed by
+// removing the proxy-URL PARAMETER from the message function entirely
+// (`formatVersionTooOldMessage` takes only a Node version), not by trying to
+// redact it.
+describe("formatVersionTooOldMessage (#3497 N3)", () => {
+	const CREDENTIAL_PROXY_URLS = [
+		"http://alice:s3cretpw@127.0.0.1:9",
+		"http://alice:s3cretpw@127.0.0.1:9999",
+		"https://deploy-token-abc123@proxy.internal:8443",
+	];
+
+	it("never contains an '@' (no userinfo can appear -- the function takes no URL at all)", () => {
+		for (const version of ["v22.20.0", "v22.19.0", "v23.11.0"]) {
+			expect(formatVersionTooOldMessage(version)).not.toContain("@");
+		}
+	});
+
+	it.each(CREDENTIAL_PROXY_URLS)(
+		"never echoes a credential-bearing HTTPS_PROXY (%s) even when one is set in the environment around the call",
+		(proxyUrl) => {
+			const original = process.env.HTTPS_PROXY;
+			process.env.HTTPS_PROXY = proxyUrl;
+			try {
+				const message = formatVersionTooOldMessage("v22.20.0");
+				expect(message).not.toContain(proxyUrl);
+				expect(message).not.toMatch(/:\/\/[^/\s]+:[^/\s@]+@/); // scheme://user:pass@
+				expect(message).not.toContain("s3cretpw");
+				expect(message).not.toContain("deploy-token-abc123");
+			} finally {
+				if (original === undefined) delete process.env.HTTPS_PROXY;
+				else process.env.HTTPS_PROXY = original;
+			}
+		},
+	);
+
+	it("still names that HTTPS_PROXY is the reason, and the Node-version requirement, without the value", () => {
+		const message = formatVersionTooOldMessage("v22.20.0");
+		expect(message).toContain("HTTPS_PROXY is set");
+		expect(message).toContain("v22.20.0");
+		expect(message).toContain("22.21.0");
+	});
+});
+
+// N3's broader ask: sweep EVERY other message in these two files for a
+// printed env value or URL that could carry a credential. Static, not a
+// live probe of every transitive network-error path (that path is safe too
+// -- probed separately: a proxy CONNECT failure's `fetch` error carries only
+// `ECONNREFUSED <host>:<port>`, never the proxy URL's userinfo, quoted in
+// the PR body) -- this guards the SOURCE against a future message
+// reintroducing the leak, which a one-time probe cannot.
+describe("no message in ci-verdict.mjs or detect-untriaged-issues.mjs prints a raw env value or credential-bearing URL (#3497 N3)", () => {
+	const CI_VERDICT_SOURCE = readFileSync(
+		join(process.cwd(), "scripts/ci-verdict.mjs"),
+		"utf8",
+	);
+	const DETECT_UNTRIAGED_SOURCE = readFileSync(
+		join(process.cwd(), "scripts/detect-untriaged-issues.mjs"),
+		"utf8",
+	);
+	const LABEL_TRIAGE_SOURCE = readFileSync(
+		join(process.cwd(), "scripts/lib/label-triage.mjs"),
+		"utf8",
+	);
+
+	// Every console.error/console.log/stderr(/stdout( call and every `throw
+	// new Error(` site, with its full argument list (balanced parens), so a
+	// multi-line template literal is captured whole, not truncated at the
+	// first newline.
+	function messageCallSites(source: string): string[] {
+		const sites: string[] = [];
+		const callStart =
+			/\b(?:console\.(?:error|log|warn)|stderr|stdout|new Error)\s*\(/g;
+		for (const match of source.matchAll(callStart)) {
+			const start = match.index + match[0].length;
+			let depth = 1;
+			let end = start;
+			while (end < source.length && depth > 0) {
+				if (source[end] === "(") depth += 1;
+				else if (source[end] === ")") depth -= 1;
+				end += 1;
+			}
+			sites.push(source.slice(start, end));
+		}
+		return sites;
+	}
+
+	// A message is suspect if it directly interpolates the proxy URL
+	// variable, a raw `process.env.HTTPS_PROXY`/`https_proxy` read, or a
+	// token/credential-shaped env var -- restGet's own Authorization HEADER
+	// construction (never a printed message) is deliberately not in this
+	// list; that seam is covered by the R4 test instead.
+	const SUSPECT =
+		/\$\{\s*proxyUrl\s*\}|process\.env\.(?:HTTPS_PROXY|https_proxy|GH_TOKEN|GITHUB_TOKEN)\b/;
+
+	it("scripts/ci-verdict.mjs: no message call site interpolates a proxy URL or a raw token env var", () => {
+		const suspects = messageCallSites(CI_VERDICT_SOURCE).filter((site) =>
+			SUSPECT.test(site),
+		);
+		expect(suspects).toEqual([]);
+	});
+
+	it("scripts/detect-untriaged-issues.mjs: no message call site interpolates a raw token env var", () => {
+		const suspects = messageCallSites(DETECT_UNTRIAGED_SOURCE).filter((site) =>
+			SUSPECT.test(site),
+		);
+		expect(suspects).toEqual([]);
+	});
+
+	it("scripts/lib/label-triage.mjs: no message call site interpolates a raw token env var", () => {
+		const suspects = messageCallSites(LABEL_TRIAGE_SOURCE).filter((site) =>
+			SUSPECT.test(site),
+		);
+		expect(suspects).toEqual([]);
+	});
+
+	it("the sweep's own regex actually catches a planted leak (sanity: the sweep is not vacuous)", () => {
+		const planted =
+			"console.error(`leaked: ${proxyUrl} and ${process.env.HTTPS_PROXY}`);";
+		expect(messageCallSites(planted).some((site) => SUSPECT.test(site))).toBe(
+			true,
+		);
+	});
 });
 
 describe("run() — REST transport end to end (#3497)", () => {
