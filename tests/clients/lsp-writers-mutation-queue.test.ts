@@ -547,36 +547,83 @@ describe("#3541: the actionable fix writes only the warning's own file", () => {
 		});
 	});
 
-	it("a quick fix whose edit also creates a file is skipped as multi_file_edit", async () => {
-		const created = path.join(env.tmpDir, "created.ts");
-		useActionableFix(async () => [
-			{
-				...fixIt(),
-				edit: {
-					documentChanges: [
+	// #3541 review round 4 (V1): the stale check compares only a text edit's
+	// first disk read, so a resource operation (create, rename, delete) is never
+	// compared, even on the warning's own file: a create-overwrite empties it
+	// before the text edit, and a delete removes it with the agent's edit.
+	it.each([
+		[
+			"also creates another file",
+			() => [
+				{
+					textDocument: { uri: pathToFileURL(filePath).href, version: null },
+					edits: valueEdit().changes[pathToFileURL(filePath).href],
+				},
+				{
+					kind: "create",
+					uri: pathToFileURL(path.join(env.tmpDir, "created.ts")).href,
+				},
+			],
+		],
+		[
+			"overwrites the warning's own file with a create, then inserts into it",
+			() => [
+				{
+					kind: "create",
+					uri: pathToFileURL(filePath).href,
+					options: { overwrite: true },
+				},
+				{
+					textDocument: { uri: pathToFileURL(filePath).href, version: null },
+					edits: [
 						{
-							textDocument: {
-								uri: pathToFileURL(filePath).href,
-								version: null,
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 0 },
 							},
-							edits: valueEdit().changes[pathToFileURL(filePath).href],
+							newText: "fixed = 1;\n",
 						},
-						{ kind: "create", uri: pathToFileURL(created).href },
 					],
 				},
-			},
-		]);
-		const summary = await applyConservativeActionableWarningFixes({
-			cwd: env.tmpDir,
-			report: actionableReport(),
-		});
-		expect(fs.existsSync(created)).toBe(false);
-		expect(fs.readFileSync(filePath, "utf8")).toBe("value = 1;\n");
-		expect(summary).toMatchObject({
-			applied: 0,
-			skipped: [{ id: "eslint:fix", reason: "multi_file_edit" }],
-		});
-	});
+			],
+		],
+		[
+			"deletes the warning's own file",
+			() => [{ kind: "delete", uri: pathToFileURL(filePath).href }],
+		],
+	])(
+		"a quick fix whose edit %s is skipped as resource_operation before any write, so an agent edit made meanwhile survives",
+		async (_shape, documentChanges) => {
+			const asked = gate();
+			const answer = gate();
+			useActionableFix(async () => {
+				asked.open();
+				await answer.p;
+				return [{ ...fixIt(), edit: { documentChanges: documentChanges() } }];
+			});
+			const fix = applyConservativeActionableWarningFixes({
+				cwd: env.tmpDir,
+				report: actionableReport(),
+			});
+			await asked.p;
+			await withFileMutationQueue(filePath, async () => {
+				fs.writeFileSync(
+					filePath,
+					`export const AGENT = 2;\n${fs.readFileSync(filePath, "utf8")}`,
+				);
+			});
+			answer.open();
+			const summary = await fix;
+			expect(fs.existsSync(path.join(env.tmpDir, "created.ts"))).toBe(false);
+			expect(
+				fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "MISSING",
+			).toBe("export const AGENT = 2;\nvalue = 1;\n");
+			expect(summary).toMatchObject({
+				applied: 0,
+				skipped: [{ id: "eslint:fix", reason: "resource_operation" }],
+			});
+		},
+	);
 });
 
 /**

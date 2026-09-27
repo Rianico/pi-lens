@@ -2111,19 +2111,29 @@ export async function applyConservativeActionableWarningFixes(args: {
 					continue;
 				}
 				const edit = selected.edit as Parameters<typeof applyWorkspaceEdit>[0];
-				// #3541: the expected content below covers only the file this fix
-				// read; an edit that also writes another file would apply there at
-				// the server's positions unchecked, so it is not a conservative fix.
+				// #3541: the expected content below is compared only where a text
+				// edit first reads a file. A resource operation (create, rename,
+				// delete) is never compared, even on this file, so a conservative
+				// fix is text-only.
+				if (
+					edit.documentChanges?.some(
+						(change) =>
+							typeof change === "object" && change !== null && "kind" in change,
+					)
+				) {
+					summary.skipped.push({
+						id: warning.id,
+						reason: "resource_operation",
+					});
+					continue;
+				}
+				// #3541: and it covers only the file this fix read; an edit that
+				// also writes another file would apply there at the server's
+				// positions unchecked. A path not on disk throws here, and the fix
+				// is skipped as apply_failed.
 				const target = fs.realpathSync.native(warning.filePath);
 				const writesOtherFile = workspaceEditDiskPaths(edit).some(
-					(diskPath) => {
-						try {
-							return fs.realpathSync.native(diskPath) !== target;
-						} catch {
-							// Not on disk yet (a create): not the file this fix read.
-							return true;
-						}
-					},
+					(diskPath) => fs.realpathSync.native(diskPath) !== target,
 				);
 				if (writesOtherFile) {
 					summary.skipped.push({ id: warning.id, reason: "multi_file_edit" });
