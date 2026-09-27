@@ -59,6 +59,10 @@ vi.mock("../clients/bootstrap.js", async () => {
 });
 
 import type { RuntimeCoordinator } from "../clients/runtime-coordinator.js";
+import {
+	getFileDiagnostics,
+	reconcileScanDiagnostics,
+} from "../clients/widget-state.js";
 import extension from "../index.js";
 import { createPiMock } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
@@ -125,5 +129,54 @@ describe("#3540: index.ts reserves diagnostics-tool tokens turn first", () => {
 		expect(
 			runtime.retireInlineBlockerOnConfirmedClean(file, turnOneClean, ["lsp"]),
 		).toBe(false);
+	});
+
+	// #3540 r2 (F1): `resetForSession` restarts the turn and write counters,
+	// but a `/reload` keeps the widget and its write guard. The reservation's
+	// turn half is the order turn, which a session reset never restarts.
+	describe("across a session reset (#3540 r2)", () => {
+		const OLD = [{ severity: "error", message: "OLD", tool: "tsserver" }];
+
+		/** Session 1 runs five turns; its turn-5 check records OLD. */
+		function fiveTurnsThenOld(): void {
+			for (let turn = 0; turn < 5; turn += 1) runtime.beginTurn();
+			reserve();
+			reserve();
+			expect(reconcileScanDiagnostics(file, OLD, true, reserve())).toBe(true);
+		}
+
+		it("E: after /reload, a confirmed clean replaces session 1's turn-5 widget verdict", () => {
+			fiveTurnsThenOld();
+			runtime.resetForSession();
+			runtime.beginTurn();
+			expect(reconcileScanDiagnostics(file, [], true, reserve())).toBe(true);
+			expect(getFileDiagnostics(file)).toEqual([]);
+		});
+
+		it("E no-drop: in the same session, turn 6's confirmed clean replaces the turn-5 widget verdict", () => {
+			fiveTurnsThenOld();
+			runtime.beginTurn();
+			expect(reconcileScanDiagnostics(file, [], true, reserve())).toBe(true);
+			expect(getFileDiagnostics(file)).toEqual([]);
+		});
+
+		it("after /reload, a clean reserved in session 2's turn 1 cannot retire a blocker recorded in its turn 2", () => {
+			for (let turn = 0; turn < 5; turn += 1) runtime.beginTurn();
+			runtime.resetForSession();
+			runtime.beginTurn();
+			const turnOneClean = reserve();
+			runtime.beginTurn();
+			runtime.recordInlineBlockers(
+				file,
+				"STOP turn 2",
+				runtime.nextWriteIndex(),
+				["lsp"],
+			);
+			expect(
+				runtime.retireInlineBlockerOnConfirmedClean(file, turnOneClean, [
+					"lsp",
+				]),
+			).toBe(false);
+		});
 	});
 });

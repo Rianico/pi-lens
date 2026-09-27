@@ -31,6 +31,7 @@ import {
 	clearWidgetState,
 	exportWidgetState,
 	getFileDiagnostics,
+	reconcileScanDiagnostics,
 	recordRunner,
 } from "../../clients/widget-state.js";
 import { setupTestEnvironment } from "./test-utils.js";
@@ -598,6 +599,167 @@ describe("formal/dispatch-pipeline replays", () => {
 		} finally {
 			env.cleanup();
 		}
+	});
+
+	// #3540 r2 (F1): the widget's write guards outlive `resetForSession` — a
+	// `/reload` keeps the widget, and a stale session-1 write can land after
+	// `/new` cleared it. The token's turn half is an order turn that a session
+	// reset never restarts, so session 1's turn 5 never outranks session 2.
+	describe("widget order across a session reset (#3540 r2)", () => {
+		const widget = (filePath: string) =>
+			(getFileDiagnostics(filePath) ?? []).map((d) => d.message);
+
+		function scriptVerdicts(verdicts: Record<string, "clean" | "blocker">) {
+			vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+				const rev = revisionOf(fp as string);
+				return (
+					verdicts[rev] === "blocker" ? blocking(fp as string, rev) : clean(rev)
+				) as never;
+			});
+		}
+
+		async function edit(
+			runtime: RuntimeCoordinator,
+			filePath: string,
+			bytes: string,
+		) {
+			fs.writeFileSync(filePath, bytes);
+			return handleToolResult({
+				...deps(runtime, noBiome),
+				event: ev("edit", filePath, bytes),
+			} as never);
+		}
+
+		/**
+		 * Session 1 runs five turns; in turn 5 another file's two edits come
+		 * first, so a.ts's dispatch draws write index 3.
+		 */
+		async function fiveTurns(runtime: RuntimeCoordinator, dir: string) {
+			for (let turn = 0; turn < 5; turn += 1) runtime.beginTurn();
+			const other = path.join(dir, "b.ts");
+			await edit(runtime, other, "export const o = 'o1';\n");
+			await edit(runtime, other, "export const o = 'o2';\n");
+		}
+
+		it("A: after /reload, session 2's first clean edit replaces session 1's turn-5 widget blocker", async () => {
+			const env = setupTestEnvironment("tla-widget-reload-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				scriptVerdicts({ v1: "blocker", v2: "clean" });
+				await fiveTurns(runtime, env.tmpDir);
+				await edit(runtime, filePath, "export const x = 'v1';\n");
+				expect(widget(filePath)).toEqual(["BLOCKER-FROM-v1"]);
+				// /reload: session_start resets the runtime and keeps the widget.
+				runtime.resetForSession();
+				runtime.beginTurn();
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				expect(widget(filePath)).toEqual([]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("A no-drop: in the same session, turn 6's clean edit replaces the turn-5 widget blocker", async () => {
+			const env = setupTestEnvironment("tla-widget-reload-nd-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				scriptVerdicts({ v1: "blocker", v2: "clean" });
+				await fiveTurns(runtime, env.tmpDir);
+				await edit(runtime, filePath, "export const x = 'v1';\n");
+				expect(widget(filePath)).toEqual(["BLOCKER-FROM-v1"]);
+				runtime.beginTurn();
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				expect(widget(filePath)).toEqual([]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		/**
+		 * A session-1 turn-5 pipeline parks in its dispatch; `between` runs
+		 * before it is released (a `/new`, or a turn boundary); then session 2
+		 * (or turn 6) edits the file clean.
+		 */
+		async function parkedTurnFive(
+			between: (runtime: RuntimeCoordinator) => void,
+		) {
+			const env = setupTestEnvironment("tla-widget-parked-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				await fiveTurns(runtime, env.tmpDir);
+				const entered = gate();
+				const release = gate();
+				vi.mocked(dispatchLintWithResult).mockImplementation(async (fp) => {
+					const rev = revisionOf(fp as string);
+					if (rev === "v1") {
+						entered.open();
+						await release.p;
+						return blocking(fp as string, rev) as never;
+					}
+					return clean(rev) as never;
+				});
+				const parked = edit(runtime, filePath, "export const x = 'v1';\n");
+				await entered.p;
+				between(runtime);
+				release.open();
+				// index.ts' bound abandoned it; its widget write lands now.
+				await parked;
+				runtime.beginTurn();
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				return widget(filePath);
+			} finally {
+				env.cleanup();
+			}
+		}
+
+		it("B: a session-1 pipeline released after /new plants no token that outranks session 2's clean edit", async () => {
+			expect(
+				await parkedTurnFive((runtime) => {
+					// /new: session_start resets the runtime and clears the widget.
+					runtime.resetForSession();
+					clearWidgetState();
+				}),
+			).toEqual([]);
+		});
+
+		it("B no-drop: in the same session, a turn-5 pipeline released at the turn boundary is replaced by turn 6's clean edit", async () => {
+			expect(await parkedTurnFive(() => {})).toEqual([]);
+		});
+
+		it("mixed producers: after /reload, a pipeline verdict drawn after a lens reservation in the same turn is not dropped", async () => {
+			const env = setupTestEnvironment("tla-widget-mixed-");
+			try {
+				const filePath = path.join(env.tmpDir, "a.ts");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				scriptVerdicts({ v1: "clean", v2: "blocker" });
+				await fiveTurns(runtime, env.tmpDir);
+				await edit(runtime, filePath, "export const x = 'v1';\n");
+				runtime.resetForSession();
+				runtime.beginTurn();
+				// lsp_diagnostics' reservation (index.ts injects this), then a
+				// confirmed clean for the file...
+				expect(
+					reconcileScanDiagnostics(
+						filePath,
+						[],
+						true,
+						runtime.nextWriteOrderToken(),
+					),
+				).toBe(true);
+				// ...then the agent's next edit of it blocks.
+				await edit(runtime, filePath, "export const x = 'v2';\n");
+				expect(widget(filePath)).toEqual(["BLOCKER-FROM-v2"]);
+			} finally {
+				env.cleanup();
+			}
+		});
 	});
 
 	it("session straddle (#3506 r1 F8): an old session's handler that settles after session_start records nothing into the new session", async () => {

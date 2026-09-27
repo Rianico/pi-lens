@@ -18,6 +18,12 @@
  *   turn-end store, whose compute also settles under the scheduler);
  * - `recordLspMutation` with a session on its context (#3576: the quickfix
  *   pass's bookkeeping into the change log, the read guard and turn state).
+ * - the widget's write guard (#3540 r2: `recordDiagnostics` under the order
+ *   token `runtime.nextWriteOrderToken()` draws when the writer is issued).
+ *   The widget is not session-guarded: a `/reload` keeps it and its guard,
+ *   `/new` clears both, and a stale write that lands after the clear stays
+ *   (#3596). What the property pins is that a token drawn later always
+ *   outranks one drawn earlier, across session resets.
  * A writer captures `runtime.captureSessionGeneration()` when it is issued,
  * awaits its work (a scheduled promise: the pipeline, the formatter, the code
  * action), then writes. `session_start` is the production pair that runs in
@@ -56,6 +62,11 @@ import { recordLspMutation } from "../../clients/lsp-mutation.js";
 import { resetLSPService } from "../../clients/lsp/index.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import {
+	clearWidgetState,
+	getFileDiagnostics,
+	recordDiagnostics,
+} from "../../clients/widget-state.js";
 
 /**
  * Budget: a run is microtasks plus one synchronous change-log append per
@@ -69,10 +80,12 @@ const PROPERTY_TIMEOUT_MS = 20_000;
 
 // --- Generated commands --------------------------------------------------
 
-type WriterKind = "cascade" | "runner" | "bookkeep";
+type WriterKind = "cascade" | "runner" | "bookkeep" | "widget";
 type Command =
 	| { t: "write"; kind: WriterKind }
-	| { t: "start" }
+	| { t: "turn" }
+	/** `keepWidget`: a `/reload` (the widget and its guard survive) or `/new`. */
+	| { t: "start"; keepWidget: boolean }
 	| { t: "shutdown" };
 
 const commandArb: fc.Arbitrary<Command> = fc.oneof(
@@ -80,14 +93,26 @@ const commandArb: fc.Arbitrary<Command> = fc.oneof(
 		weight: 6,
 		arbitrary: fc.record({
 			t: fc.constant("write" as const),
-			kind: fc.constantFrom<WriterKind>("cascade", "runner", "bookkeep"),
+			kind: fc.constantFrom<WriterKind>(
+				"cascade",
+				"runner",
+				"bookkeep",
+				"widget",
+			),
 		}),
 	},
-	{ weight: 2, arbitrary: fc.constant({ t: "start" as const }) },
+	{ weight: 2, arbitrary: fc.constant({ t: "turn" as const }) },
+	{
+		weight: 2,
+		arbitrary: fc.record({
+			t: fc.constant("start" as const),
+			keepWidget: fc.boolean(),
+		}),
+	},
 	{ weight: 1, arbitrary: fc.constant({ t: "shutdown" as const }) },
 );
 
-const commandsArb = fc.array(commandArb, { minLength: 1, maxLength: 8 });
+const commandsArb = fc.array(commandArb, { minLength: 1, maxLength: 10 });
 
 // --- Recorded run --------------------------------------------------------
 
@@ -99,6 +124,10 @@ interface Writer {
 	/** The test's own session count when the writer was issued. */
 	session: number;
 	settled: boolean;
+	/** Widget writers: the order token drawn at issue. */
+	token?: number;
+	/** Widget writers: the run's step at which the write ran. */
+	wroteAt?: number;
 }
 
 interface Run {
@@ -109,6 +138,10 @@ interface Run {
 	cascade: string[];
 	runner: string[];
 	bookkeep: string[];
+	/** The widget file's message at quiescence (the writer's name). */
+	widget: string | undefined;
+	/** Widget writers' ids that wrote after the last `/new` cleared it. */
+	widgetSinceClear: number[];
 	log: string[];
 	unsettled: string[];
 }
@@ -125,6 +158,8 @@ async function execute(
 		cascade: [],
 		runner: [],
 		bookkeep: [],
+		widget: undefined,
+		widgetSinceClear: [],
 		log: [],
 		unsettled: [],
 	};
@@ -133,7 +168,14 @@ async function execute(
 	runtime.projectRoot = root;
 	const cacheManager = new CacheManager(false);
 	resetPendingRunnerFindings();
+	clearWidgetState();
 	let session = 1;
+	let step = 0;
+	let clearedAt = 0;
+	// The host runs a tool only inside a turn: turn_start (`beginTurn`) comes
+	// before any writer a session issues.
+	let turnOpen = false;
+	const widgetFile = path.join(root, "widget.ts");
 
 	const write = (
 		writer: Writer,
@@ -151,6 +193,13 @@ async function execute(
 				handle,
 				writer.file,
 			);
+		} else if (writer.kind === "widget") {
+			recordDiagnostics(
+				widgetFile,
+				[{ severity: "error", tool: "tsserver", message: `w${writer.id}` }],
+				writer.token,
+			);
+			writer.wroteAt = ++step;
 		} else if (writer.kind === "runner") {
 			const result: RunnerResult = {
 				status: "succeeded",
@@ -209,6 +258,10 @@ async function execute(
 	};
 
 	const issueWriter = (kind: WriterKind, id: number) => {
+		if (!turnOpen) {
+			runtime.beginTurn();
+			turnOpen = true;
+		}
 		const writer: Writer = {
 			id,
 			kind,
@@ -220,6 +273,8 @@ async function execute(
 		run.writers.push(writer);
 		// The production capture, taken when the writer starts.
 		const handle = runtime.captureSessionGeneration();
+		// The widget order token, drawn when the writer starts (#3540 r2).
+		if (kind === "widget") writer.token = runtime.nextWriteOrderToken();
 		note(`issue ${kind} w${id} in session ${session}`);
 		void s.schedule(Promise.resolve(), `work:${id}`).then(() => {
 			write(writer, handle);
@@ -233,11 +288,22 @@ async function execute(
 			label: `cmd${index}`,
 			builder: async () => {
 				if (command.t === "write") issueWriter(command.kind, index);
-				else if (command.t === "start") {
+				else if (command.t === "turn") {
+					runtime.beginTurn();
+					turnOpen = true;
+					note("turn_start");
+				} else if (command.t === "start") {
 					resetPendingRunnerFindings();
 					runtime.resetForSession();
+					if (!command.keepWidget) {
+						clearWidgetState();
+						clearedAt = ++step;
+					}
+					turnOpen = false;
 					session += 1;
-					note(`session_start -> session ${session}`);
+					note(
+						`session_start (${command.keepWidget ? "/reload" : "/new"}) -> session ${session}`,
+					);
 				} else {
 					resetLSPService({ reason: "session_shutdown" });
 					note("session_shutdown");
@@ -266,12 +332,16 @@ async function execute(
 	run.bookkeep = run.writers
 		.filter((w) => bookkept.has(normalizeMapKey(w.file)))
 		.map((w) => w.file);
+	run.widget = getFileDiagnostics(widgetFile)?.[0]?.message;
+	run.widgetSinceClear = run.writers
+		.filter((w) => w.wroteAt !== undefined && w.wroteAt > clearedAt)
+		.map((w) => w.id);
 	return run;
 }
 
 // --- The oracle ----------------------------------------------------------
 
-function heldBy(run: Run, kind: WriterKind): string[] {
+function heldBy(run: Run, kind: Exclude<WriterKind, "widget">): string[] {
 	return kind === "cascade"
 		? run.cascade
 		: kind === "runner"
@@ -291,7 +361,7 @@ function liveness(run: Run): string[] {
 function noStaleWrite(run: Run): string[] {
 	const out: string[] = [];
 	for (const w of run.writers) {
-		if (w.session === run.finalSession) continue;
+		if (w.kind === "widget" || w.session === run.finalSession) continue;
 		if (heldBy(run, w.kind).includes(w.file))
 			out.push(
 				`${w.kind} w${w.id} from session ${w.session} is in session ${run.finalSession}'s state`,
@@ -307,17 +377,36 @@ function noStaleWrite(run: Run): string[] {
 function noOwnDrop(run: Run): string[] {
 	const out: string[] = [];
 	for (const w of run.writers) {
-		if (w.session !== run.finalSession) continue;
+		if (w.kind === "widget" || w.session !== run.finalSession) continue;
 		if (!heldBy(run, w.kind).includes(w.file))
 			out.push(`${w.kind} w${w.id} of the final session was dropped`);
 	}
 	return out;
 }
 
-const PROPERTIES = { liveness, noStaleWrite, noOwnDrop } satisfies Record<
-	string,
-	(run: Run) => string[]
->;
+/**
+ * #3540 r2: order tokens rise with issue order across session resets, so the
+ * widget holds the latest-issued writer among those that wrote since the last
+ * `/new`, whatever order the writes landed in. A turn half that restarts at
+ * `resetForSession` leaves a `/reload`ed widget, or a stale write that landed
+ * after `/new`, outranking the next session's writes.
+ */
+function widgetLatest(run: Run): string[] {
+	const latest = Math.max(...run.widgetSinceClear);
+	const expected = Number.isFinite(latest) ? `w${latest}` : undefined;
+	return run.widget === expected
+		? []
+		: [
+				`widget holds ${run.widget ?? "nothing"}, expected ${expected ?? "nothing"}`,
+			];
+}
+
+const PROPERTIES = {
+	liveness,
+	noStaleWrite,
+	noOwnDrop,
+	widgetLatest,
+} satisfies Record<string, (run: Run) => string[]>;
 type PropertyName = keyof typeof PROPERTIES;
 const ALL = Object.keys(PROPERTIES) as PropertyName[];
 
@@ -349,6 +438,7 @@ describe("#3576 — the session generation guard over scheduled interleavings", 
 	afterEach(() => {
 		vi.useRealTimers();
 		resetPendingRunnerFindings();
+		clearWidgetState();
 	});
 
 	it(
