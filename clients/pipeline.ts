@@ -34,6 +34,7 @@ import {
 	admitWidgetDiagnosticsWrite,
 	recordDiagnostics,
 } from "./widget-state.js";
+import { writeOrderToken } from "./write-ordering-guard.js";
 import { getDiagnosticLogger } from "./diagnostic-logger.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { loadDispatchIntegration } from "./dispatch/lazy.js";
@@ -254,6 +255,13 @@ export interface PipelineContext {
 		sessionId: string;
 		turnIndex: number;
 		writeIndex: number;
+		/**
+		 * #3540 r2: the order turn `writeIndex` was drawn in
+		 * (`RuntimeCoordinator.writeOrderTurn`). Unlike `turnIndex` it never
+		 * restarts at a session reset, so it, not `turnIndex`, orders writes
+		 * into stores that outlive the session (the widget).
+		 */
+		orderTurn?: number;
 		/** Raw model id / provider, separate from the combined `model` display
 		 * string above — worklog attribution (#1448) wants the two apart. */
 		modelId?: string;
@@ -302,9 +310,15 @@ export interface PipelineContext {
 	sessionGeneration?: GenerationHandle;
 	/**
 	 * #3506: draws a fresh `telemetry.writeIndex` when the bytes this pipeline
-	 * analyses are not the bytes its handler's token was drawn for.
+	 * analyses are not the bytes its handler's token was drawn for. #3559: with
+	 * the turn it is drawn in, which is later than the handler's when the
+	 * pipeline outlived its turn.
 	 */
-	nextWriteIndex?: () => number;
+	nextWriteIndex?: () => {
+		turnIndex: number;
+		orderTurn: number;
+		writeIndex: number;
+	};
 }
 
 export interface PipelineDeps {
@@ -336,6 +350,8 @@ export interface PipelineResult {
 	postWriteStateHash?: string;
 	/** #3506: the write token the analysis was recorded under. */
 	writeIndex?: number;
+	/** #3559: the order turn `writeIndex` was drawn in (#3540 r2). */
+	orderTurn?: number;
 	/** #3503: `Date.now()` taken before the bytes the analysis ran on were read. */
 	analysisReadAtMs?: number;
 	/** Files modified by pi-lens format/autofix, including side-effect files. */
@@ -1153,6 +1169,19 @@ export type LspResyncOutcome =
 	| "unsupported"
 	| "aborted";
 
+/**
+ * #3576 R1: resync `filePath` only where a live client of the current service
+ * already holds it open, from a fresh read of the disk; never build a service,
+ * never spawn. For a drain whose session or LSP service was replaced: the next
+ * session may already hold the file (a read-warm touch), and the drain's write
+ * would otherwise leave that document behind the disk until the next drift
+ * sweep. `resyncGitChangedFiles` owns the held-only filter and the drift read.
+ */
+export async function resyncHeldLspDocument(filePath: string): Promise<void> {
+	const lsp = await loadLspService();
+	await lsp.peekLSPService()?.resyncGitChangedFiles([filePath]);
+}
+
 export async function resyncLspFile(
 	filePath: string,
 	fileContent: string,
@@ -1372,6 +1401,8 @@ export interface FormatPhaseResult {
 	 */
 	formatUnavailable: Array<{ formatter: string; reason: string }>;
 	fileContent: string | undefined;
+	/** #3574: the bytes `fileContent` was decoded from. */
+	fileBytes: Buffer | undefined;
 	/** #3481: `performance.now()` taken before `fileContent` was read. */
 	fileReadStamp: number;
 	/**
@@ -1473,8 +1504,10 @@ export async function runFormatPhase(
 
 	const fileReadStamp = performance.now();
 	const fileReadAtMs = Date.now();
+	let fileBytes: Buffer | undefined;
 	try {
-		fileContent = nodeFs.readFileSync(filePath, "utf-8");
+		fileBytes = nodeFs.readFileSync(filePath);
+		fileContent = fileBytes.toString("utf-8");
 	} catch {
 		fileContent = undefined;
 	}
@@ -1485,6 +1518,7 @@ export async function runFormatPhase(
 		formatFailures,
 		formatUnavailable,
 		fileContent,
+		fileBytes,
 		fileReadStamp,
 		...(abandoned === undefined ? {} : { abandoned }),
 		fileReadAtMs,
@@ -1572,7 +1606,11 @@ async function analysePipeline(
 			reason: `observed mutation is not evidence of agent authorship (${filePath})`,
 		});
 	}
-	admitWidgetDiagnosticsWrite(filePath, ctx.telemetry?.writeIndex);
+	// #3540: the widget's order spans turns; read at each use, since the
+	// re-token below replaces the pair.
+	const widgetOrder = () =>
+		writeOrderToken(ctx.telemetry?.orderTurn, ctx.telemetry?.writeIndex);
+	admitWidgetDiagnosticsWrite(filePath, widgetOrder());
 
 	const phase = createPhaseTracker(toolName, filePath);
 	const pipelineStart = Date.now();
@@ -1589,8 +1627,14 @@ async function analysePipeline(
 	// mtimes against. A write that lands after this read is newer than the
 	// verdict, even when it lands while the dispatch below is still awaited.
 	let analysisReadAtMs = Date.now();
+	// #3574: the bytes `fileContent` was decoded from, kept in step with it. The
+	// inline blocker's size and hash baseline is taken from these: a decoded
+	// string re-encodes a non-UTF-8 byte as three, so a baseline built from it
+	// never matches the file and the blocker self-drifts every turn.
+	let fileBytes: Buffer | undefined;
 	try {
-		fileContent = nodeFs.readFileSync(filePath, "utf-8");
+		fileBytes = nodeFs.readFileSync(filePath);
+		fileContent = fileBytes.toString("utf-8");
 	} catch {
 		// File may not exist (e.g., deleted)
 	}
@@ -1629,6 +1673,7 @@ async function analysePipeline(
 		formattersUsed = formatResult.formattersUsed;
 		formatFailures = formatResult.formatFailures;
 		fileContent = formatResult.fileContent;
+		fileBytes = formatResult.fileBytes;
 		fileReadStamp = formatResult.fileReadStamp;
 		analysisReadAtMs = formatResult.fileReadAtMs;
 		if (formatChanged) {
@@ -1719,8 +1764,10 @@ async function analysePipeline(
 		fileReadStamp = performance.now();
 		analysisReadAtMs = Date.now();
 		try {
-			fileContent = nodeFs.readFileSync(filePath, "utf-8");
+			fileBytes = nodeFs.readFileSync(filePath);
+			fileContent = fileBytes.toString("utf-8");
 		} catch {
+			fileBytes = undefined;
 			fileContent = undefined;
 		}
 	}
@@ -1759,7 +1806,7 @@ async function analysePipeline(
 	// ones first read (this pipeline's own write, or an edit queued ahead of
 	// it), draw a fresh one while the queue still holds the file.
 	if (fileContent !== readContent && ctx.telemetry && ctx.nextWriteIndex) {
-		ctx.telemetry = { ...ctx.telemetry, writeIndex: ctx.nextWriteIndex() };
+		ctx.telemetry = { ...ctx.telemetry, ...ctx.nextWriteIndex() };
 	}
 	writeHold?.release();
 
@@ -1795,9 +1842,9 @@ async function analysePipeline(
 	// promise can yield to another writer. The blocker evidence below belongs to
 	// this analysis input, not to whatever happens to be on disk when the whole
 	// pipeline returns.
-	const inlineBlockerFileContent = fileContent
+	const inlineBlockerFileContent = fileBytes?.byteLength
 		? (() => {
-				const content = Buffer.from(fileContent, "utf8");
+				const content = fileBytes;
 				return content.byteLength <= 2 * 1024 * 1024
 					? {
 							size: content.byteLength,
@@ -1819,7 +1866,10 @@ async function analysePipeline(
 		},
 		{
 			projectRoot: ctx.projectRoot,
-			writeIndex: ctx.telemetry?.writeIndex,
+			// The runners' widget order (#3540).
+			writeIndex: widgetOrder(),
+			// #3568: a collect-later runner defers its result to a turn end.
+			sessionGeneration: ctx.sessionGeneration,
 			telemetryModel: ctx.telemetry?.modelId,
 			telemetryProvider: ctx.telemetry?.provider,
 		},
@@ -1827,7 +1877,7 @@ async function analysePipeline(
 	recordDiagnostics(
 		filePath,
 		dispatchResult.diagnostics,
-		ctx.telemetry?.writeIndex,
+		widgetOrder(),
 		analysisReadAtMs,
 	);
 	// #502: emit the write batch's FINAL diagnostic state immediately after
@@ -2020,6 +2070,7 @@ async function analysePipeline(
 				hasBlockers,
 				dbg,
 				turnSeq: ctx.telemetry?.turnIndex,
+				orderTurn: ctx.telemetry?.orderTurn,
 				writeSeq: ctx.telemetry?.writeIndex,
 				// #3157: `cwd` here is the LANGUAGE root. The cascade's display
 				// filter reads the disposition store and the `.pi-lens.json` rule
@@ -2099,6 +2150,7 @@ async function analysePipeline(
 		fileModified,
 		postWriteStateHash,
 		writeIndex: ctx.telemetry?.writeIndex,
+		orderTurn: ctx.telemetry?.orderTurn,
 		analysisReadAtMs,
 		changedFiles,
 		// #3190: re-rendered from the GATED set with `formatDiagnostics(...,

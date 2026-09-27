@@ -2110,6 +2110,19 @@ export async function applyConservativeActionableWarningFixes(args: {
 					});
 					continue;
 				}
+				// #3576: no edit starts after the drain's session was replaced; its
+				// write would land in the next session's files and its code-action
+				// request was the await the replacement straddled.
+				if (
+					args.mutationContext?.session &&
+					args.mutationContext.session.guardedWrite(
+						warning.filePath,
+						() => true,
+					) === undefined
+				) {
+					summary.skipped.push({ id: warning.id, reason: "session_replaced" });
+					continue;
+				}
 				const edit = selected.edit as Parameters<typeof applyWorkspaceEdit>[0];
 				// #3541: the expected content below is compared only where a text
 				// edit first reads a file. A resource operation (create, rename,

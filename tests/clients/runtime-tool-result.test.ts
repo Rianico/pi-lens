@@ -1592,6 +1592,174 @@ describe("monorepo turn-state cwd alignment", () => {
 			}
 		},
 	);
+
+	it("drops the cascade of a session-1 handler parked before its dispatch (#3568)", async () => {
+		// The handler waits for the on-demand analysers before it dispatches.
+		// A replacement lands during that wait; the dispatch that follows used
+		// to capture session 2, so the admission guard (#3512) passed its
+		// compute into session 2's turn end.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const sessionOneRun = {
+			filePath: "/proj/session-one-entry.ts",
+			origin: { projectSeq: 1, turnSeq: 1 },
+			result: undefined,
+			neighborCount: 1,
+			diagnosticCount: 1,
+		};
+		vi.mocked(runPipeline).mockImplementation(async () => ({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+			cascadePromise: Promise.resolve(sessionOneRun),
+		}));
+		const entered = gatedPromise<void>();
+		const release = gatedPromise<void>();
+		requestBootstrapClients.mockImplementationOnce(async () => {
+			entered.resolve();
+			await release.promise;
+			return { biomeClient: {}, ruffClient: {}, metricsClient: {} };
+		});
+		resetDegradationLedger();
+		const env = setupTestEnvironment("pi-lens-3568-entry-cascade-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				"edit.ts",
+				"export const x = 2;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.resetForSession();
+			runtime.beginTurn();
+			const handler = handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 2;" },
+					content: [{ type: "text", text: "ok" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: {
+					addModifiedRange: () => {},
+					readTurnState: () => ({}),
+				},
+				testRunnerClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+			await entered.promise;
+			runtime.resetForSession();
+			runtime.beginTurn();
+			release.resolve();
+			await handler;
+			await runtime.settleCascadeRuns(1_000, { trackTurnEndClock: true });
+			expect(runtime.consumeCascadeRuns().map((r) => r.filePath)).toEqual([]);
+			expect(
+				getDegradationSummary()
+					.find((e) => e.kind === "generation-guard-stale-write")
+					?.latestReasons.map((e) => e.subject),
+			).toContain(`runtime-session:${filePath}`);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a bash handler's synthetic writes carry the session its handler entered in (#3568)", async () => {
+		// A multi-file bash result dispatches one synthetic handler per written
+		// file, one after another. Each used to capture its own session at its
+		// dispatch, after the parent's recovery awaits and the earlier synthetic
+		// dispatches, so a replacement in between handed the later files
+		// session 2's generation.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-3568-bash-synthetic-");
+		try {
+			const first = gatedPromise<void>();
+			const release = gatedPromise<void>();
+			const handles: Array<{ generation: number; isCurrent(): boolean }> = [];
+			vi.mocked(runPipeline).mockImplementation(async (ctx) => {
+				handles.push(ctx.sessionGeneration as never);
+				if (handles.length === 1) {
+					first.resolve();
+					await release.promise;
+				}
+				return {
+					output: "",
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+				};
+			});
+			const existingPath = createTempFile(
+				env.tmpDir,
+				"extracted/existing.js",
+				"(function(){ return 1; })();\n",
+			);
+			const directPath = createTempFile(
+				env.tmpDir,
+				"direct.js",
+				"const direct = 1;\n",
+			);
+			const command = `echo direct > "${directPath}"; node opaque-extractor.js`;
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const entered = runtime.sessionGeneration;
+			const cacheManager = new CacheManager(false);
+			await handleToolCall({
+				event: {
+					toolName: "bash",
+					toolCallId: "3568-bash",
+					input: { command },
+				},
+				ctx: { cwd: env.tmpDir },
+				lensEnabled: true,
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager,
+				ensureLSPConfigInitialized: async () => {},
+				updateLspStatus: () => {},
+				resetLSPService: () => {},
+			} as any);
+			fs.writeFileSync(existingPath, "(function(){ return 2; })();\n");
+			fs.writeFileSync(directPath, "const direct = 2;\n");
+			const handler = handleToolResult({
+				event: {
+					toolName: "bash",
+					toolCallId: "3568-bash",
+					input: { command },
+					content: [{ type: "text", text: "extracted" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager,
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+				readGuard: runtime.readGuard,
+			} as any);
+			await first.promise;
+			// `/new` while the first written file is analysed.
+			runtime.resetForSession();
+			release.resolve();
+			await handler;
+			expect(
+				handles.map((h) => ({
+					generation: h.generation,
+					current: h.isCurrent(),
+				})),
+			).toEqual([
+				{ generation: entered, current: false },
+				{ generation: entered, current: false },
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
 });
 
 describe("runtime-tool-result inline behavior warnings", () => {

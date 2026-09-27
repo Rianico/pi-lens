@@ -9,6 +9,7 @@ import type {
 import { setupTestEnvironment } from "./test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
+import { writeOrderToken } from "../../clients/write-ordering-guard.js";
 
 type ImpactHitMock = {
 	symbol: string;
@@ -2252,6 +2253,87 @@ describe("computeCascadeForFile", () => {
 			}
 		});
 
+		// #3573: the active touch's row is stamped before the neighbor's read.
+		// Stamped at reconcile time, a dependency written while the touch was
+		// still waiting on the language server had an older mtime than the row,
+		// and the widget's dependency gate never demoted it. (The own-file axis
+		// is the #1095 binding's: a rewritten neighbor's touch is bound-false and
+		// never reconciled.)
+		for (const [label, depWrittenDuringTouch] of [
+			[
+				"a dependency written while the active touch runs demotes the neighbor's reconciled row (#3573)",
+				true,
+			],
+			[
+				"a dependency written before the neighbor's read leaves its reconciled row authoritative (#3573)",
+				false,
+			],
+		] as const) {
+			it(label, async () => {
+				const env = setupTestEnvironment("cascade-reconcile-read-stamp-");
+				const T_READ = 1_900_000_000_000;
+				const T_EDIT = T_READ + 400;
+				const T_REC = T_READ + 1500;
+				const setMtime = (file: string, ms: number) =>
+					fs.utimesSync(file, ms / 1000, ms / 1000);
+				try {
+					const primary = path.join(env.tmpDir, "primary.ts");
+					const neighbor = path.join(env.tmpDir, "neighbor.ts");
+					fs.writeFileSync(primary, "export const x = 1;\n");
+					fs.writeFileSync(
+						neighbor,
+						'import { x } from "./primary.js";\nexport const y = x;\n',
+					);
+					setMtime(neighbor, T_READ - 1000);
+					// The primary edit that started this cascade: before the read.
+					// Its mtime leads the clock by 40 ms, the #1710 skew.
+					setMtime(primary, T_READ + 40);
+					mocks.computeImpactCascade.mockReturnValue(
+						impact(primary, [neighbor]),
+					);
+					mocks.getLSPService.mockReturnValue({
+						...makeLspServiceDouble(),
+						getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+						touchFile: vi.fn(async () => {
+							vi.setSystemTime(T_EDIT);
+							if (depWrittenDuringTouch) {
+								fs.writeFileSync(primary, "export const x = 2;\n");
+								setMtime(primary, T_EDIT);
+							}
+							vi.setSystemTime(T_REC);
+							return { diags: [lspError("cross-file error")] };
+						}),
+						getDiagnostics: vi.fn(),
+					});
+					vi.useFakeTimers({ toFake: ["Date"] });
+					vi.setSystemTime(T_READ);
+
+					const { computeCascadeForFile } =
+						await import("../../clients/dispatch/integration.js");
+					const { getFileDiagnostics, reconcileStaleWidgetDependencyBlockers } =
+						await import("../../clients/widget-state.js");
+					await computeCascadeForFile(primary, env.tmpDir, {
+						turnSeq: 1,
+						writeSeq: 1,
+					});
+
+					const { demoted } = await reconcileStaleWidgetDependencyBlockers(
+						env.tmpDir,
+					);
+					expect(demoted).toBe(depWrittenDuringTouch ? 1 : 0);
+					expect(
+						(getFileDiagnostics(neighbor) ?? []).map((d) => ({
+							observedAt: d.observedAt,
+							stale: d.stale ?? false,
+						})),
+					).toEqual([{ observedAt: T_READ, stale: depWrittenDuringTouch }]);
+				} finally {
+					vi.useRealTimers();
+					env.cleanup();
+				}
+			});
+		}
+
 		it("an INCONCLUSIVE neighbor result (rejected touch → passive fallback) does NOT overwrite an existing footer entry", async () => {
 			const env = setupTestEnvironment("cascade-reconcile-inconclusive-");
 			try {
@@ -2319,7 +2401,11 @@ describe("computeCascadeForFile", () => {
 				const { recordDiagnostics, getFileDiagnostics } =
 					await import("../../clients/widget-state.js");
 
-				// A NEWER per-edit LSP-error record for the neighbor (writeIndex 10).
+				// A NEWER per-edit LSP-error record for the neighbor (order turn 7,
+				// writeIndex 10), in the pipeline's turn-first widget order (#3540).
+				// #3540 r2: the order turn is not the session's turn (`turnSeq`,
+				// which restarts at a session reset); the cascade orders by the one
+				// its primary edit carried.
 				recordDiagnostics(
 					neighbor,
 					[
@@ -2330,13 +2416,14 @@ describe("computeCascadeForFile", () => {
 							message: "newer per-edit result",
 						},
 					],
-					10,
+					writeOrderToken(7, 10),
 				);
 
 				// Cascade launched from an OLDER primary edit (writeSeq 3) lands late —
 				// its reconcile must be dropped by the WriteOrderingGuard.
 				await computeCascadeForFile(primary, env.tmpDir, {
 					turnSeq: 1,
+					orderTurn: 7,
 					writeSeq: 3,
 				});
 				expect(getFileDiagnostics(neighbor)?.[0]?.message).toBe(
@@ -2349,6 +2436,7 @@ describe("computeCascadeForFile", () => {
 				resetDispatchBaselines();
 				await computeCascadeForFile(primary, env.tmpDir, {
 					turnSeq: 1,
+					orderTurn: 7,
 					writeSeq: 20,
 				});
 				expect(getFileDiagnostics(neighbor)?.[0]?.message).toBe(

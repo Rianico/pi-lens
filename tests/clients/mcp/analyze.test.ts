@@ -66,6 +66,7 @@ import { getDiagnosticTracker } from "../../../clients/diagnostic-tracker.js";
 import {
 	clearWidgetState,
 	getFileDiagnosticSummaries,
+	reconcileStaleWidgetFiles,
 	recordRunner,
 } from "../../../clients/widget-state.js";
 import { analyzeFile } from "../../../clients/mcp/analyze.js";
@@ -737,5 +738,84 @@ describe("analyzeFile — absolute dot-segment `file` argument (#3184)", () => {
 		expect(String(result.content[0]?.text)).toMatch(
 			/reanchored from line 2 to 3/,
 		);
+	});
+});
+
+// #3573: the row `pilens_analyze` records is stamped at the analysis's first
+// read, not after the dispatch. The first read is the LSP warm-up's: the
+// dispatch that follows can serve the diagnostics the warm-up's content
+// produced. A write that lands after that read, while the analysis is still
+// running, is then newer than the row and `reconcileStaleWidgetFiles` drops it.
+describe("analyzeFile stamps its widget row at the analysis read (#3573)", () => {
+	const T_READ = 1_900_000_000_000;
+	const T_EDIT = T_READ + 400;
+	const T_REC = T_READ + 1500;
+	const setMtime = (file: string, ms: number) =>
+		fs.utimesSync(file, ms / 1000, ms / 1000);
+
+	/** The dispatch analyses from T_READ to T_REC; `during` runs at T_EDIT. */
+	function dispatchBlocker(during?: () => void) {
+		vi.mocked(dispatchForFile).mockImplementation(async () => {
+			vi.setSystemTime(T_EDIT);
+			during?.();
+			vi.setSystemTime(T_REC);
+			return {
+				...emptyResult,
+				diagnostics: [blockingDiagnostic],
+				blockers: [blockingDiagnostic],
+				hasBlockers: true,
+			};
+		});
+	}
+
+	const rewrite = () => {
+		fs.writeFileSync(tsFile, "export const a = 2;\n");
+		setMtime(tsFile, T_EDIT);
+	};
+
+	const rows = () =>
+		getFileDiagnosticSummaries().flatMap((s) => s.diagnostics ?? []);
+
+	beforeEach(() => {
+		setMtime(tsFile, T_READ - 1000);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(T_READ);
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("drops the row when the file is rewritten during the dispatch (#3573)", async () => {
+		dispatchBlocker(rewrite);
+		await analyzeFile(tsFile, tmpDir);
+		expect(rows()).toHaveLength(1);
+		expect(await reconcileStaleWidgetFiles()).toBe(1);
+		expect(rows()).toEqual([]);
+	});
+
+	it("drops the row when the file is rewritten after the LSP warm-up read it (#3573)", async () => {
+		mockSupportsLSP.mockReturnValue(true);
+		mockTouchFile.mockImplementationOnce(async () => {
+			vi.setSystemTime(T_EDIT);
+			rewrite();
+			vi.setSystemTime(T_REC);
+			return undefined;
+		});
+		dispatchBlocker();
+		await analyzeFile(tsFile, tmpDir);
+		expect(mockTouchFile).toHaveBeenCalledTimes(1);
+		expect(await reconcileStaleWidgetFiles()).toBe(1);
+		expect(rows()).toEqual([]);
+	});
+
+	it("keeps the row when the file was written before the analysis read it (#3573)", async () => {
+		// Its mtime leads the clock by 40 ms: the #1710 skew the tolerance absorbs.
+		setMtime(tsFile, T_READ + 40);
+		dispatchBlocker();
+		await analyzeFile(tsFile, tmpDir);
+		expect(await reconcileStaleWidgetFiles()).toBe(0);
+		expect(rows()).toEqual([
+			expect.objectContaining({ message: "Type error", observedAt: T_READ }),
+		]);
 	});
 });

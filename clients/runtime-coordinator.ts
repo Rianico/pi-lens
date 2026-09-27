@@ -26,7 +26,7 @@ import { TurnSummaryCollector } from "./turn-summary.js";
 import { deriveProviderFromModelId } from "./model-provider.js";
 import { beginTurnContext, setTurnContextSession } from "./turn-context.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
-import { WriteOrderingGuard } from "./write-ordering-guard.js";
+import { WriteOrderingGuard, writeOrderToken } from "./write-ordering-guard.js";
 import {
 	createGenerationSource,
 	type GenerationHandle,
@@ -189,6 +189,11 @@ export interface InlineBlockerRecord {
 	 * not erase a newer blocker) are unenforceable.
 	 */
 	writeIndex?: number;
+	/**
+	 * #3540: `writeIndex` with the turn it was drawn in (`writeOrderToken`).
+	 * `writeIndex` restarts at every `beginTurn`, so a retire orders on this.
+	 */
+	writeOrder?: number;
 	/**
 	 * #1561 F1: the `tool` ids of the blocking diagnostics behind this
 	 * summary. Inline blockers are NOT an LSP-only concept — `dispatcher.ts`
@@ -431,6 +436,14 @@ export class RuntimeCoordinator {
 	// claude-sonnet-4-5) doesn't leave a stale provider from the old model.
 	private _telemetryProviderIsExplicit = false;
 	private _turnIndex = 0;
+	/**
+	 * #3540 r2: the turn half of a write order token (`writeOrderToken`).
+	 * `beginTurn` advances it and `resetForSession` never restarts it: the
+	 * widget's write guards outlive a session reset (`/reload` keeps them),
+	 * so a later turn's token must outrank every earlier one in the process.
+	 * `_turnIndex` restarts per session for telemetry.
+	 */
+	private _writeOrderTurn = 0;
 	private _writeIndex = 0;
 	private _projectSeq = 0;
 	// #3511: the highest logged seq this runtime's view is known to have missed
@@ -707,6 +720,7 @@ export class RuntimeCoordinator {
 		// by resetForSession().
 		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
+		this._writeOrderTurn += 1;
 		beginTurnContext(this._telemetrySessionId);
 		this._writeIndex = 0;
 		this._reportedThisTurn.clear();
@@ -837,6 +851,18 @@ export class RuntimeCoordinator {
 		return this._writeIndex;
 	}
 
+	/**
+	 * #3540: draw the next write index as an order token that spans turns
+	 * (`writeOrderToken`), for a writer whose token is compared against
+	 * another turn's: the widget store and the inline-blocker retire.
+	 */
+	nextWriteOrderToken(): number {
+		return writeOrderToken(
+			this._writeOrderTurn,
+			this.nextWriteIndex(),
+		) as number;
+	}
+
 	setTelemetryIdentity(identity: {
 		sessionId?: string;
 		model?: string;
@@ -919,6 +945,11 @@ export class RuntimeCoordinator {
 
 	get turnIndex(): number {
 		return this._turnIndex;
+	}
+
+	/** #3540 r2: the order turn a write token is drawn in; never restarts. */
+	get writeOrderTurn(): number {
+		return this._writeOrderTurn;
 	}
 
 	get projectSeq(): number {
@@ -1284,21 +1315,6 @@ export class RuntimeCoordinator {
 	}
 
 	/**
-	 * #3507: the `(turnIndex, writeIndex)` order of a dispatch as one token.
-	 * `writeIndex` restarts at every `beginTurn` while inline records live for
-	 * the session, so the turn has to lead the comparison. Undefined when the
-	 * caller has no write token: such a write is unordered and always applies.
-	 */
-	private inlineBlockerOrder(
-		writeIndex: number | undefined,
-		turnIndex: number,
-	): number | undefined {
-		return writeIndex === undefined
-			? undefined
-			: turnIndex * 2 ** 32 + writeIndex;
-	}
-
-	/**
 	 * Record a file's blocking verdict. Returns its freshness baseline, or
 	 * undefined when a newer dispatch of the same file already recorded or
 	 * cleared it (#3507). `recordedAtMs` is the pipeline's analysis read time
@@ -1312,13 +1328,14 @@ export class RuntimeCoordinator {
 		lines?: readonly number[],
 		contentBaseline?: { size: number; sha256: string },
 		diagnostics?: readonly Diagnostic[],
-		turnIndex = this._turnIndex,
+		orderTurn = this._writeOrderTurn,
 		recordedAtMs = Date.now(),
 	): number | undefined {
+		const writeOrder = writeOrderToken(orderTurn, writeIndex);
 		if (
 			!this._inlineBlockerWriteOrder.shouldWrite(
 				normalizeMapKey(filePath),
-				this.inlineBlockerOrder(writeIndex, turnIndex),
+				writeOrder,
 			)
 		)
 			return undefined;
@@ -1326,6 +1343,7 @@ export class RuntimeCoordinator {
 			filePath,
 			summary,
 			writeIndex,
+			writeOrder,
 			sources,
 			lines,
 			diagnostics,
@@ -1348,12 +1366,12 @@ export class RuntimeCoordinator {
 	clearInlineBlockers(
 		filePath: string,
 		writeIndex?: number,
-		turnIndex = this._turnIndex,
+		orderTurn = this._writeOrderTurn,
 	): boolean {
 		if (
 			!this._inlineBlockerWriteOrder.shouldWrite(
 				normalizeMapKey(filePath),
-				this.inlineBlockerOrder(writeIndex, turnIndex),
+				writeOrderToken(orderTurn, writeIndex),
 			)
 		)
 			return false;
@@ -1585,7 +1603,8 @@ export class RuntimeCoordinator {
 	 * clean from the authoritative current view retires the stale verdict.
 	 *
 	 * Ordering (#1198 invariants 1-2). Both stores draw from the same
-	 * `nextWriteIndex()` counter, so when both sides are stamped the retire
+	 * `nextWriteIndex()` counter, ordered turn first (#3540: the counter
+	 * restarts at every turn), so when both sides are stamped the retire
 	 * requires the clean verdict to be strictly NEWER. A slow old clean that
 	 * settles after a fresh dispatch found real blockers must not erase them.
 	 * When either side is unstamped the two cannot be ordered at all; the fresh
@@ -1609,16 +1628,17 @@ export class RuntimeCoordinator {
 	 */
 	retireInlineBlockerOnConfirmedClean(
 		filePath: string,
-		confirmedAtWriteIndex?: number,
+		/** #3540: a `nextWriteOrderToken()` reservation, turn first. */
+		confirmedAtWriteOrder?: number,
 		coveredSources?: readonly string[],
 	): boolean {
 		const key = path.resolve(filePath);
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (
-			existing.writeIndex !== undefined &&
-			confirmedAtWriteIndex !== undefined &&
-			confirmedAtWriteIndex <= existing.writeIndex
+			existing.writeOrder !== undefined &&
+			confirmedAtWriteOrder !== undefined &&
+			confirmedAtWriteOrder <= existing.writeOrder
 		) {
 			return false;
 		}

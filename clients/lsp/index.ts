@@ -919,25 +919,28 @@ export interface LSPWorkspaceDiagnosticResult {
 	 */
 	skippedWarmupFailure?: boolean;
 	/**
-	 * #1093: wall-clock time (ms) these diagnostics were actually OBSERVED, set
-	 * ONLY for results served from the workspace-diagnostics cache (a replay of
-	 * an older scan). Absent for freshly-touched results (observed now). Callers
-	 * reconciling this into the footer widget must pass it as the `observedAt`
-	 * stamp so a cache-hit replay doesn't re-arm the mtime-staleness gate
-	 * (`reconcileStaleWidgetFiles`) and keep a resolved finding on screen (the
-	 * #1092 touchedAt-re-arming defect).
+	 * #1093: wall-clock time (ms) these diagnostics were actually OBSERVED. For
+	 * a result served from the workspace-diagnostics cache (a replay of an older
+	 * scan) it is that entry's `scannedAt`; for a fresh result (#3573) it is the
+	 * stamp taken before the sweep read the file (a pull: before its request).
+	 * Callers reconciling this into the footer widget must pass it as the
+	 * `observedAt` stamp so a cache-hit replay doesn't re-arm the mtime-staleness
+	 * gate (`reconcileStaleWidgetFiles`) and keep a resolved finding on screen
+	 * (the #1092 touchedAt-re-arming defect), and so a write that landed while
+	 * the sweep was analysing the file is newer than the row.
 	 */
-	observedAt?: number;
+	observedAt?: number | undefined;
 	/**
 	 * #1104: sha256 of the file bytes this result's diagnostics were computed
 	 * against, when known — from the pull path's server-answered `resultId`
 	 * flow (a "full" `workspace/diagnostic`/`textDocument/diagnostic` report is
-	 * fingerprinted at request time; an "unchanged" report inherits the prior
-	 * fingerprint) or, for a per-file touch, the SAME `contentHash` the #1095
-	 * push-path binding records. Absent means "no hash available" (never
-	 * fabricated) — the cache-record site below then honestly stores no
-	 * contentHash and a later `lookup()`'s binding reads "unknown", exactly the
-	 * pre-#1104 behavior for that entry.
+	 * bound to the content pi-lens last sent the server (#3505 b); an
+	 * "unchanged" report inherits the prior fingerprint) or, for a per-file
+	 * touch, the SAME `contentHash` the #1095 push-path binding records. Absent
+	 * means "no hash available" (never fabricated) — the cache-record site below
+	 * then honestly stores no contentHash and a later `lookup()`'s binding reads
+	 * "unknown", exactly the pre-#1104 behavior for that entry. A workspace
+	 * pull answer without one is not recorded at all (#3505 b).
 	 */
 	contentHash?: string;
 	/**
@@ -9205,6 +9208,10 @@ export class LSPService {
 			cachedResults.map((result) => normalizeMapKey(result.filePath)),
 		);
 		const supersededCacheKeys = new Set<string>();
+		// #3505 (b): files a workspace pull answered this sweep. Their answer is
+		// persisted only when it is bound to bytes pi-lens sent (see the record
+		// loop below).
+		const pullAnsweredFiles = new Set<string>();
 		// Per-file scan mtime captured as each file completes below, so a
 		// confirmed fresh result can be written back into the cache with the
 		// mtime it was ACTUALLY scanned at (not re-stat'd after the fact, which
@@ -9707,6 +9714,7 @@ export class LSPService {
 										normalizeMapKey(result.filePath),
 									),
 								});
+								pullAnsweredFiles.add(result.filePath);
 								// #671: a pull result is always confirmed (see
 								// `tryWorkspacePull`'s doc comment), so it's cache-eligible
 								// too — best-effort stat since the pull already resolved the
@@ -9850,6 +9858,17 @@ export class LSPService {
 				results.flatMap((result) => result.unconfirmedServerIds ?? []),
 			),
 		].sort((a, b) => Number(a > b) - Number(a < b));
+		// #3505 (b): pull answers not bound to bytes pi-lens sent. The record
+		// loop below delivers but does not cache them (and drops the entry each
+		// supersedes), so a pull sweep that caches nothing says so here.
+		let pullUnbound = 0;
+		for (const result of results) {
+			if (
+				pullAnsweredFiles.has(result.filePath) &&
+				result.contentHash === undefined
+			)
+				pullUnbound += 1;
+		}
 		logLatency({
 			type: "phase",
 			phase: "lsp_workspace_diagnostics",
@@ -9868,6 +9887,7 @@ export class LSPService {
 				timedOutFiles,
 				unconfirmedByReason,
 				partiallyCoveredFiles,
+				pullUnbound,
 				...(unconfirmedServerIds.length > 0 && { unconfirmedServerIds }),
 				aborted: signal?.aborted ?? false,
 			},
@@ -9892,6 +9912,19 @@ export class LSPService {
 				(result.unconfirmedServerIds?.length ?? 0) > 0 ||
 				scannedAt === undefined
 			) {
+				continue;
+			}
+			// #3505 (b): a pull answer is persisted only when it is bound to the
+			// bytes pi-lens sent the server. Its stat is taken after the answer, so
+			// without that binding a write that landed while the server answered
+			// is recorded as the entry's own state and the pre-edit verdict is
+			// served from cache. The answer still reaches this sweep's results;
+			// the entry it supersedes (#1782) is dropped rather than replayed.
+			if (
+				pullAnsweredFiles.has(result.filePath) &&
+				result.contentHash === undefined
+			) {
+				workspaceDiagnosticsCacheCtx.forget(result.filePath);
 				continue;
 			}
 			// #1104: thread the per-result `contentHash` (from either the
@@ -9924,7 +9957,14 @@ export class LSPService {
 						(result) =>
 							!supersededCacheKeys.has(normalizeMapKey(result.filePath)),
 					);
-		return [...servedCacheResults, ...results].filter(Boolean);
+		// #3573: a fresh result is observed at its read, the same stamp its cache
+		// entry carries, so a write that landed while the sweep was still
+		// analysing the file is newer than the widget row it reconciles into.
+		const freshResults = results.map((result) => ({
+			...result,
+			observedAt: scannedAtByFile.get(result.filePath),
+		}));
+		return [...servedCacheResults, ...freshResults].filter(Boolean);
 	}
 
 	/**
@@ -10506,6 +10546,16 @@ function processService(): LSPService {
  */
 export function getLSPService(): LSPService {
 	return processService();
+}
+
+/**
+ * #3576 R1: the live service, if one exists, without building one. Work that
+ * outlived its session reaches the next session's documents through this and
+ * never through `getLSPService()`, which would build a service (and a touch
+ * would spawn its server) after `resetLSPService`.
+ */
+export function peekLSPService(): LSPService | undefined {
+	return lspProcessState().service ?? undefined;
 }
 
 /**

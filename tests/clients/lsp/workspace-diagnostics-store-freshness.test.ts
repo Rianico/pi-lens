@@ -19,6 +19,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	cacheKeyFor,
@@ -34,16 +35,23 @@ import {
 	setupTestEnvironment,
 } from "../test-utils.js";
 
-const { getServersForFileWithConfig, createLSPClient, warm } = vi.hoisted(
-	() => ({
+const { getServersForFileWithConfig, createLSPClient, warm, logLatency } =
+	vi.hoisted(() => ({
 		getServersForFileWithConfig: vi.fn(),
 		createLSPClient: vi.fn(),
 		warm: {
 			attached: false,
 			diagnostics: vi.fn(),
 		},
-	}),
-);
+		logLatency: vi.fn(),
+	}));
+// A pass-through, so every row still reaches the real logger.
+vi.mock("../../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../../clients/latency-logger.js")>();
+	logLatency.mockImplementation(actual.logLatency);
+	return { ...actual, logLatency };
+});
 vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
 	...(await importOriginal()),
 	getServersForFileWithConfig,
@@ -59,7 +67,11 @@ vi.mock("../../../clients/warm-attach.js", async (importOriginal) => ({
 	tryWarmAttachedDiagnostics: warm.diagnostics,
 }));
 
+import { clientRequestWorkspaceDiagnostics } from "../../../clients/lsp/client.js";
+import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import type { LSPService } from "../../../clients/lsp/index.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { createMockState } from "./mock-client-state.js";
 
 const PREFIX = "pi-lens-wsd-store-freshness-";
 const T_READ = 1_900_000_000_000;
@@ -341,7 +353,14 @@ describe("formal/store-freshness workspace-cache replays (#3505)", () => {
 								setMtime(dep, T_EDIT);
 							}
 							vi.setSystemTime(T_REC);
-							return [];
+							// #3505 (b): answers bound to the bytes pi-lens sent (open
+							// documents at the sent version), the only pull answers
+							// the sweep caches; neither file itself is written.
+							return [other, file].map((p) => ({
+								filePath: p,
+								diagnostics: [],
+								contentHash: hashDiagnosticContent(fs.readFileSync(p, "utf-8")),
+							}));
 						});
 						createLSPClient.mockResolvedValue({
 							...makeClient(tmp).client,
@@ -366,5 +385,117 @@ describe("formal/store-freshness workspace-cache replays (#3505)", () => {
 				CASE_MS,
 			);
 		}
+	});
+
+	// ── (b) pull path: an answer is cached only when bound to sent bytes ─────
+	// The client double hands the request to the REAL report builder
+	// (`clientRequestWorkspaceDiagnostics`) over a mock connection, so the
+	// binding under test is the production one. The concurrent writer lands
+	// while the server is answering.
+	describe("a workspace pull answer is cached only when bound to bytes pi-lens sent (#3505 b)", () => {
+		/** `pullUnbound` of each `lsp_workspace_diagnostics` row logged. */
+		const sweepRowPullUnbound = () =>
+			logLatency.mock.calls
+				.map(([row]) => row)
+				.filter((row) => row.phase === "lsp_workspace_diagnostics")
+				.map((row) => row.metadata?.pullUnbound);
+
+		function pullClient(opts: { sent: boolean; writeDuringAnswer: boolean }) {
+			const state = createMockState({
+				serverId: "typescript",
+				workspaceDiagnosticsSupport: {
+					advertised: true,
+					mode: "pull",
+					workspaceDiagnostics: true,
+					diagnosticProviderKind: "object",
+				},
+			});
+			if (opts.sent) {
+				// pi-lens has both documents open at version 1, with the bytes on
+				// disk as the content it sent.
+				for (const p of [other, file]) {
+					const key = normalizeMapKey(p);
+					state.openDocuments.add(key);
+					state.documentContentHashes.set(key, {
+						version: 1,
+						hash: hashDiagnosticContent(fs.readFileSync(p, "utf-8")),
+					});
+				}
+			}
+			let pulls = 0;
+			state.connection.sendRequest = vi.fn(async () => {
+				pulls += 1;
+				if (opts.writeDuringAnswer && pulls === 1) rewriteFile();
+				return {
+					items: [other, file].map((p) => ({
+						uri: pathToFileURL(p).href,
+						kind: "full",
+						version: opts.sent ? 1 : null,
+						items: [],
+					})),
+				};
+			}) as never;
+			createLSPClient.mockResolvedValue({
+				...makeClient(tmp).client,
+				getWorkspaceDiagnosticsSupport: () => state.workspaceDiagnosticsSupport,
+				requestWorkspaceDiagnostics: (budgetMs: number) =>
+					clientRequestWorkspaceDiagnostics(state, budgetMs),
+			});
+			return () => pulls;
+		}
+
+		for (const [label, sent] of [
+			[
+				"WorkspaceOwnPullPostHocHash (#3505 b): a write while the server answers a file it read itself makes the next sweep pull again",
+				false,
+			],
+			[
+				"WorkspaceOwnPullPostHocHash (#3505 b): a write while the server answers an open document makes the next sweep pull again",
+				true,
+			],
+		] as const) {
+			it(
+				label,
+				async () => {
+					process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
+					try {
+						const pulls = pullClient({ sent, writeDuringAnswer: true });
+						logLatency.mockClear();
+						await sweep();
+						expect(pulls()).toBe(1);
+						// The sweep row counts the answers it would not cache.
+						expect(sweepRowPullUnbound()).toEqual([sent ? 0 : 2]);
+						await sweep();
+						expect(pulls()).toBe(2);
+					} finally {
+						delete process.env.PI_LENS_LSP_WORKSPACE_PULL;
+					}
+				},
+				CASE_MS,
+			);
+		}
+
+		it(
+			"WorkspaceOwnPullPostHocHash no-drop (#3505 b): an answer bound to the bytes pi-lens sent is served from cache on the next sweep",
+			async () => {
+				process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
+				try {
+					const pulls = pullClient({ sent: true, writeDuringAnswer: false });
+					logLatency.mockClear();
+					await sweep();
+					expect(sweepRowPullUnbound()).toEqual([0]);
+					await sweep();
+					expect(pulls()).toBe(1);
+					const entry =
+						loadWorkspaceDiagnosticsCache(tmp)?.entries[cacheKeyFor(file)];
+					expect(entry?.contentHash).toBe(
+						hashDiagnosticContent(fs.readFileSync(file, "utf-8")),
+					);
+				} finally {
+					delete process.env.PI_LENS_LSP_WORKSPACE_PULL;
+				}
+			},
+			CASE_MS,
+		);
 	});
 });

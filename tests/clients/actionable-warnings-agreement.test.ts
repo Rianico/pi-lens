@@ -12,6 +12,9 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { CacheManager } from "../../clients/cache-manager.js";
+import { applyWorkspaceEdit } from "../../clients/lsp/edits.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { setupTestEnvironment } from "./test-utils.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 
@@ -302,5 +305,176 @@ describe("actionable warning quickfix agreement (#3005)", () => {
 				latestReasons: [expect.objectContaining({ subject: "node:eslint" })],
 			}),
 		]);
+	});
+});
+
+describe("#3576: a quickfix pass whose session was replaced", () => {
+	let env: ReturnType<typeof setupTestEnvironment>;
+
+	beforeEach(() => {
+		env = setupTestEnvironment("pi-lens-3576-quickfix-");
+		resetDegradationLedger();
+		codeAction.mockReset();
+		fs.writeFileSync(
+			path.join(env.tmpDir, "package.json"),
+			JSON.stringify({ devDependencies: { eslint: "^9.0.0" } }),
+		);
+		fs.writeFileSync(
+			path.join(env.tmpDir, "package-lock.json"),
+			JSON.stringify({
+				packages: { "node_modules/eslint": { version: "9.0.0" } },
+			}),
+		);
+	});
+	afterEach(() => env.cleanup());
+
+	function quickfix(filePath: string) {
+		return {
+			title: "Fix it",
+			kind: "quickfix",
+			isPreferred: true,
+			edit: {
+				changes: {
+					[pathToFileURL(filePath).href]: [
+						{
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 5 },
+							},
+							newText: "const",
+						},
+					],
+				},
+			},
+		};
+	}
+
+	/** One eligible eslint warning per file, in order. */
+	function twoFileReport(files: string[]): ActionableWarningsReport {
+		const base = report(files[0]!);
+		return {
+			...base,
+			files: files.map((filePath, index) => ({
+				filePath,
+				displayPath: path.basename(filePath),
+				warnings: [
+					{
+						...base.files[0]!.warnings[0]!,
+						id: `eslint:fix:${index}`,
+						filePath,
+						displayPath: path.basename(filePath),
+					},
+				],
+			})),
+		};
+	}
+
+	/** The drain's mutation context over a real runtime and its session. */
+	function drainContext(runtime: RuntimeCoordinator, cache: CacheManager) {
+		return {
+			cwd: env.tmpDir,
+			correlationId: "3576-quickfix",
+			tool: "lsp-quickfix",
+			source: "autofix" as const,
+			runtime,
+			cacheManager: cache,
+			readGuard: runtime.readGuard,
+			session: runtime.captureSessionGeneration(),
+		};
+	}
+
+	function files(): string[] {
+		return ["a.ts", "b.ts"].map((name) => {
+			const filePath = path.join(env.tmpDir, name);
+			fs.writeFileSync(filePath, "value = 1;\n");
+			return filePath;
+		});
+	}
+
+	it("applies no edit it had not started when /new lands during its code-action request", async () => {
+		const [a, b] = files();
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = env.tmpDir;
+		let entered!: () => void;
+		const parked = new Promise<void>((r) => (entered = r));
+		let release!: () => void;
+		const released = new Promise<void>((r) => (release = r));
+		codeAction.mockImplementation((async (fp: string) => {
+			if (fp === a) {
+				entered();
+				await released;
+			}
+			return [quickfix(fp)];
+		}) as never);
+		const pass = applyConservativeActionableWarningFixes({
+			cwd: env.tmpDir,
+			report: twoFileReport([a!, b!]),
+			mutationContext: drainContext(runtime, new CacheManager(false)),
+		});
+		await parked;
+		runtime.resetForSession();
+		release();
+		const result = await pass;
+		expect(result.applied).toBe(0);
+		expect(result.skipped).toEqual([
+			{ id: "eslint:fix:0", reason: "session_replaced" },
+			{ id: "eslint:fix:1", reason: "session_replaced" },
+		]);
+		expect(fs.readFileSync(a!, "utf8")).toBe("value = 1;\n");
+		expect(fs.readFileSync(b!, "utf8")).toBe("value = 1;\n");
+	});
+
+	it("no-drop (shape 54): a pass that stays in its session applies every edit", async () => {
+		const [a, b] = files();
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = env.tmpDir;
+		codeAction.mockImplementation((async (fp: string) => [
+			quickfix(fp),
+		]) as never);
+		const result = await applyConservativeActionableWarningFixes({
+			cwd: env.tmpDir,
+			report: twoFileReport([a!, b!]),
+			mutationContext: drainContext(runtime, new CacheManager(false)),
+		});
+		expect(result.applied).toBe(2);
+		expect(fs.readFileSync(a!, "utf8")).toBe("const = 1;\n");
+		expect(runtime.getFileSeq(a!)).toBe(1);
+		expect(runtime.getFileSeq(b!)).toBe(1);
+	});
+
+	it("an edit already writing when /new lands completes, and its bookkeeping stays out of the next session", async () => {
+		const [a] = files();
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = env.tmpDir;
+		const cache = new CacheManager(false);
+		const addModifiedRange = vi.spyOn(cache, "addModifiedRange");
+		const applying = applyWorkspaceEdit(quickfix(a!).edit, env.tmpDir, {
+			mutationContext: drainContext(runtime, cache),
+		});
+		// The write is in flight (its first await); the next session starts.
+		runtime.resetForSession();
+		await applying;
+		expect(fs.readFileSync(a!, "utf8")).toBe("const = 1;\n");
+		expect(runtime.getFileSeq(a!)).toBe(0);
+		expect(runtime.projectSeq).toBe(0);
+		expect(addModifiedRange).not.toHaveBeenCalled();
+		expect(
+			getDegradationSummary()
+				.filter((group) => group.kind === "generation-guard-stale-write")
+				.flatMap((group) => group.latestReasons.map((r) => r.subject)),
+		).toEqual([`runtime-session:${a}`]);
+	});
+
+	it("no-drop (shape 54): an edit in its own session records its bookkeeping", async () => {
+		const [a] = files();
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = env.tmpDir;
+		const cache = new CacheManager(false);
+		const addModifiedRange = vi.spyOn(cache, "addModifiedRange");
+		await applyWorkspaceEdit(quickfix(a!).edit, env.tmpDir, {
+			mutationContext: drainContext(runtime, cache),
+		});
+		expect(runtime.getFileSeq(a!)).toBe(1);
+		expect(addModifiedRange).toHaveBeenCalledTimes(1);
 	});
 });
