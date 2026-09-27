@@ -578,6 +578,70 @@ describe("change-log allocation and its lock (#3577, #3578)", () => {
 	});
 
 	/**
+	 * Recurrence: #3594 item 2 round 2 (review, verify). A naive "trust the
+	 * LAST complete line's own seq" first version of `tailMaxSeq` shipped and
+	 * broke `tests/clients/project-snapshot-cross-process.test.ts`'s "a line
+	 * still being written is read once it is complete" — an unlocked
+	 * writer's line can finish landing in the log AFTER a lower-seq line an
+	 * unseeded reader already appended past it, so the file's own byte order
+	 * is not always seq order at the exact moment a cold cursor reads it.
+	 * This pins the same shape directly against `tailMaxSeq`'s own seam:
+	 * a tiny two-line log where the FIRST line carries the higher seq.
+	 */
+	it("allocates correctly when an earlier line in the log carries a higher seq than the last (#3594 item 2 round 2)", () => {
+		nodeFs.mkdirSync(path.dirname(logPath), { recursive: true });
+		// The exact shape an unlocked writer's delayed completion leaves: its
+		// higher seq (5) physically precedes a lower seq (1) that landed
+		// first because THIS runtime allocated it while the writer's own
+		// line was still incomplete.
+		nodeFs.writeFileSync(logPath, logLine(5) + logLine(1));
+
+		const counts = watchReadsOf();
+		const runtime = new RuntimeCoordinator();
+		runtime.seedProjectSequence(0);
+		expect(edit(runtime, "a.ts").projectSeq).toBe(6);
+		// Trusted directly, in one read — not via a fallback to the OLD
+		// full-read algorithm after tailMaxSeq gives up (which would still
+		// be correct, but is exactly the cost this optimization exists to
+		// avoid: a mutant that stops trusting a window already covering the
+		// whole file reds here on read count, not on the allocated value).
+		expect(counts.reads).toHaveLength(1);
+	});
+
+	/**
+	 * Recurrence: same shape as above, scaled so the disordered pair sits
+	 * INSIDE the first (small) scan window while the log is still too large
+	 * for that window to cover the whole file — the case where trusting the
+	 * window's own local max immediately (without checking it against the
+	 * window's own last line) would settle for a value that a mutation
+	 * could get away with for a single disordered pair, but a genuine fix
+	 * must instead keep growing past it rather than stopping the moment ANY
+	 * complete line parses.
+	 */
+	it("keeps growing the window when the disordered pair sits inside it, not just when it stops at one line (#3594 item 2 round 2)", () => {
+		nodeFs.mkdirSync(path.dirname(logPath), { recursive: true });
+		let existing = "";
+		for (let seq = 1; seq <= 200; seq++) existing += logLine(seq);
+		existing += logLine(999); // an unlocked writer's reserved-early seq
+		existing += logLine(201); // this runtime's own, landed first
+		nodeFs.writeFileSync(logPath, existing);
+		const size = nodeFs.statSync(logPath).size;
+		// The disordered [999, 201] pair must be inside the FIRST window, and
+		// the window must NOT yet cover the whole file — otherwise this is
+		// the same "start === 0" shape the test above already covers.
+		expect(size).toBeGreaterThan(4_096 * 2);
+
+		const counts = watchReadsOf();
+		const runtime = new RuntimeCoordinator();
+		runtime.seedProjectSequence(0);
+		expect(edit(runtime, "a.ts").projectSeq).toBe(1_000);
+		// More than one attempt: the first window's own disorder (max 999,
+		// last line 201) is not trusted on sight, so the loop grows past it.
+		expect(counts.reads.length).toBeGreaterThan(1);
+		expect(counts.reads[0]).toBeLessThanOrEqual(4_096);
+	});
+
+	/**
 	 * Recurrence: an allocator that trusts the read taken before the lock. A
 	 * sibling that held the lock appended in between, and would share its seq.
 	 */
