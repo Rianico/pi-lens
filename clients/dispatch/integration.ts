@@ -998,6 +998,8 @@ export async function computeCascadeForFile(
 		dbg?: (msg: string) => void;
 		/** Turn/write sequence from RuntimeCoordinator — scopes cascade caches (A5/B10) */
 		turnSeq?: number;
+		/** #3540 r2: the primary edit's order turn, for its widget writes. */
+		orderTurn?: number;
 		writeSeq?: number;
 		/**
 		 * Authoritative workspace root (`PipelineContext.projectRoot`). `cwd` above
@@ -1064,6 +1066,7 @@ export async function computeCascadeForFile(
 			hasBlockers = false,
 			dbg,
 			turnSeq = 0,
+			orderTurn,
 			writeSeq,
 			projectRoot,
 			seqState,
@@ -1074,7 +1077,7 @@ export async function computeCascadeForFile(
 			sessionGeneration,
 		} = options;
 		// #3540: the primary edit's widget order, turn first.
-		const widgetOrder = writeOrderToken(turnSeq, writeSeq);
+		const widgetOrder = writeOrderToken(orderTurn, writeSeq);
 
 		ensureCascadeTurnScope(turnSeq);
 

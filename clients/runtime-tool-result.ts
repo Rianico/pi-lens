@@ -802,6 +802,8 @@ async function dispatchPipelineAnalysis(args: {
 	autofixMode: "immediate" | "deferred";
 	modifiedRanges: Array<{ start: number; end: number }> | undefined;
 	writeIndex: number;
+	/** #3540 r2: the order turn `writeIndex` was drawn in. */
+	writeOrderTurn: number;
 	initialStateHash: string;
 	readGuardCorrelationId: string;
 	requestedEditIndexes: number[];
@@ -848,6 +850,7 @@ async function dispatchPipelineAnalysis(args: {
 		autofixMode,
 		modifiedRanges,
 		writeIndex,
+		writeOrderTurn,
 		initialStateHash,
 		readGuardCorrelationId,
 		requestedEditIndexes,
@@ -884,6 +887,7 @@ async function dispatchPipelineAnalysis(args: {
 				sessionId: runtime.telemetrySessionId,
 				turnIndex: runtime.turnIndex,
 				writeIndex,
+				orderTurn: writeOrderTurn,
 				modelId: runtime.telemetryModelId,
 				provider: runtime.telemetryProviderId,
 			},
@@ -917,6 +921,7 @@ async function dispatchPipelineAnalysis(args: {
 			// #3559: the re-token's turn, read when it is drawn.
 			nextWriteIndex: () => ({
 				turnIndex: runtime.turnIndex,
+				orderTurn: runtime.writeOrderTurn,
 				writeIndex: runtime.nextWriteIndex(),
 			}),
 		},
@@ -2176,6 +2181,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							autofixMode: observedAutofixMode,
 							modifiedRanges: undefined,
 							writeIndex: runtime.nextWriteIndex(),
+							writeOrderTurn: runtime.writeOrderTurn,
 							initialStateHash: observedStateHashForPath,
 							readGuardCorrelationId: observedReadGuardCorrelationId,
 							requestedEditIndexes: getRequestedEditIndexes(
@@ -2460,8 +2466,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// comes from the runtime, which `message_start`/`session_start` populate —
 	// see the `telemetry:` block handed to `runPipeline` below.
 	const writeIndex = runtime.nextWriteIndex();
-	// #3507: the turn this token was drawn in orders it across turns.
-	const writeTurnIndex = runtime.turnIndex;
+	// #3507: the turn this token was drawn in orders it across turns (#3540
+	// r2: the order turn, which a session reset never restarts).
+	const writeOrderTurn = runtime.writeOrderTurn;
 	let modifiedRanges: Array<{ start: number; end: number }> | undefined;
 	// #2423: ranges a shape adapter resolved from the tool's own input. Only a
 	// classified non-native edit shape sets these — a plain host `edit` carries
@@ -2608,6 +2615,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			autofixMode,
 			modifiedRanges,
 			writeIndex,
+			writeOrderTurn,
 			initialStateHash,
 			readGuardCorrelationId,
 			requestedEditIndexes,
@@ -2834,7 +2842,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					// end instead of replaying pre-mark text.
 					result.inlineBlockerDiagnostics,
 					// #3559: a re-token's own turn.
-					result.turnIndex ?? writeTurnIndex,
+					result.orderTurn ?? writeOrderTurn,
 					// #3503: the freshness baseline is the analysis read.
 					result.analysisReadAtMs,
 				),
@@ -2845,7 +2853,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				runtime.clearInlineBlockers(
 					filePath,
 					result.writeIndex ?? writeIndex,
-					result.turnIndex ?? writeTurnIndex,
+					result.orderTurn ?? writeOrderTurn,
 				),
 			) ?? false;
 	}

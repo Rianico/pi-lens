@@ -255,6 +255,13 @@ export interface PipelineContext {
 		sessionId: string;
 		turnIndex: number;
 		writeIndex: number;
+		/**
+		 * #3540 r2: the order turn `writeIndex` was drawn in
+		 * (`RuntimeCoordinator.writeOrderTurn`). Unlike `turnIndex` it never
+		 * restarts at a session reset, so it, not `turnIndex`, orders writes
+		 * into stores that outlive the session (the widget).
+		 */
+		orderTurn?: number;
 		/** Raw model id / provider, separate from the combined `model` display
 		 * string above — worklog attribution (#1448) wants the two apart. */
 		modelId?: string;
@@ -307,7 +314,11 @@ export interface PipelineContext {
 	 * the turn it is drawn in, which is later than the handler's when the
 	 * pipeline outlived its turn.
 	 */
-	nextWriteIndex?: () => { turnIndex: number; writeIndex: number };
+	nextWriteIndex?: () => {
+		turnIndex: number;
+		orderTurn: number;
+		writeIndex: number;
+	};
 }
 
 export interface PipelineDeps {
@@ -339,8 +350,8 @@ export interface PipelineResult {
 	postWriteStateHash?: string;
 	/** #3506: the write token the analysis was recorded under. */
 	writeIndex?: number;
-	/** #3559: the turn `writeIndex` was drawn in. */
-	turnIndex?: number;
+	/** #3559: the order turn `writeIndex` was drawn in (#3540 r2). */
+	orderTurn?: number;
 	/** #3503: `Date.now()` taken before the bytes the analysis ran on were read. */
 	analysisReadAtMs?: number;
 	/** Files modified by pi-lens format/autofix, including side-effect files. */
@@ -1594,7 +1605,7 @@ async function analysePipeline(
 	// #3540: the widget's order spans turns; read at each use, since the
 	// re-token below replaces the pair.
 	const widgetOrder = () =>
-		writeOrderToken(ctx.telemetry?.turnIndex, ctx.telemetry?.writeIndex);
+		writeOrderToken(ctx.telemetry?.orderTurn, ctx.telemetry?.writeIndex);
 	admitWidgetDiagnosticsWrite(filePath, widgetOrder());
 
 	const phase = createPhaseTracker(toolName, filePath);
@@ -2046,6 +2057,7 @@ async function analysePipeline(
 				hasBlockers,
 				dbg,
 				turnSeq: ctx.telemetry?.turnIndex,
+				orderTurn: ctx.telemetry?.orderTurn,
 				writeSeq: ctx.telemetry?.writeIndex,
 				// #3157: `cwd` here is the LANGUAGE root. The cascade's display
 				// filter reads the disposition store and the `.pi-lens.json` rule
@@ -2125,7 +2137,7 @@ async function analysePipeline(
 		fileModified,
 		postWriteStateHash,
 		writeIndex: ctx.telemetry?.writeIndex,
-		turnIndex: ctx.telemetry?.turnIndex,
+		orderTurn: ctx.telemetry?.orderTurn,
 		analysisReadAtMs,
 		changedFiles,
 		// #3190: re-rendered from the GATED set with `formatDiagnostics(...,

@@ -436,6 +436,14 @@ export class RuntimeCoordinator {
 	// claude-sonnet-4-5) doesn't leave a stale provider from the old model.
 	private _telemetryProviderIsExplicit = false;
 	private _turnIndex = 0;
+	/**
+	 * #3540 r2: the turn half of a write order token (`writeOrderToken`).
+	 * `beginTurn` advances it and `resetForSession` never restarts it: the
+	 * widget's write guards outlive a session reset (`/reload` keeps them),
+	 * so a later turn's token must outrank every earlier one in the process.
+	 * `_turnIndex` restarts per session for telemetry.
+	 */
+	private _writeOrderTurn = 0;
 	private _writeIndex = 0;
 	private _projectSeq = 0;
 	// #3511: the highest logged seq this runtime's view is known to have missed
@@ -712,6 +720,7 @@ export class RuntimeCoordinator {
 		// by resetForSession().
 		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
+		this._writeOrderTurn += 1;
 		beginTurnContext(this._telemetrySessionId);
 		this._writeIndex = 0;
 		this._reportedThisTurn.clear();
@@ -848,7 +857,10 @@ export class RuntimeCoordinator {
 	 * another turn's: the widget store and the inline-blocker retire.
 	 */
 	nextWriteOrderToken(): number {
-		return writeOrderToken(this._turnIndex, this.nextWriteIndex()) as number;
+		return writeOrderToken(
+			this._writeOrderTurn,
+			this.nextWriteIndex(),
+		) as number;
 	}
 
 	setTelemetryIdentity(identity: {
@@ -933,6 +945,11 @@ export class RuntimeCoordinator {
 
 	get turnIndex(): number {
 		return this._turnIndex;
+	}
+
+	/** #3540 r2: the order turn a write token is drawn in; never restarts. */
+	get writeOrderTurn(): number {
+		return this._writeOrderTurn;
 	}
 
 	get projectSeq(): number {
@@ -1311,10 +1328,10 @@ export class RuntimeCoordinator {
 		lines?: readonly number[],
 		contentBaseline?: { size: number; sha256: string },
 		diagnostics?: readonly Diagnostic[],
-		turnIndex = this._turnIndex,
+		orderTurn = this._writeOrderTurn,
 		recordedAtMs = Date.now(),
 	): number | undefined {
-		const writeOrder = writeOrderToken(turnIndex, writeIndex);
+		const writeOrder = writeOrderToken(orderTurn, writeIndex);
 		if (
 			!this._inlineBlockerWriteOrder.shouldWrite(
 				normalizeMapKey(filePath),
@@ -1349,12 +1366,12 @@ export class RuntimeCoordinator {
 	clearInlineBlockers(
 		filePath: string,
 		writeIndex?: number,
-		turnIndex = this._turnIndex,
+		orderTurn = this._writeOrderTurn,
 	): boolean {
 		if (
 			!this._inlineBlockerWriteOrder.shouldWrite(
 				normalizeMapKey(filePath),
-				writeOrderToken(turnIndex, writeIndex),
+				writeOrderToken(orderTurn, writeIndex),
 			)
 		)
 			return false;
