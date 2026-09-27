@@ -152,6 +152,20 @@
  * every derived timeout at `MIN_GH_TIMEOUT_MS` -- a hang still can't blow far
  * past the hard cap (the floor is a small fraction of it), and a healthy
  * call near the end of a small budget still gets a fighting chance.
+ *
+ * #3497: the Claude Code cloud container carries `GH_TOKEN`/`GITHUB_TOKEN`
+ * but has no `gh` binary, so this script exited 70 (transport) unconditionally
+ * there -- a `check_suite.completed` wake was misread as a green head on
+ * PR #3491 in exactly that gap (its own verify reviewer read CI by hand
+ * instead). When the real `gh` is confirmed missing (an `ENOENT` probe, not
+ * merely erroring) AND a token is available, `run()` switches to a REST
+ * transport that reads the SAME endpoints (`gh api X` is itself a thin fetch
+ * wrapper around `https://api.github.com/X`) via an authenticated `fetch`,
+ * resolving the repository from the checkout's own `git remote` instead of
+ * `gh repo view`. The verdict line names which transport produced it
+ * (`Transport: gh` / `Transport: rest`). See `resolveTransport`,
+ * `restResolveHeadSha`, `restFetchCheckRunsPayload` and
+ * `restResolveRequiredCheckNames` below.
  */
 
 import { execFileSync } from "node:child_process";
@@ -215,6 +229,42 @@ export function isTransientGhError(error) {
 	if (error.code === "ETIMEDOUT") return true;
 	const stderr = error.stderr == null ? "" : String(error.stderr);
 	return TRANSIENT_GH_STDERR.test(stderr);
+}
+
+/**
+ * True when a thrown failure is specifically "the `gh` binary itself is not
+ * on PATH" (#3497): `execFileSync("gh", ...)` reports this as `ENOENT`, the
+ * exact shape the pre-existing "gh not on PATH" case in the
+ * `isTransientGhError` test table already carries. This is deliberately
+ * NARROWER than "any gh failure" -- an auth error, a malformed response, or
+ * a hung process all stay on the `gh` transport and keep today's immediate
+ * exit 70, because only a genuinely missing binary is what the REST
+ * fallback below exists to route around.
+ */
+export function isGhMissingError(error) {
+	return error instanceof Error && error.code === "ENOENT";
+}
+
+/**
+ * The token this script uses for the REST transport (#3497), checked in the
+ * same order `gh` itself documents for `GH_TOKEN`/`GITHUB_TOKEN` -- `GH_TOKEN`
+ * first. Returns `null` for an unset or empty value so a caller can treat
+ * "no token" and "no gh" as the single combined "cannot reach GitHub at all"
+ * case (today's exit 70).
+ */
+export function resolveGithubToken(env = process.env) {
+	const token = env.GH_TOKEN || env.GITHUB_TOKEN;
+	return typeof token === "string" && token.length > 0 ? token : null;
+}
+
+/**
+ * The REST API base this script talks to for the REST transport (#3497):
+ * `GITHUB_API_URL` when set (GitHub Enterprise Server), else the public
+ * default -- the same variable `scripts/check-pr-body.mjs`'s `fetchLivePrBody`
+ * already reads for the identical reason.
+ */
+export function resolveGithubApiBase(env = process.env) {
+	return env.GITHUB_API_URL || "https://api.github.com";
 }
 
 /**
@@ -811,6 +861,31 @@ export const PROTECTED_BRANCH = "master";
  * carries both today and they agree (probed 2026-09-06: `checks: [{context:
  * "Lint & type-check", ...}, {context: "Unit tests", ...}]`).
  */
+/**
+ * The pure `required_status_checks` -> names extraction, shared (#3497) by
+ * both the `gh api` path above's doc comment and the REST path below --
+ * they read the identical branch-protection response shape, differing only
+ * in how the bytes got here (`gh` shelling out vs. an authenticated
+ * `fetch`). Split out of `resolveRequiredCheckNames` unchanged: same inputs,
+ * same `null`-or-string-array output, so its existing tests keep passing
+ * against this call-through.
+ */
+export function extractRequiredCheckNames(requiredStatusChecks) {
+	const checks = requiredStatusChecks?.checks;
+	const contextsFromChecks = Array.isArray(checks)
+		? checks.map((check) => check?.context).filter(Boolean)
+		: [];
+	// An empty (or absent) `.checks` falls all the way back to the legacy
+	// array -- an empty modern array is more likely an unpopulated field on
+	// an older API response than a repository with zero required checks.
+	const contexts =
+		contextsFromChecks.length > 0
+			? contextsFromChecks
+			: requiredStatusChecks?.contexts;
+	if (!Array.isArray(contexts) || contexts.length === 0) return null;
+	return contexts.map(String);
+}
+
 export function resolveRequiredCheckNames(
 	repository,
 	ghExec = gh,
@@ -821,22 +896,226 @@ export function resolveRequiredCheckNames(
 			["api", `repos/${repository}/branches/${PROTECTED_BRANCH}/protection`],
 			{ timeoutMs },
 		);
-		const requiredStatusChecks = JSON.parse(raw)?.required_status_checks;
-		const checks = requiredStatusChecks?.checks;
-		const contextsFromChecks = Array.isArray(checks)
-			? checks.map((check) => check?.context).filter(Boolean)
-			: [];
-		// An empty (or absent) `.checks` falls all the way back to the legacy
-		// array -- an empty modern array is more likely an unpopulated field on
-		// an older API response than a repository with zero required checks.
-		const contexts =
-			contextsFromChecks.length > 0
-				? contextsFromChecks
-				: requiredStatusChecks?.contexts;
-		if (!Array.isArray(contexts) || contexts.length === 0) return null;
-		return contexts.map(String);
+		return extractRequiredCheckNames(JSON.parse(raw)?.required_status_checks);
 	} catch {
 		return null;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3497: the REST transport. Used only when the real `gh` binary is not on
+// PATH (the Claude Code cloud container's own shape -- `GH_TOKEN`/
+// `GITHUB_TOKEN` set, no `gh`) -- see `probeGhAvailable` and `run()` below.
+// Every function here reads the SAME endpoints the `gh api` calls above hit
+// (`gh api X` is itself a thin authenticated-fetch wrapper around
+// `https://api.github.com/X`), so the verdict this produces is the same
+// verdict the `gh` path would have produced for the same SHA -- the
+// acceptance criterion is parity, not a second policy.
+// ---------------------------------------------------------------------------
+
+export const TRANSPORT_GH = "gh";
+export const TRANSPORT_REST = "rest";
+
+/**
+ * Parses `owner/repo` out of a `git remote get-url origin` value -- both the
+ * SSH (`git@github.com:owner/repo.git`) and HTTPS
+ * (`https://github.com/owner/repo.git`) forms this repo's own clones use.
+ * `gh repo view` resolves the current repository the same way (from the
+ * checkout's remote), so this is the REST transport's equivalent when `gh`
+ * itself cannot be asked to do it.
+ */
+export function parseOwnerRepoFromGitRemote(remoteUrl) {
+	const match = /github\.com[:/]{1,2}([^/\s]+)\/([^/\s.]+?)(?:\.git)?\/?$/.exec(
+		String(remoteUrl ?? "").trim(),
+	);
+	return match ? `${match[1]}/${match[2]}` : null;
+}
+
+/**
+ * REST equivalent of `resolveRepository` (#3497): `gh repo view` has no REST
+ * analogue that resolves "the repo of the current checkout" the way the CLI
+ * does, so this reads the same fact from the checkout's own git remote
+ * instead of a GitHub API call. Synchronous, like `resolveRepository`, since
+ * `git remote get-url` is a local read with no network round trip.
+ */
+export function resolveRepositoryViaGit(execFileSyncImpl = execFileSync) {
+	const url = execFileSyncImpl("git", ["remote", "get-url", "origin"], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		timeout: 10_000,
+	}).trim();
+	const repository = parseOwnerRepoFromGitRemote(url);
+	if (!repository)
+		throw new Error(
+			`could not parse an owner/repo from git remote "origin" (${url})`,
+		);
+	return repository;
+}
+
+/**
+ * One authenticated `fetch` against the REST API, normalized to the SAME
+ * failure shapes `isTransientGhError` already understands, so `--wait`'s
+ * backoff loop (#2935) works identically for both transports without any
+ * change to that loop: a 5xx or connect failure carries an `.stderr` string
+ * matching `TRANSIENT_GH_STDERR`'s "HTTP 5\d\d" / "error connecting to"
+ * alternatives, and a `fetch` abort-timeout carries `.code === "ETIMEDOUT"`,
+ * mirroring the `gh` CLI's own hung-process `ETIMEDOUT` (F4). A 4xx (auth or
+ * repo error) carries an `.stderr` of "HTTP 4xx: ..." that the SAME regex
+ * does NOT match, so it keeps the immediate exit 70 the `gh` path already
+ * gives those.
+ */
+async function restGet(
+	path,
+	{
+		token,
+		fetchImpl = fetch,
+		timeoutMs = DEFAULT_GH_TIMEOUT_MS,
+		apiBase = resolveGithubApiBase(),
+	} = {},
+) {
+	let response;
+	try {
+		response = await fetchImpl(`${apiBase}/${path}`, {
+			signal: AbortSignal.timeout(timeoutMs),
+			headers: {
+				Accept: "application/vnd.github+json",
+				Authorization: `Bearer ${token}`,
+				"X-GitHub-Api-Version": "2022-11-28",
+			},
+		});
+	} catch (error) {
+		if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+			throw Object.assign(new Error(`REST request timed out: ${path}`), {
+				code: "ETIMEDOUT",
+			});
+		}
+		throw Object.assign(
+			new Error(
+				`REST request failed: ${path}: ${error instanceof Error ? error.message : error}`,
+			),
+			{
+				stderr: `error connecting to api.github.com: ${error instanceof Error ? error.message : error}`,
+			},
+		);
+	}
+	const text = await response.text();
+	if (!response.ok) {
+		throw Object.assign(new Error(`GitHub REST API error for ${path}`), {
+			stderr: `HTTP ${response.status}: ${text.slice(0, 300)} (${path})`,
+		});
+	}
+	return text.length > 0 ? JSON.parse(text) : {};
+}
+
+/**
+ * GitHub's REST `mergeable_state` enum down to the three-value set
+ * `computeVerdict` already understands from `gh pr view --json mergeable`
+ * ("MERGEABLE", "CONFLICTING", "UNKNOWN"). Only the "dirty" ->
+ * "CONFLICTING" mapping matters to `computeVerdict` (its own doc comment:
+ * everything else defers to the check rows) -- "clean"/"unstable"/"blocked"/
+ * "unknown"/"draft"/"has_hooks" all fall through to "UNKNOWN" rather than
+ * risk a wrong-direction MERGEABLE guess for a state this script has never
+ * needed to distinguish.
+ */
+export function mapRestMergeableState(pullRequest) {
+	if (pullRequest?.mergeable_state === "dirty") return "CONFLICTING";
+	if (pullRequest?.mergeable === true) return "MERGEABLE";
+	return "UNKNOWN";
+}
+
+/** REST equivalent of `resolveHeadSha` (#3497): `GET .../pulls/<n>` carries
+ * both `head.sha` and `mergeable`/`mergeable_state` in one request, same as
+ * the single `gh pr view` call it replaces. */
+export async function restResolveHeadSha(repository, target, options = {}) {
+	if (!isPrNumber(target))
+		return { sha: String(target).trim(), mergeable: null };
+	const pullRequest = await restGet(
+		`repos/${repository}/pulls/${target}`,
+		options,
+	);
+	return {
+		sha: pullRequest?.head?.sha,
+		mergeable: mapRestMergeableState(pullRequest),
+	};
+}
+
+/** REST equivalent of `fetchCheckRunsPayload` (#3497): identical pagination
+ * over the identical endpoint `gh api` was already calling, so the merge
+ * loop below is unchanged from that function's -- only the page fetch
+ * itself (`restGet` vs. `ghExec`) differs. */
+export async function restFetchCheckRunsPayload(repository, sha, options = {}) {
+	const checkRuns = [];
+	let totalCount;
+	let page = 1;
+	for (;;) {
+		const payload = await restGet(
+			`repos/${repository}/commits/${sha}/check-runs?per_page=100&page=${page}`,
+			options,
+		);
+		if (typeof payload?.total_count === "number")
+			totalCount = payload.total_count;
+		if (Array.isArray(payload?.check_runs))
+			checkRuns.push(...payload.check_runs);
+		if (
+			typeof totalCount !== "number" ||
+			checkRuns.length >= totalCount ||
+			payload?.check_runs?.length === 0
+		)
+			break;
+		page += 1;
+	}
+	return { total_count: totalCount ?? checkRuns.length, check_runs: checkRuns };
+}
+
+/** REST equivalent of `resolveRequiredCheckNames` (#3497): same endpoint,
+ * same `extractRequiredCheckNames` parse, same `null`-on-any-failure
+ * fail-open-to-the-static-allowlist contract. */
+export async function restResolveRequiredCheckNames(repository, options = {}) {
+	try {
+		const payload = await restGet(
+			`repos/${repository}/branches/${PROTECTED_BRANCH}/protection`,
+			options,
+		);
+		return extractRequiredCheckNames(payload?.required_status_checks);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Decides ONCE, before any repository/PR resolution, whether this run uses
+ * the REST transport (#3497): only when `usesDefaultGhExec` is true -- i.e.
+ * the caller left `run()`'s `ghExec` at its real default, never for an
+ * injected test double, so every existing `gh`-path test (which always
+ * injects its own `ghExec`) is unaffected regardless of whether the real
+ * `gh` binary or a `GH_TOKEN` happen to be present in the process running
+ * the suite -- AND the real `gh --version` probe fails with ENOENT
+ * (confirmed missing, not merely erroring) AND a token is available. `gh`
+ * present but broken some OTHER way (a permission error on the probe, say)
+ * stays on the `gh` transport so the real call below reproduces that
+ * failure exactly as it did before this change, rather than this function
+ * guessing "missing" from an error shape `isGhMissingError` does not
+ * confirm. `probe` takes no arguments -- it is only ever invoked once
+ * `usesDefaultGhExec` is already confirmed true, so it probes the real `gh`
+ * wrapper directly rather than needing that private reference passed in,
+ * which keeps this function callable from a test with no access to `gh`
+ * (module-private by design, see the "Thin `gh` shell" section above).
+ */
+export function resolveTransport(usesDefaultGhExec, token, probe = probeGh) {
+	if (!usesDefaultGhExec || !token) return TRANSPORT_GH;
+	return probe() ? TRANSPORT_GH : TRANSPORT_REST;
+}
+
+/** The `gh --version` probe `resolveTransport` runs against the real `gh`
+ * wrapper. Not injectable by design (see `resolveTransport`'s doc comment);
+ * a test drives this indirectly by injecting `resolveTransport`'s own
+ * `probe` parameter instead. */
+function probeGh() {
+	try {
+		gh(["--version"], { timeoutMs: MIN_GH_TIMEOUT_MS });
+		return true;
+	} catch (error) {
+		return !isGhMissingError(error);
 	}
 }
 
@@ -862,6 +1141,15 @@ export function parseArgs(argv) {
 export async function run({
 	argv = process.argv.slice(2),
 	ghExec = gh,
+	// #3497: injectable REST-transport seams, mirroring `ghExec` above --
+	// `gitExec` for `resolveRepositoryViaGit`'s local `git remote` read,
+	// `fetchImpl` for every `restGet` call. Both default to the real thing,
+	// so production behavior is unchanged; a test drives the REST branch
+	// deterministically by overriding these two plus `PATH`/`GH_TOKEN` (to
+	// make the `gh --version` probe ENOENT on demand) without touching a
+	// real network or a real git remote.
+	gitExec = execFileSync,
+	fetchImpl = fetch,
 	stdout = console.log,
 	stderr = console.error,
 	sleepImpl,
@@ -897,17 +1185,47 @@ export async function run({
 				onRetry: stderr,
 				...(sleepImpl ? { sleepImpl } : {}),
 			});
-		const repository = await retryStartup((remainingMs) =>
-			resolveRepository(ghExec, resolveGhTimeoutMs(remainingMs)),
-		);
-		const { sha, mergeable, classification } = await retryStartup(
-			(remainingMs) =>
-				resolveHeadSha(target, ghExec, resolveGhTimeoutMs(remainingMs)),
-		);
+		// #3497: decided once, before any repository/PR resolution, and never
+		// for an injected test `ghExec` (see `resolveTransport`'s own doc
+		// comment) -- every call below branches on this ONE flag rather than
+		// each guessing per-call, and the `gh`-branch call shapes are
+		// byte-for-byte what they were before this transport existed.
+		const transport = resolveTransport(ghExec === gh, resolveGithubToken());
+		const restOptions = { token: resolveGithubToken(), fetchImpl };
+		const repository =
+			transport === TRANSPORT_REST
+				? resolveRepositoryViaGit(gitExec)
+				: await retryStartup((remainingMs) =>
+						resolveRepository(ghExec, resolveGhTimeoutMs(remainingMs)),
+					);
+		const { sha, mergeable, classification } =
+			transport === TRANSPORT_REST
+				? {
+						...(await retryStartup((remainingMs) =>
+							restResolveHeadSha(repository, target, {
+								...restOptions,
+								timeoutMs: resolveGhTimeoutMs(remainingMs),
+							}),
+						)),
+						classification: null,
+					}
+				: await retryStartup((remainingMs) =>
+						resolveHeadSha(target, ghExec, resolveGhTimeoutMs(remainingMs)),
+					);
+		// The rerun-classifier comment marker and the Actions-attempts read
+		// below are both `gh pr view`/`gh api` reads with no REST path added
+		// in this change (#3497's acceptance criteria are PR head/mergeable,
+		// check-runs and required-check names only) -- the REST transport
+		// simply carries no classification, which `computeVerdict` already
+		// treats as "no infra-rerun grace", the same as a target with no
+		// `ci-classifier:` comment on the `gh` transport.
 		const ciClassification =
-			classification ?? resolveClassification(target, ghExec, initialTimeoutMs);
+			transport === TRANSPORT_REST
+				? null
+				: (classification ??
+					resolveClassification(target, ghExec, initialTimeoutMs));
 		const rerunState =
-			ciClassification && isPrNumber(target)
+			transport === TRANSPORT_GH && ciClassification && isPrNumber(target)
 				? () => fetchRerunState(repository, sha, ghExec, initialTimeoutMs)
 				: null;
 		// #2609: read once, before polling starts (branch protection does not
@@ -915,11 +1233,13 @@ export async function run({
 		// `requiredChecks` then falls back to the constant default, and every
 		// OTHER discovered check still gates via computeVerdict's own
 		// advisory-allowlist check (see its doc comment).
-		const liveRequiredChecks = resolveRequiredCheckNames(
-			repository,
-			ghExec,
-			initialTimeoutMs,
-		);
+		const liveRequiredChecks =
+			transport === TRANSPORT_REST
+				? await restResolveRequiredCheckNames(repository, {
+						...restOptions,
+						timeoutMs: initialTimeoutMs,
+					})
+				: resolveRequiredCheckNames(repository, ghExec, initialTimeoutMs);
 		const requiredChecks = liveRequiredChecks ?? REQUIRED_CHECKS;
 		const gatingSource = liveRequiredChecks
 			? `branch protection required_status_checks on ${PROTECTED_BRANCH} (${liveRequiredChecks.join(", ")}) -- every other check-run gates unless it is on the advisory allowlist`
@@ -927,12 +1247,17 @@ export async function run({
 
 		const { verdict, polls } = await pollVerdict({
 			fetchPayload: (remainingMs) =>
-				fetchCheckRunsPayload(
-					repository,
-					sha,
-					ghExec,
-					resolveGhTimeoutMs(remainingMs),
-				),
+				transport === TRANSPORT_REST
+					? restFetchCheckRunsPayload(repository, sha, {
+							...restOptions,
+							timeoutMs: resolveGhTimeoutMs(remainingMs),
+						})
+					: fetchCheckRunsPayload(
+							repository,
+							sha,
+							ghExec,
+							resolveGhTimeoutMs(remainingMs),
+						),
 			waitSeconds:
 				deadline === undefined
 					? waitSeconds
@@ -955,6 +1280,9 @@ export async function run({
 		// infer it from `reason` text alone. `"n/a"` for a bare-SHA target
 		// documents that DIRTY is PR-only.
 		stdout(`Merge state: ${verdict.mergeState}`);
+		// #3497: names which transport produced this verdict, so a reviewer
+		// reading the output never has to infer it from context.
+		stdout(`Transport: ${transport}`);
 		stdout(`Gating source: ${gatingSource}`);
 		stdout(verdict.reason);
 		return verdict.exitCode;
