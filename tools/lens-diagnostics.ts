@@ -195,7 +195,7 @@ type WorkspaceLspDiagnosticResult = {
 	// original scan, or (#3573) a fresh result's read. Threaded into the footer
 	// reconcile so neither a cache-served nor a fresh mode=full row is stamped
 	// after a write it never saw. See LSPWorkspaceDiagnosticResult.observedAt.
-	observedAt?: number;
+	observedAt?: number | undefined;
 	contentHash?: string;
 	boundToCurrentDisk?: BoundToCurrentDisk;
 	writeIndex?: number;
@@ -2033,9 +2033,12 @@ function mergeDiagnosticsWithWidgetSummaries(
 		for (const diagnostic of result.diagnostics ?? []) {
 			// #3573: the row keeps its sweep read stamp through the correlated
 			// commit, which otherwise stamps it with the project scan's time or now.
+			// Absent only for a service double that predates the field.
 			addDiagnostic(filePath, {
 				...lspDiagnosticToWidget(diagnostic),
-				observedAt: result.observedAt,
+				...(result.observedAt !== undefined && {
+					observedAt: result.observedAt,
+				}),
 			});
 		}
 	}

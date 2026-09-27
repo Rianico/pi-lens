@@ -929,7 +929,7 @@ export interface LSPWorkspaceDiagnosticResult {
 	 * (the #1092 touchedAt-re-arming defect), and so a write that landed while
 	 * the sweep was analysing the file is newer than the row.
 	 */
-	observedAt?: number;
+	observedAt?: number | undefined;
 	/**
 	 * #1104: sha256 of the file bytes this result's diagnostics were computed
 	 * against, when known — from the pull path's server-answered `resultId`
