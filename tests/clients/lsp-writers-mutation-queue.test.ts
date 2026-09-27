@@ -143,11 +143,11 @@ async function assertAgentEditSurvives(write: () => Promise<unknown>) {
 }
 
 /** The quick fix the actionable-warning report offers for line 1. */
-const fixIt = () => ({
+const fixIt = (target = filePath) => ({
 	title: "Fix it",
 	kind: "quickfix",
 	isPreferred: true,
-	edit: valueEdit(),
+	edit: valueEdit(target),
 });
 
 /**
@@ -439,31 +439,28 @@ describe("#3541: the actionable fix applies only to the bytes its code action wa
 			(group) => group.kind === "lsp-edit-stale-content",
 		);
 
-	// The report may spell F through a symlinked directory; the edit's URI
-	// names the real path. Both must key the same expected content.
+	// The report and the code action's URI can each spell F through a
+	// symlinked directory; every pairing must key the same expected content.
 	it.each([
-		["as the edit does", () => filePath],
-		[
-			"through a symlinked directory",
-			() => {
-				const link = path.join(env.tmpDir, "linked");
-				fs.symlinkSync(env.tmpDir, link, "dir");
-				return path.join(link, "a.ts");
-			},
-		],
+		["the report and the edit spell F alike", false, false],
+		["the report spells F through a symlinked directory", true, false],
+		["the edit spells F through a symlinked directory", false, true],
 	])(
-		"an agent edit made while the code action is computed is not rewritten at the action's stale position; the fix is skipped as stale_content (report spells F %s)",
-		async (_spelling, reportedPath) => {
+		"an agent edit made while the code action is computed is not rewritten at the action's stale position; the fix is skipped as stale_content (%s)",
+		async (_spelling, reportViaLink, editViaLink) => {
+			const link = path.join(env.tmpDir, "linked");
+			fs.symlinkSync(env.tmpDir, link, "dir");
+			const viaLink = path.join(link, "a.ts");
 			const asked = gate();
 			const answer = gate();
 			useActionableFix(async () => {
 				asked.open();
 				await answer.p;
-				return [fixIt()];
+				return [fixIt(editViaLink ? viaLink : filePath)];
 			});
 			const fix = applyConservativeActionableWarningFixes({
 				cwd: env.tmpDir,
-				report: actionableReport(reportedPath()),
+				report: actionableReport(reportViaLink ? viaLink : filePath),
 			});
 			await asked.p;
 			// The agent's edit: a line prepended through pi's queue, so line 1 is
