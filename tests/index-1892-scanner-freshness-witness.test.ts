@@ -34,6 +34,7 @@ import { CacheManager } from "../clients/cache-manager.js";
 import { getDegradationSummary } from "../clients/degradation-ledger.js";
 import type { GitleaksResult } from "../clients/gitleaks-client.js";
 import type { GovulncheckResult } from "../clients/govulncheck-client.js";
+import { _settleRegistryMutationsForTests } from "../clients/instance-registry.js";
 import type { TrivyResult } from "../clients/trivy-client.js";
 import extension from "../index.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
@@ -154,6 +155,13 @@ describe("#1892 witness: pi turn_end → context, scanner freshness", () => {
 			makeSessionStartEvent(),
 			makeCtx({ cwd: tmpDir, sessionId: SESSION_ID }),
 		);
+		// session_start queues its registerInstance without awaiting it, and
+		// turn_end's heartbeat takes the registry lock outside that queue. On
+		// a loaded runner the heartbeat can win, find no entry and record
+		// instance-registry-registration-missing into this golden. Join the
+		// queue so the golden only holds the scanner rows it pins; the race
+		// itself is G16's (#3587).
+		await _settleRegistryMutationsForTests();
 		await pi.emit("turn_start", {}, makeCtx({ cwd: tmpDir }));
 		await pi.emit(
 			"tool_result",
