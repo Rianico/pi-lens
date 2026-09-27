@@ -1,6 +1,16 @@
+// flake-shape: real-process-spawn — F1's defect (#3592 round 2) is a
+// temporal-dead-zone crash that only exists in the driver's OWN top-level
+// execution order; the driver is a top-level script this suite cannot
+// import (see the "stated exception" notes below), and a source-text
+// assertion alone already passed under the crash (the wiring test for
+// #3592 item 2 checked the literal text existed, not that calling
+// `baseMeta` before it ran was safe). Only spawning the real script against
+// a real, throwaway git fixture reproduces the actual TDZ ordering bug.
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
 import {
 	augmentAndSummarize,
 	buildRunConfig,
@@ -44,6 +54,76 @@ const workflow = readFileSync(
 	resolve(import.meta.dirname, "../../.github/workflows/mutation.yml"),
 	"utf8",
 );
+
+const repositoryRoot = resolve(import.meta.dirname, "../..");
+const driverPath = join(repositoryRoot, "scripts", "stryker-diff.mjs");
+
+describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
+	// Recurrence this guards: `baseMeta` (called from four early-exit paths --
+	// no changed mutation source, no covering test, a source-map build
+	// failure, no mutation range) read a `let costEstimate` that was declared
+	// LOWER in the file, past every one of those call sites. Every early exit
+	// therefore called `baseMeta` while `costEstimate` sat in the temporal
+	// dead zone, throwing `ReferenceError: Cannot access 'costEstimate'
+	// before initialization` out of the driver with no report written and
+	// exit code 1 -- the sticky comment renders that as "Stale ... a crash"
+	// rather than the intended zero-mutant advisory. A source-text check on
+	// the driver (see the `measuredTotalMutants` wiring test above) cannot
+	// catch this: the literal text is correct either way, only the ORDER of
+	// two statements in the real module differs. This spawns the actual
+	// script against a real, throwaway git repo -- no relative import,
+	// mock, or source-text substitute reproduces a temporal-dead-zone crash.
+	it("exits 0 with a zero-mutant report when no changed line falls under a mutated glob, instead of crashing on costEstimate's TDZ", () => {
+		const fixtureRepo = mkdtempSync(
+			join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
+		);
+		try {
+			// One commit, no files under scripts/**/*.mjs, clients/**/*.ts,
+			// tools/**/*.ts, mcp/**/*.ts, or index.ts -- `--base HEAD` then diffs
+			// HEAD against itself (empty), landing on the very first early-exit
+			// branch (`files.length === 0`), the earliest of the four vulnerable
+			// call sites.
+			writeFileSync(join(fixtureRepo, "README.md"), "fixture\n");
+			gitExecFileSync(["init", "-q"], { cwd: fixtureRepo });
+			gitExecFileSync(["add", "README.md"], { cwd: fixtureRepo });
+			gitExecFileSync(
+				[
+					"-c",
+					"user.email=pi-lens-test@example.com",
+					"-c",
+					"user.name=pi-lens-test",
+					"commit",
+					"-qm",
+					"fixture",
+				],
+				{ cwd: fixtureRepo },
+			);
+
+			const result = execFileSync(
+				process.execPath,
+				[driverPath, "--base", "HEAD"],
+				{ cwd: fixtureRepo, encoding: "utf8" },
+			);
+
+			expect(result).toContain("no mutants evaluated");
+			expect(result).not.toContain("ReferenceError");
+			const report = JSON.parse(
+				readFileSync(
+					join(fixtureRepo, "reports", "mutation", "mutation.json"),
+					"utf8",
+				),
+			);
+			expect(report.piLensMutationDiff.zeroMutants.reason).toContain(
+				"no PR-changed lines fall under",
+			);
+			// #3592 item 2's own field must survive an early exit too -- null,
+			// since the dry-run measurement never ran, not a crash-shaped absence.
+			expect(report.piLensMutationDiff.measuredTotalMutants).toBeNull();
+		} finally {
+			rmSync(fixtureRepo, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("stryker diff selection", () => {
 	it.each([

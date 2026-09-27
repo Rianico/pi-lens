@@ -120,11 +120,16 @@ export function renderMutationMarkdown(report) {
 	// candidate range set, not just the sampled subset) by design, and no
 	// per-range count exists to compute an expected sampled total (#3592
 	// item 1).
+	// F3 (#3592 round 2): `!zeroMutants` and `total > 0` were dead conjuncts
+	// -- control flow can only reach this line when the `if (zeroMutants)`
+	// branch above did NOT return, i.e. `zeroMutants` is already falsy here,
+	// and (given `!meta.partial` below) `total !== 0` follows from
+	// `zeroMutants`'s own definition (`!meta.partial && total === 0`), so
+	// `total > 0` was equally guaranteed rather than checked. Removed; the
+	// remaining four conjuncts are the only ones a mutation can affect.
 	const evaluatedMismatch =
 		!meta.partial &&
-		!zeroMutants &&
 		!meta.rangesSampled &&
-		total > 0 &&
 		typeof meta.measuredTotalMutants === "number" &&
 		meta.measuredTotalMutants !== total;
 

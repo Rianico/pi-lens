@@ -493,6 +493,17 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the CLI's exit codes and rendered stdout/stderr are the process-boundary contract; an in-process fetch call cannot certify the real entry point",
 	},
+	// 2026-09-27 (#3592 round 2 F1): the driver's temporal-dead-zone crash
+	// (`baseMeta` reading a `let costEstimate` still in the TDZ from four
+	// early-exit call sites) only exists in the real module's own top-level
+	// execution order; a source-text assertion on the driver already passed
+	// under the crash, so only spawning the actual script against a real,
+	// throwaway git fixture reproduces it.
+	"real-process-spawn:scripts/stryker-diff.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the defect is a temporal-dead-zone crash in the driver's own top-level execution order; no source-text or in-process substitute reproduces it",
+	},
 	// 2026-09-06 (#2586 review F1): proves the actual delimiter
 	// supply-host-provided-deps.mjs prints in its own stdout bytes; an
 	// in-process double would just re-assert the test author's assumption.
