@@ -1,3 +1,4 @@
+// mutation-lane: exclude
 /**
  * #1892 witness (ADR 0007) — the pi HOST entry, not the engine seam.
  *

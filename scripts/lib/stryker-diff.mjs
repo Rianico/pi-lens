@@ -5,6 +5,41 @@ import { mapGeneratedLineToOriginal } from "./mutation-source-map.mjs";
 
 const IMPORT_SPECIFIER_RE =
 	/(?:from\s+|import\s*(?:\(\s*)?|require\(\s*)["']([^"']+)["']/g;
+const MUTATION_LANE_EXCLUSION_RE = /^\s*\/\/\s*mutation-lane:\s*exclude\s*$/m;
+const MUTATION_LANE_EXCLUSIONS_PATH =
+	"tests/config/stryker-diff-exclusions.json";
+
+function mutationLaneExclusions() {
+	try {
+		return JSON.parse(readFileSync(MUTATION_LANE_EXCLUSIONS_PATH, "utf8"));
+	} catch {
+		return {};
+	}
+}
+
+/** @param {string} file @param {{readFile?: (file: string) => string, exclusions?: Record<string, {reason?: string}>}} [options] */
+export function mutationLaneExclusion(
+	file,
+	{
+		readFile = (candidate) => readFileSync(candidate, "utf8"),
+		exclusions = mutationLaneExclusions(),
+	} = {},
+) {
+	let source;
+	try {
+		source = readFile(file);
+	} catch {
+		return null;
+	}
+	if (!MUTATION_LANE_EXCLUSION_RE.test(source)) return null;
+	const admission = exclusions[file];
+	if (!admission?.reason) {
+		throw new Error(
+			`mutation lane exclusion marker has no checked reason: ${file}`,
+		);
+	}
+	return { file, reason: admission.reason };
+}
 
 export const DEFAULT_MAX_FILES = 6;
 
@@ -227,8 +262,24 @@ function strykerFailureCause(result, budgetMinutes) {
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
  */
-export function describeStrykerFailure(result, budgetMinutes) {
-	return `mutation diff: no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}`;
+export function describeStrykerFailure(
+	result,
+	budgetMinutes,
+	{ tests = [], output = "" } = {},
+) {
+	const failed = [
+		...new Set(
+			[...output.matchAll(/(?:FAIL|×|❯)\s+(tests\/[^\s:]+)/g)].map(
+				(match) => match[1],
+			),
+		),
+	];
+	const named = failed.length > 0 ? failed : tests;
+	const suffix =
+		named.length > 0
+			? `; tests involved: ${named.join(", ")}`
+			: "; no related test file was identified";
+	return `mutation diff: dry run failed; no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}${suffix}`;
 }
 
 /**
@@ -286,31 +337,46 @@ export function mapRelatedTests(
 	{
 		testFiles = collectTestFiles("tests"),
 		readFile = (file) => readFileSync(file, "utf8"),
+		exclusions = mutationLaneExclusions(),
 	} = {},
 ) {
 	const sources = changedFiles.filter(isMutationSourceFile);
 	const related = new Map(sources.map((file) => [file, new Set()]));
+	const excluded = new Map();
 	const testContents = testFiles.map((test) => {
+		let content;
 		try {
-			return [test, readFile(test)];
+			content = readFile(test);
 		} catch {
-			return [test, null];
+			return [test, null, null];
 		}
+		const exclusion = mutationLaneExclusion(test, {
+			readFile: () => content,
+			exclusions,
+		});
+		return [test, content, exclusion];
 	});
 
 	for (const file of sources) {
 		const sibling = conventionalTestSibling(file);
-		if (testFiles.some((test) => normalized(test) === normalized(sibling))) {
-			related.get(file).add(sibling);
+		const siblingEntry = testContents.find(
+			([test]) => normalized(test) === normalized(sibling),
+		);
+		if (siblingEntry) {
+			const siblingExclusion = siblingEntry[2];
+			if (siblingExclusion) excluded.set(sibling, siblingExclusion);
+			else related.get(file).add(sibling);
 		}
 		const target = normalized(file);
-		for (const [test, content] of testContents) {
+		for (const [test, content, exclusion] of testContents) {
 			if (content === null) continue;
 			for (const specifier of extractRelativeSpecifiers(content)) {
 				const imported = normalized(
 					path.resolve(path.dirname(test), specifier),
 				);
-				if (imported === target) related.get(file).add(test);
+				if (imported !== target) continue;
+				if (exclusion) excluded.set(test, exclusion);
+				else related.get(file).add(test);
 			}
 		}
 	}
@@ -320,6 +386,7 @@ export function mapRelatedTests(
 		covered: sources.filter((file) => related.get(file).size > 0),
 		uncovered: sources.filter((file) => related.get(file).size === 0),
 		tests: [...new Set([...related.values()].flatMap((files) => [...files]))],
+		excluded: [...excluded.values()],
 	};
 }
 

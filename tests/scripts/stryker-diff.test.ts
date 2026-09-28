@@ -29,6 +29,7 @@ import {
 	isMutationSourceFile,
 	isScriptMutationFile,
 	mapRelatedTests,
+	mutationLaneExclusion,
 	MUTATION_BUDGET_MINUTES,
 	mutationRangePatterns,
 	parseChangedLineRanges,
@@ -463,6 +464,52 @@ describe("compiled-source mutation targets (#3531 rescope)", () => {
 });
 
 describe("mapRelatedTests generalized to compiled sources", () => {
+	it("excludes only source-marked tests with a checked reason", () => {
+		// Recurrence: #3625 admitted grammar, real-stdio, and host-witness tests
+		// into a dry run because they imported a widely-used module. The marker
+		// is source-derived; the reason is independently checked and an unmarked
+		// importer remains in the population.
+		const result = mapRelatedTests(["clients/degradation-ledger.ts"], {
+			testFiles: ["tests/marked.test.ts", "tests/plain.test.ts"],
+			readFile: (file) =>
+				file.includes("marked")
+					? '// mutation-lane: exclude\nimport "../clients/degradation-ledger.js";'
+					: 'import "../clients/degradation-ledger.js";',
+			exclusions: {
+				"tests/marked.test.ts": { reason: "fixture boundary" },
+			},
+		});
+
+		expect(result.tests).toEqual(["tests/plain.test.ts"]);
+		expect(result.excluded).toEqual([
+			{ file: "tests/marked.test.ts", reason: "fixture boundary" },
+		]);
+	});
+
+	it("rejects an exclusion marker without a checked reason", () => {
+		// Recurrence: a marker without an independently reviewed reason would be
+		// silent coverage loss rather than a bounded admission.
+		expect(() =>
+			mutationLaneExclusion("tests/marked.test.ts", {
+				readFile: () => "// mutation-lane: exclude",
+				exclusions: {},
+			}),
+		).toThrow("no checked reason");
+	});
+
+	it("names the related tests when the dry run fails", () => {
+		const reason = describeStrykerFailure(
+			{ status: 1, signal: null, error: undefined },
+			60,
+			{ tests: ["tests/mcp/server.smoke.test.ts"] },
+		);
+		expect(reason).toContain("dry run failed");
+		expect(reason).toContain("tests/mcp/server.smoke.test.ts");
+		expect(reason).not.toContain(
+			"mutation diff: no mutants evaluated; dry run or",
+		);
+	});
+
 	it("matches a compiled source's test import even though tests import the .js specifier", () => {
 		// Recurrence: TypeScript's nodenext resolution (and this repo's own
 		// tests, e.g. tests/index-wiring.test.ts importing "../index.js")

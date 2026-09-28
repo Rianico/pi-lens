@@ -1,3 +1,4 @@
+// mutation-lane: exclude
 /**
  * MCP server stdio smoke test — spawns the in-place-compiled server and drives
  * the real newline-delimited JSON-RPC handshake (initialize → tools/list →

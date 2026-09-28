@@ -1,0 +1,11 @@
+{
+  "tests/clients/module-report-call-graph.test.ts": {
+    "reason": "grammar-heavy fixture matrix depends on optional tree-sitter grammars"
+  },
+  "tests/mcp/server.smoke.test.ts": {
+    "reason": "real stdio child and latency payload are scheduling-sensitive"
+  },
+  "tests/index-1892-scanner-freshness-witness.test.ts": {
+    "reason": "host witness uses real cache and scanner lifecycle state"
+  }
+}

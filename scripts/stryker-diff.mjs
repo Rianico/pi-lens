@@ -246,7 +246,12 @@ if (files.length === 0) {
 	process.exit(0);
 }
 
-const { covered, uncovered, tests } = mapRelatedTests(files);
+const { covered, uncovered, tests, excluded } = mapRelatedTests(files);
+for (const { file, reason } of excluded) {
+	console.log(
+		`mutation diff: excluding ${file} from dry-run gating (${reason})`,
+	);
+}
 for (const file of uncovered) {
 	console.log(`mutation diff: no covering test for ${file}`);
 }
@@ -260,6 +265,7 @@ if (covered.length === 0) {
 			zeroMutants: { reason },
 			filesSkippedOverCap: skipped,
 			filesUncovered: uncovered,
+			testsExcluded: excluded,
 		}),
 	);
 	process.exit(0);
@@ -400,7 +406,10 @@ if (measureResult.error || measureResult.status !== 0) {
 	// The measurement dry run IS the real run's own dry run (same tests, same
 	// code): if it fails here, the real run would fail identically, so report
 	// that failure now instead of spending a second, redundant dry run.
-	const reason = describeStrykerFailure(measureResult, budgetMinutes);
+	const reason = describeStrykerFailure(measureResult, budgetMinutes, {
+		tests,
+		output: measureOutput,
+	});
 	console.error(reason);
 	writeReport(
 		null,
@@ -410,6 +419,7 @@ if (measureResult.error || measureResult.status !== 0) {
 			filesUncovered: uncovered,
 			rangesTotal: allPatterns.length,
 			testsRun: tests,
+			testsExcluded: excluded,
 		}),
 	);
 	process.exit(1);
@@ -559,10 +569,10 @@ for (;;) {
 			rangesEvaluated: triedPatterns.length,
 			rangesTotal: allPatterns.length,
 			totalMutants: costEstimate?.totalMutants ?? null,
-			failureReason: describeStrykerFailure(result, budgetMinutes),
+			failureReason: describeStrykerFailure(result, budgetMinutes, { tests }),
 			partialReason: describePartialInterruptCause(result, budgetMinutes),
 		});
-		console.error(describeStrykerFailure(result, budgetMinutes));
+		console.error(describeStrykerFailure(result, budgetMinutes, { tests }));
 		if (outcome.partial) {
 			console.log(
 				`mutation diff: partial report -- ${outcome.partial.evaluated} of ${outcome.partial.total ?? "an unknown total of"} mutant(s) evaluated before the interrupt`,
