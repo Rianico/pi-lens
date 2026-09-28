@@ -9,6 +9,13 @@ const MUTATION_LANE_EXCLUSION_RE = /^\s*\/\/\s*mutation-lane:\s*exclude\s*$/m;
 const MUTATION_LANE_EXCLUSIONS_PATH =
 	"tests/config/stryker-diff-exclusions.json";
 
+export class MutationLaneExclusionError extends Error {
+	constructor(file) {
+		super(`mutation lane exclusion marker has no checked reason: ${file}`);
+		this.name = "MutationLaneExclusionError";
+	}
+}
+
 function mutationLaneExclusions() {
 	try {
 		return JSON.parse(readFileSync(MUTATION_LANE_EXCLUSIONS_PATH, "utf8"));
@@ -34,9 +41,7 @@ export function mutationLaneExclusion(
 	if (!MUTATION_LANE_EXCLUSION_RE.test(source)) return null;
 	const admission = exclusions[file];
 	if (!admission?.reason) {
-		throw new Error(
-			`mutation lane exclusion marker has no checked reason: ${file}`,
-		);
+		throw new MutationLaneExclusionError(file);
 	}
 	return { file, reason: admission.reason };
 }

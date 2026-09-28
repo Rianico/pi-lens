@@ -246,7 +246,19 @@ if (files.length === 0) {
 	process.exit(0);
 }
 
-const { covered, uncovered, tests, excluded } = mapRelatedTests(files);
+let selection;
+try {
+	selection = mapRelatedTests(files);
+} catch (error) {
+	const reason = `mutation diff: invalid mutation-lane exclusion registry (${error.name ?? "Error"}): ${error.message}`;
+	console.error(reason);
+	writeReport(
+		null,
+		baseMeta({ zeroMutants: { reason }, filesSkippedOverCap: skipped }),
+	);
+	process.exit(1);
+}
+const { covered, uncovered, tests, excluded } = selection;
 for (const { file, reason } of excluded) {
 	console.log(
 		`mutation diff: excluding ${file} from dry-run gating (${reason})`,
@@ -668,6 +680,7 @@ for (;;) {
 				rangesEvaluated: triedPatterns.length,
 				rangesSampled: sampled,
 				testsRun: tests,
+				testsExcluded: excluded,
 				counts,
 				score,
 			}),

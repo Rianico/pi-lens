@@ -33,6 +33,30 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).not.toMatch(/score/i);
 	});
 
+	it("renders excluded tests and their reasons on the delivered scored summary", () => {
+		// Recurrence (#3625 F3): metadata-only exclusions made the scored report
+		// look as though the entire related population had been evaluated.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234567890",
+				zeroMutants: null,
+				counts: { Killed: 1 },
+				score: "100.00",
+				testsExcluded: [
+					{
+						file: "tests/mcp/server.smoke.test.ts",
+						reason: "real stdio scheduling",
+					},
+				],
+			},
+		});
+		expect(markdown).toContain("Excluded tests:");
+		expect(markdown).toContain("tests/mcp/server.smoke.test.ts");
+		expect(markdown).toContain("real stdio scheduling");
+	});
+
 	it("round 4 R3-1: renders 0/no-zeroMutants/no-partial as not a clean pass, backstopping a driver branch that failed to set either", () => {
 		// Recurrence: the round-4 review mutated the driver's OWN success/zero
 		// branch (`if (mutants.length > 0)` -> `>= 0`) and its partial branch

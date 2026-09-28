@@ -30,7 +30,16 @@ function metaTable(meta) {
 	if ((meta.filesUncovered?.length ?? 0) > 0) {
 		rows.push(["No covering test", meta.filesUncovered.join(", ")]);
 	}
-	return rows.map(([k, v]) => `- **${k}:** ${v}`).join("\n");
+	const rendered = rows.map(([k, v]) => `- **${k}:** ${v}`);
+	if ((meta.testsExcluded?.length ?? 0) > 0) {
+		rendered.push(
+			"- **Excluded tests:**",
+			...meta.testsExcluded.map(
+				({ file, reason }) => `  - \`${file}\` — ${reason}`,
+			),
+		);
+	}
+	return rendered.join("\n");
 }
 
 /**

@@ -30,6 +30,7 @@ import {
 	isScriptMutationFile,
 	mapRelatedTests,
 	mutationLaneExclusion,
+	MutationLaneExclusionError,
 	MUTATION_BUDGET_MINUTES,
 	mutationRangePatterns,
 	parseChangedLineRanges,
@@ -494,7 +495,64 @@ describe("mapRelatedTests generalized to compiled sources", () => {
 				readFile: () => "// mutation-lane: exclude",
 				exclusions: {},
 			}),
-		).toThrow("no checked reason");
+		).toThrowError(
+			expect.objectContaining({
+				name: "MutationLaneExclusionError",
+				message: expect.stringContaining("no checked reason"),
+			}),
+		);
+	});
+
+	it("keeps an excluded sole importer uncovered", () => {
+		// Recurrence: an exclusion is not coverage. If it is the only importer,
+		// the source must retain the no-covering-test verdict rather than becoming
+		// a falsely covered mutation target.
+		const result = mapRelatedTests(["clients/degradation-ledger.ts"], {
+			testFiles: ["tests/marked.test.ts"],
+			readFile: () =>
+				'// mutation-lane: exclude\nimport "../clients/degradation-ledger.js";',
+			exclusions: {
+				"tests/marked.test.ts": { reason: "fixture boundary" },
+			},
+		});
+		expect(result.covered).toEqual([]);
+		expect(result.uncovered).toEqual(["clients/degradation-ledger.ts"]);
+		expect(result.tests).toEqual([]);
+		expect(result.excluded).toEqual([
+			{ file: "tests/marked.test.ts", reason: "fixture boundary" },
+		]);
+	});
+
+	it("parses failing test names from Stryker output before falling back", () => {
+		// Recurrence: the dry-run failure branch must preserve the child output's
+		// named failing tests, not discard it and report only the selected list.
+		const reason = describeStrykerFailure(
+			{ status: 1, signal: null, error: undefined },
+			60,
+			{
+				tests: ["tests/fallback.test.ts"],
+				output: "FAIL tests/first.test.ts:12\n❯ tests/second.test.ts:4",
+			},
+		);
+		expect(reason).toContain("tests/first.test.ts, tests/second.test.ts");
+		expect(reason).not.toContain("tests/fallback.test.ts");
+	});
+
+	it("uses a bounded named error for an unregistered marker", () => {
+		// Recurrence: a malformed checked registry used to escape the driver as
+		// an anonymous uncaught Error before it could write a bounded report.
+		try {
+			mutationLaneExclusion("tests/marked.test.ts", {
+				readFile: () => "// mutation-lane: exclude",
+				exclusions: {},
+			});
+		} catch (error) {
+			expect(error).toBeInstanceOf(MutationLaneExclusionError);
+			if (!(error instanceof Error)) throw error;
+			expect(error.name).toBe("MutationLaneExclusionError");
+			return;
+		}
+		throw new Error("expected the marker admission to fail");
 	});
 
 	it("names the related tests when the dry run fails", () => {
