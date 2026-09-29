@@ -28,6 +28,15 @@
   #3288), plus #3284's own `path` count red (cue-vet 5→6, dart-analyze 6→4)
   until a trailing re-pin.
 - Build and run the targeted and required governance suites.
+- **Name the behaviour population; never clear a seam from a curated list.**
+  When a change replaces, moves, or widens a lifecycle, dispatch, or ownership
+  seam, enumerate EVERY suite that exercises the behaviour the seam governs,
+  run them all, and name the list in the review. A hand-picked file set cannot
+  clear the behaviour it omits. Evidence: PR #3622's registry seam was called
+  merge-ready after a seven-file run that omitted
+  `tests/clients/lsp/service-crash-respawn.test.ts` and
+  `tests/clients/lsp/service-notify-per-server.test.ts` — the two suites that
+  exercise idle eviction — and both were red on the required Unit tests.
 - Revert or neuter the source fix and verify the red-first test fails.
 - Mutate every new guard, filter, cap, fallback, and lifecycle path.
 - Probe inversions, concurrency, input channels, trust boundaries, strict
