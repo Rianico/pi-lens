@@ -11,6 +11,7 @@ import {
 	augmentAndSummarize,
 	buildRunConfig,
 	capMutationFiles,
+	capRelatedTests,
 	compiledJsPath,
 	decideMutationOutcome,
 	dedupePatterns,
@@ -20,10 +21,12 @@ import {
 	describeStrykerFailure,
 	estimateAffordableMutants,
 	formatCapNotice,
+	formatTestCapNotice,
 	isCompiledMutationSource,
 	isMutationSourceFile,
 	isScriptMutationFile,
 	mapRelatedTests,
+	DEFAULT_MAX_TESTS,
 	MUTATION_BUDGET_MINUTES,
 	mutationRangePatterns,
 	parseChangedLineRanges,
@@ -258,7 +261,16 @@ try {
 	);
 	process.exit(1);
 }
-const { covered, uncovered, tests, excluded } = selection;
+const { covered, uncovered, excluded } = selection;
+const relatedTestCap = capRelatedTests(
+	selection.tests,
+	DEFAULT_MAX_TESTS,
+	selection.priorities,
+);
+const tests = relatedTestCap.selected;
+if (relatedTestCap.dropped.length > 0) {
+	console.log(formatTestCapNotice(tests.length, selection.tests.length));
+}
 for (const { file, reason } of excluded) {
 	console.log(
 		`mutation diff: excluding ${file} from dry-run gating (${reason})`,
@@ -531,7 +543,11 @@ for (;;) {
 	rmSync(INCREMENTAL_PATH, { force: true });
 
 	console.log(`mutation diff: mutating ${patterns.join(", ")}`);
-	console.log(`mutation diff: running related tests ${tests.join(", ")}`);
+	const testSummary =
+		tests.join(", ").length <= 240 ? `; selected: ${tests.join(", ")}` : "";
+	console.log(
+		`mutation diff: running ${tests.length} of ${selection.tests.length} related tests${testSummary}`,
+	);
 	console.log(`mutation diff: budget ${budgetMinutes} minute(s)`);
 	const result = spawnSync(
 		"node_modules/.bin/stryker",

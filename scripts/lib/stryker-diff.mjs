@@ -57,6 +57,13 @@ export const DEFAULT_MAX_FILES = 6;
  */
 export const DEFAULT_MAX_RANGES = 40;
 
+// Measured 2026-09-26: the #3579 replay spent about 3.4 hours in the dry run
+// for 768 related test files (about 15.9 seconds per file). 47 files therefore
+// projects to about 12.5 minutes, leaving the 60-minute mutation budget room
+// for the actual mutants and the lane's build/report overhead. This is a
+// deliberately measured ceiling, not a round population guess.
+export const DEFAULT_MAX_TESTS = 47;
+
 /**
  * Wall-clock bound the driver puts on the Stryker child, in minutes. It must
  * stay strictly below .github/workflows/mutation.yml's `timeout-minutes`, or
@@ -303,6 +310,54 @@ export function formatCapNotice(selectedCount, totalCount, skipped) {
 	return `capped: ${selectedCount} of ${totalCount} changed files mutated; skipped: ${skipped.join(", ")}`;
 }
 
+export function formatTestCapNotice(selectedCount, totalCount) {
+	return `capped: ${selectedCount} of ${totalCount} related tests selected; dropped: ${totalCount - selectedCount}`;
+}
+
+/**
+ * Bound the test population without changing any under-cap selection. Sibling
+ * tests are first, then tests with a direct import, then any future incidental
+ * relations. Ties use the selector's stable order and then the path, making a
+ * capped selection reproducible even when directory enumeration changes.
+ *
+ * @param {string[]} tests
+ * @param {number} maxTests
+ * @param {Map<string, number>} [priorities]
+ */
+export function capRelatedTests(
+	tests,
+	maxTests = DEFAULT_MAX_TESTS,
+	priorities = new Map(),
+) {
+	if (!Number.isInteger(maxTests) || maxTests < 0) {
+		throw new RangeError("maxTests must be a non-negative integer");
+	}
+	if (tests.length <= maxTests) return { selected: tests, dropped: [] };
+	const ranked = tests
+		.map((test, index) => ({
+			test,
+			index,
+			priority: priorities.get(test) ?? 2,
+		}))
+		.sort(
+			(a, b) =>
+				a.priority - b.priority ||
+				a.index - b.index ||
+				a.test.localeCompare(b.test),
+		);
+	const selectedSet = new Set(
+		ranked.slice(0, maxTests).map(({ test }) => test),
+	);
+	return {
+		selected: ranked
+			.filter(({ test }) => selectedSet.has(test))
+			.map(({ test }) => test),
+		dropped: ranked
+			.filter(({ test }) => !selectedSet.has(test))
+			.map(({ test }) => test),
+	};
+}
+
 /**
  * The conventional test-file location a mutation source's basename maps to,
  * mirroring the file's top-level directory: `scripts/lib/ci-checks.mjs` ->
@@ -347,6 +402,7 @@ export function mapRelatedTests(
 ) {
 	const sources = changedFiles.filter(isMutationSourceFile);
 	const related = new Map(sources.map((file) => [file, new Set()]));
+	const priorities = new Map();
 	const excluded = new Map();
 	const testContents = testFiles.map((test) => {
 		let content;
@@ -370,7 +426,10 @@ export function mapRelatedTests(
 		if (siblingEntry) {
 			const siblingExclusion = siblingEntry[2];
 			if (siblingExclusion) excluded.set(sibling, siblingExclusion);
-			else related.get(file).add(sibling);
+			else {
+				related.get(file).add(sibling);
+				priorities.set(sibling, 0);
+			}
 		}
 		const target = normalized(file);
 		for (const [test, content, exclusion] of testContents) {
@@ -381,7 +440,10 @@ export function mapRelatedTests(
 				);
 				if (imported !== target) continue;
 				if (exclusion) excluded.set(test, exclusion);
-				else related.get(file).add(test);
+				else {
+					related.get(file).add(test);
+					if (!priorities.has(test)) priorities.set(test, 1);
+				}
 			}
 		}
 	}
@@ -391,6 +453,7 @@ export function mapRelatedTests(
 		covered: sources.filter((file) => related.get(file).size > 0),
 		uncovered: sources.filter((file) => related.get(file).size === 0),
 		tests: [...new Set([...related.values()].flatMap((files) => [...files]))],
+		priorities,
 		excluded: [...excluded.values()],
 	};
 }
