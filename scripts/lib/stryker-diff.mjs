@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
 import { mapGeneratedLineToOriginal } from "./mutation-source-map.mjs";
 
 const IMPORT_SPECIFIER_RE =
@@ -57,11 +58,13 @@ export const DEFAULT_MAX_FILES = 6;
  */
 export const DEFAULT_MAX_RANGES = 40;
 
-// Measured 2026-09-26: the #3579 replay spent about 3.4 hours in the dry run
-// for 768 related test files (about 15.9 seconds per file). 47 files therefore
-// projects to about 12.5 minutes, leaving the 60-minute mutation budget room
-// for the actual mutants and the lane's build/report overhead. This is a
-// deliberately measured ceiling, not a round population guess.
+// Bounded 2026-09-29 command-run measurement and its raw output are recorded
+// in tests/fixtures/mutation-test-cap-measurement.json. Three fixed LSP suites
+// 1.51 seconds per suite process; 47 therefore projects to about 71 seconds,
+// leaving about 58 minutes 49 seconds of the 60-minute budget for mutants and
+// build/report overhead. Stryker's dry-run server was EPERM-blocked in this
+// sandbox, so this is explicitly a bounded process-cost proxy, not a claim
+// about mutant execution cost.
 export const DEFAULT_MAX_TESTS = 47;
 
 /**
@@ -317,8 +320,9 @@ export function formatTestCapNotice(selectedCount, totalCount) {
 /**
  * Bound the test population without changing any under-cap selection. Sibling
  * tests are first, then tests with a direct import, then any future incidental
- * relations. Ties use the selector's stable order and then the path, making a
- * capped selection reproducible even when directory enumeration changes.
+ * relations. Ties use the normalized path and then the original index for
+ * exact duplicate paths, making a capped selection reproducible even when
+ * directory enumeration changes.
  *
  * @param {string[]} tests
  * @param {number} maxTests
@@ -337,13 +341,14 @@ export function capRelatedTests(
 		.map((test, index) => ({
 			test,
 			index,
+			pathKey: normalizeEphemeralMapKey(test),
 			priority: priorities.get(test) ?? 2,
 		}))
 		.sort(
 			(a, b) =>
 				a.priority - b.priority ||
-				a.index - b.index ||
-				a.test.localeCompare(b.test),
+				(a.pathKey < b.pathKey ? -1 : a.pathKey > b.pathKey ? 1 : 0) ||
+				a.index - b.index,
 		);
 	const selectedSet = new Set(
 		ranked.slice(0, maxTests).map(({ test }) => test),

@@ -254,7 +254,40 @@ describe("stryker diff selection", () => {
 		expect(formatTestCapNotice(2, tests.length)).toBe(
 			"capped: 2 of 3 related tests selected; dropped: 1",
 		);
-		expect(DEFAULT_MAX_TESTS).toBe(47);
+		const measurement = JSON.parse(
+			readFileSync("tests/fixtures/mutation-test-cap-measurement.json", "utf8"),
+		);
+		expect(measurement.proxy.projectedElapsedSeconds).toBe(
+			measurement.proxy.meanElapsedSeconds * measurement.proxy.projectedSuites,
+		);
+		expect(measurement.proxy.remainingHeadroomSeconds).toBe(
+			measurement.proxy.budgetSeconds -
+				measurement.proxy.projectedElapsedSeconds,
+		);
+		// Recurrence M3648-3: the measured cap must remain checked against the
+		// evidence it cites, or the constant can silently drift from the budget.
+		expect(DEFAULT_MAX_TESTS).toBe(measurement.recommendedMaxTests);
+	});
+
+	it("keeps equal-priority selection stable when the input order is reversed", () => {
+		// Recurrence M3648-1: recursive readdirSync order must not decide which
+		// equal-priority related test consumes the cap.
+		const priorities = new Map([
+			["tests/z.test.ts", 1],
+			["tests/a.test.ts", 1],
+		]);
+		const forward = capRelatedTests(
+			["tests/z.test.ts", "tests/a.test.ts"],
+			1,
+			priorities,
+		);
+		const reversed = capRelatedTests(
+			["tests/a.test.ts", "tests/z.test.ts"],
+			1,
+			priorities,
+		);
+		expect(forward.selected).toEqual(["tests/a.test.ts"]);
+		expect(reversed.selected).toEqual(forward.selected);
 	});
 
 	it("leaves an under-cap related-test selection byte-for-byte unchanged", () => {

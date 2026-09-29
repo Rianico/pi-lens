@@ -42,6 +42,19 @@ function metaTable(meta) {
 	return rendered.join("\n");
 }
 
+function testCapNotice(meta) {
+	const cap = meta.testCap;
+	if (
+		!cap ||
+		typeof cap.selected !== "number" ||
+		typeof cap.total !== "number" ||
+		typeof cap.dropped !== "number" ||
+		cap.dropped <= 0
+	)
+		return null;
+	return `**Bounded evidence:** ${cap.selected} of ${cap.total} related tests selected; ${cap.dropped} dropped. The score is from a truncated test population.`;
+}
+
 /**
  * @param {object} report a parsed reports/mutation/mutation.json
  * @returns {string} markdown
@@ -111,6 +124,8 @@ export function renderMutationMarkdown(report) {
 			"",
 		);
 		if (samplingNote) lines.push(samplingNote, "");
+		const capNote = testCapNotice(meta);
+		if (capNote) lines.push(capNote, "");
 		lines.push(metaTable(meta));
 		return lines.join("\n");
 	}
@@ -170,8 +185,9 @@ export function renderMutationMarkdown(report) {
 		);
 	}
 
+	const capNote = testCapNotice(meta);
 	lines.push(
-		`**Score: ${meta.score ?? "n/a"}%** -- ${counts.Killed ?? 0} killed, ${counts.Survived ?? 0} survived, ${counts.Timeout ?? 0} timeout, ${counts.NoCoverage ?? 0} no coverage (${total} total)`,
+		`**Score: ${meta.score ?? "n/a"}%** -- ${counts.Killed ?? 0} killed, ${counts.Survived ?? 0} survived, ${counts.Timeout ?? 0} timeout, ${counts.NoCoverage ?? 0} no coverage (${total} total)${capNote ? ` — ${capNote.replaceAll("**", "")}` : ""}`,
 		"",
 	);
 

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "measuredAt": "2026-09-29",
+  "environment": "HOME=$PWD/.probe-home/home PI_LENS_HOME=$PWD/.probe-home/lens PILENS_DATA_DIR=$PWD/.probe-home/data XDG_CACHE_HOME=$PWD/.probe-home/cache npm_config_cache=$PWD/.probe-home/npm PI_LENS_TEST_MAX_WORKERS=6",
+  "dryRun": {
+    "command": "node_modules/.bin/stryker run --mutate scripts/lib/stryker-diff.mjs --dryRunOnly .probe-home/m3648-dryrun.config.mjs",
+    "elapsedSeconds": 0.7,
+    "blocked": true,
+    "error": "Error: listen EPERM: operation not permitted 0.0.0.0"
+  },
+  "proxy": {
+    "description": "Fixed-suite process-cost proxy used because the exact Stryker dry-run was environment-blocked.",
+    "suites": [
+      {
+        "file": "tests/clients/lsp-mutation-bridge-equivalence.test.ts",
+        "command": "node_modules/.bin/vitest run tests/clients/lsp-mutation-bridge-equivalence.test.ts --configLoader runner",
+        "testsPassed": 5,
+        "elapsedSeconds": 1.27
+      },
+      {
+        "file": "tests/config/lsp-advertised-capability-senders.test.ts",
+        "command": "node_modules/.bin/vitest run tests/config/lsp-advertised-capability-senders.test.ts --configLoader runner",
+        "testsPassed": 5,
+        "elapsedSeconds": 1.81
+      },
+      {
+        "file": "tests/config/lsp-gate-population.test.ts",
+        "command": "node_modules/.bin/vitest run tests/config/lsp-gate-population.test.ts --configLoader runner",
+        "testsPassed": 12,
+        "elapsedSeconds": 1.45
+      }
+    ],
+    "meanElapsedSeconds": 1.51,
+    "projectedSuites": 47,
+    "projectedElapsedSeconds": 70.97,
+    "budgetSeconds": 3600,
+    "remainingHeadroomSeconds": 3529.03
+  },
+  "recommendedMaxTests": 47
+}

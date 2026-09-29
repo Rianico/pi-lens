@@ -201,6 +201,7 @@ function writeReport(strykerReport, meta) {
 // with a `zeroMutants` report (reproduced live at 69413b03e -- see
 // "no PR-changed lines" in the spawn test below).
 let costEstimate = null;
+let relatedTestCapMeta = null;
 
 function baseMeta(extra) {
 	return {
@@ -220,6 +221,7 @@ function baseMeta(extra) {
 		// zero-mutant paths above) or when Stryker's dry-run output could not
 		// be parsed (`parseDryRunCost` returned null).
 		measuredTotalMutants: costEstimate?.totalMutants ?? null,
+		testCap: relatedTestCapMeta,
 		...extra,
 	};
 }
@@ -268,6 +270,11 @@ const relatedTestCap = capRelatedTests(
 	selection.priorities,
 );
 const tests = relatedTestCap.selected;
+relatedTestCapMeta = {
+	selected: tests.length,
+	total: selection.tests.length,
+	dropped: relatedTestCap.dropped.length,
+};
 if (relatedTestCap.dropped.length > 0) {
 	console.log(formatTestCapNotice(tests.length, selection.tests.length));
 }
