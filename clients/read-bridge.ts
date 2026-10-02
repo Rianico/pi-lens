@@ -29,7 +29,7 @@
  *   bridge?.recordRead({
  *     filePath,          // absolute path
  *     requestedOffset,   // 1-indexed first line (default 1)
- *     requestedLimit,    // line count, or undefined for the whole file
+ *     requestedLimit,    // line count, undefined for the whole file, or 0 for an (empty-file) zero-line read
  *     consumer,          // optional identifier, e.g. "my-extension" (appears in read-guard.log)
  *   });
  *
@@ -58,6 +58,8 @@
  */
 
 /** Stable Symbol key — identical across module reloads in the same process. */
+import * as fs from "node:fs";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 import { registerProcessBridge } from "./process-bridge.js";
 import {
 	captureReadContentBinding,
@@ -75,6 +77,12 @@ export interface ReadBridgeEntry {
 	/**
 	 * Number of lines read. `undefined` means the whole file was requested;
 	 * pi-lens will treat the effective limit as the full file length.
+	 * `0` is a valid observation only when the target file exists and is
+	 * empty: it grants whole-file coverage (normalized to line 1) so a
+	 * subsequent edit is authorized. A zero-line read carries no
+	 * `contentBinding` — no content was delivered, so there is nothing to
+	 * bind — and a zero-line read of a non-empty or unreadable file is
+	 * dropped.
 	 */
 	requestedLimit: number | undefined;
 	/**
@@ -148,13 +156,14 @@ function isValidEntry(entry: unknown): entry is ReadBridgeEntry {
 	)
 		return false;
 
-	// requestedLimit must be undefined or a finite positive integer.
+	// requestedLimit must be undefined or a finite non-negative integer. 0 is
+	// admitted here and narrowed to genuinely empty files by the gate in recordRead.
 	const limit = e["requestedLimit"];
 	if (limit !== undefined) {
 		if (
 			typeof limit !== "number" ||
 			!Number.isFinite(limit) ||
-			limit < 1 ||
+			limit < 0 ||
 			!Number.isInteger(limit)
 		)
 			return false;
@@ -178,24 +187,58 @@ export function registerReadBridge(deps: BridgeDeps): void {
 			if (!isValidEntry(entry)) return;
 
 			if (!deps.isRecordable(entry.filePath)) return;
+			// A zero-line read vouches for nothing unless the file is really
+			// empty: probe emptiness here (and only here - no new stat on the
+			// common path). A non-empty, missing, or unreadable target is
+			// dropped (one bounded degradation record) instead of granting coverage
+			// for content never seen.
+			if (entry.requestedLimit === 0) {
+				let size: number | undefined;
+				try {
+					size = fs.statSync(entry.filePath).size;
+				} catch {
+					size = undefined;
+				}
+				if (size !== 0) {
+					incrementDegradationCount({
+						kind: "read-bridge-zero-line-dropped",
+						subject: entry.filePath,
+						reason:
+							size === undefined
+								? "a zero-line read was dropped: the target file's size could not be read"
+								: "a zero-line read was dropped: the target file is not empty",
+					});
+					return;
+				}
+			}
 
 			const offset = entry.requestedOffset;
 			// When no limit is given treat the whole file as covered — the
 			// guard clips to the actual line count via its own file-length
 			// probe.
 			const limit = entry.requestedLimit ?? Number.MAX_SAFE_INTEGER;
-			const contentBinding = captureReadContentBinding(
-				entry.filePath,
-				offset,
-				limit,
-			);
+			// A zero-line read admitted by the empty-file gate above grants
+			// whole-file coverage, so a later multi-line insert into the empty
+			// file falls inside the recorded range. `requestedLimit` below keeps
+			// the caller's asked-for 0 for provenance (log-only in read-guard.log).
+			// No content is bound: a zero-line read delivered nothing, and a
+			// stale empty-file binding would block every later edit (#3652).
+			const effectiveLimit =
+				entry.requestedLimit === 0 ? Number.MAX_SAFE_INTEGER : limit;
+			// An empty file has only line 1 addressable: normalize coverage to
+			// start there regardless of the caller's offset.
+			const effectiveOffset = entry.requestedLimit === 0 ? 1 : offset;
+			const contentBinding =
+				entry.requestedLimit === 0
+					? undefined
+					: captureReadContentBinding(entry.filePath, offset, effectiveLimit);
 
 			deps.getReadGuard().recordRead({
 				filePath: entry.filePath,
 				requestedOffset: offset,
 				requestedLimit: limit,
-				effectiveOffset: offset,
-				effectiveLimit: limit,
+				effectiveOffset,
+				effectiveLimit,
 				expandedByLsp: false,
 				turnIndex: deps.getTurnIndex(),
 				writeIndex: deps.peekWriteIndex(),

@@ -35,7 +35,7 @@
  * - `beforeEach` resets that mutable state — it never touches the global.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -51,6 +51,10 @@ import {
 	captureReadContentBinding,
 	ReadGuard,
 } from "../../clients/read-guard.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 
 vi.mock("../../clients/read-guard-logger.js", () => ({
 	logReadGuardEvent: vi.fn(),
@@ -120,6 +124,7 @@ describe("read-bridge", () => {
 		_turnIndex = 0;
 		_writeIndex = 0;
 		_isRecordable = () => true;
+		resetDegradationLedger();
 	});
 
 	// ── Bridge metadata ──────────────────────────────────────────────────────
@@ -316,13 +321,6 @@ describe("read-bridge", () => {
 			expect(_guardFn).not.toHaveBeenCalled();
 		});
 
-		it("requestedLimit = 0 (below minimum) is silently dropped", () => {
-			(globalThis as any)[READ_BRIDGE_KEY].recordRead(
-				validEntry({ requestedLimit: 0 }),
-			);
-			expect(_guardFn).not.toHaveBeenCalled();
-		});
-
 		it("requestedLimit = NaN is silently dropped", () => {
 			(globalThis as any)[READ_BRIDGE_KEY].recordRead(
 				validEntry({ requestedLimit: NaN }),
@@ -350,6 +348,71 @@ describe("read-bridge", () => {
 				validEntry({ requestedLimit: 3.7 }),
 			);
 			expect(_guardFn).not.toHaveBeenCalled();
+		});
+	});
+
+	// ── Zero-line reads of empty files ───────────────────────────────────────
+
+	describe("zero-line reads of empty files", () => {
+		it("accepts a zero-line read of a real empty file with whole-file coverage and no content binding", () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-lens-read-bridge-empty-"));
+			try {
+				const filePath = join(dir, "empty.ts");
+				writeFileSync(filePath, "", "utf-8");
+				(globalThis as any)[READ_BRIDGE_KEY].recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: 0,
+				});
+				expect(_guardFn).toHaveBeenCalledOnce();
+				expect(_calls[0].requestedLimit).toBe(0);
+				expect(_calls[0].effectiveOffset).toBe(1);
+				expect(_calls[0].effectiveLimit).toBe(Number.MAX_SAFE_INTEGER);
+				expect(_calls[0].contentBinding).toBeUndefined();
+				expect(
+					getDegradationSummary().filter(
+						(group) => group.kind === "read-bridge-zero-line-dropped",
+					),
+				).toHaveLength(0);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("drops a zero-line read of a non-empty file", () => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-lens-read-bridge-nonempty-"));
+			try {
+				const filePath = join(dir, "nonempty.ts");
+				writeFileSync(filePath, "const value = 1;\n", "utf-8");
+				(globalThis as any)[READ_BRIDGE_KEY].recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: 0,
+				});
+				expect(_guardFn).not.toHaveBeenCalled();
+				const groups = getDegradationSummary().filter(
+					(group) => group.kind === "read-bridge-zero-line-dropped",
+				);
+				expect(groups).toHaveLength(1);
+				expect(groups[0].latestReasons[0].subject).toBe(filePath);
+				expect(groups[0].latestReasons[0].reason).toContain("not empty");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("requestedLimit = 0 on a non-existent file is dropped", () => {
+			(globalThis as any)[READ_BRIDGE_KEY].recordRead(
+				validEntry({ requestedLimit: 0 }),
+			);
+			expect(_guardFn).not.toHaveBeenCalled();
+			const groups = getDegradationSummary().filter(
+				(group) => group.kind === "read-bridge-zero-line-dropped",
+			);
+			expect(groups).toHaveLength(1);
+			expect(groups[0].latestReasons[0].reason).toContain(
+				"size could not be read",
+			);
 		});
 	});
 
@@ -561,6 +624,117 @@ describe("read-bridge", () => {
 			expect(_calls[0].requestedOffset).toBe(1);
 			expect(_calls[1].requestedOffset).toBe(51);
 			expect(_calls[2].requestedLimit).toBe(Number.MAX_SAFE_INTEGER);
+		});
+
+		it("a zero-line read of an empty file authorizes a subsequent multi-line insert", () => {
+			const dir = mkdtempSync(
+				join(tmpdir(), "pi-lens-read-bridge-empty-edit-"),
+			);
+			try {
+				const filePath = join(dir, "empty.ts");
+				writeFileSync(filePath, "", "utf-8");
+				// Backdate mtime so the guard cannot attribute this fixture to the session:
+				// only the bridged read may authorize the later edit.
+				utimesSync(filePath, new Date(0), new Date(0));
+				const guard = new ReadGuard("bridge-empty", { mode: "block" });
+				_guardFn = (record) => guard.recordRead(record);
+				(globalThis as any)[READ_BRIDGE_KEY].recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: 0,
+				});
+				expect(guard.checkEdit(filePath, [1, 10]).action).toBe("allow");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+		it("a landed edit after a zero-line read does not stick a stale binding", () => {
+			const dir = mkdtempSync(
+				join(tmpdir(), "pi-lens-read-bridge-empty-reread-"),
+			);
+			try {
+				const filePath = join(dir, "empty.ts");
+				writeFileSync(filePath, "", "utf-8");
+				// Backdate mtime so the guard cannot attribute this fixture to the session:
+				// only the bridged read may authorize the later edit.
+				utimesSync(filePath, new Date(0), new Date(0));
+				const guard = new ReadGuard("bridge-empty-reread", { mode: "block" });
+				_guardFn = (record) => guard.recordRead(record);
+				(globalThis as any)[READ_BRIDGE_KEY].recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: 0,
+				});
+				expect(guard.checkEdit(filePath, [1, 10]).action).toBe("allow");
+				// Simulate the landed edit: content arrives and the write is recorded.
+				writeFileSync(filePath, "const value = 1;\n", "utf-8");
+				guard.recordWritten(filePath, { writtenContent: "const value = 1;\n" });
+				expect(guard.checkEdit(filePath, [1, 10]).action).toBe("allow");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("a zero-line read of an empty file does not authorize edits after content appears", () => {
+			const dir = mkdtempSync(
+				join(tmpdir(), "pi-lens-read-bridge-empty-stale-"),
+			);
+			try {
+				const filePath = join(dir, "stale.ts");
+				writeFileSync(filePath, "", "utf-8");
+				// Backdate mtime so the guard cannot attribute this fixture to the session:
+				// only the bridged read may authorize the later edit.
+				utimesSync(filePath, new Date(0), new Date(0));
+				const guard = new ReadGuard("bridge-empty-stale", { mode: "block" });
+				_guardFn = (record) => guard.recordRead(record);
+				(globalThis as any)[READ_BRIDGE_KEY].recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: 0,
+				});
+				// External change the bridge never saw: the FileTime cause must fire.
+				writeFileSync(filePath, "const value = 1;\n", "utf-8");
+				const verdict = guard.checkEdit(filePath, [1, 10]);
+				expect(verdict.action).toBe("block");
+				expect(verdict.reason).toContain("modified on disk");
+				// A native re-read observes the new content and authorizes the edit.
+				guard.recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: Number.MAX_SAFE_INTEGER,
+					effectiveOffset: 1,
+					effectiveLimit: Number.MAX_SAFE_INTEGER,
+					expandedByLsp: false,
+					turnIndex: 0,
+					writeIndex: 0,
+					timestamp: Date.now(),
+				});
+				expect(guard.checkEdit(filePath, [1, 10]).action).toBe("allow");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+		it("a zero-line read normalizes coverage to line 1 regardless of offset", () => {
+			const dir = mkdtempSync(
+				join(tmpdir(), "pi-lens-read-bridge-empty-offset-"),
+			);
+			try {
+				const filePath = join(dir, "empty.ts");
+				writeFileSync(filePath, "", "utf-8");
+				// Backdate mtime so the guard cannot attribute this fixture to the session:
+				// only the bridged read may authorize the later edit.
+				utimesSync(filePath, new Date(0), new Date(0));
+				const guard = new ReadGuard("bridge-empty-offset", { mode: "block" });
+				_guardFn = (record) => guard.recordRead(record);
+				(globalThis as any)[READ_BRIDGE_KEY].recordRead({
+					filePath,
+					requestedOffset: 5,
+					requestedLimit: 0,
+				});
+				expect(guard.checkEdit(filePath, [1, 10]).action).toBe("allow");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
 		});
 	});
 });

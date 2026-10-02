@@ -948,6 +948,13 @@ export type DegradationKind =
 	 */
 	| "query-predicates-invalid"
 	/**
+	 * #3652: a co-process extension reported a zero-line read
+	 * (`requestedLimit: 0`) of a target that is not empty, or whose size could
+	 * not be read, so the bridge dropped the observation. Subject is the file
+	 * path. Counted. The accepted empty-file case emits nothing.
+	 */
+	| "read-bridge-zero-line-dropped"
+	/**
 	 * #2524: the resource sampler's OWN process-table scanner (heartbeat CPU/RSS
 	 * sampling, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS` 2000ms — a much tighter and
 	 * far more frequent budget than the orphan backstop's one-per-cooldown
