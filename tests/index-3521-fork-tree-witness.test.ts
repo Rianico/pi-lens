@@ -56,6 +56,12 @@ import {
 import { takeHandoff } from "../clients/session-scope.js";
 import { exportWidgetState } from "../clients/widget-state.js";
 import { queueAgentAdvisory } from "../clients/agent-nudge.js";
+import { AstGrepClient } from "../clients/ast-grep-client.js";
+import {
+	deferRunnerFindings,
+	pendingRunnerFindingsSize,
+	resetPendingRunnerFindings,
+} from "../clients/dispatch/pending-runner-findings.js";
 import { RuntimeCoordinator } from "../clients/runtime-coordinator.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
 import {
@@ -169,6 +175,7 @@ async function startRuntime(
 	alongside: Array<(pi: ExtensionAPI) => void> = [],
 	/** Factories whose handlers pi runs before pi-lens's (#3881). */
 	ahead: Array<(pi: ExtensionAPI) => void> = [],
+	runtimeCwd = cwd,
 ): Promise<AgentSessionRuntime> {
 	const runtime = await createAgentSessionRuntime(
 		async ({ cwd: runtimeCwd, sessionManager: sm, sessionStartEvent }) => {
@@ -190,7 +197,7 @@ async function startRuntime(
 				diagnostics: services.diagnostics,
 			};
 		},
-		{ cwd, agentDir, sessionManager },
+		{ cwd: runtimeCwd, agentDir, sessionManager },
 	);
 	// Bound once with an error listener, as pi's modes bind: `/reload` emits
 	// its session_start only to a session with host bindings, and a handler
@@ -1683,28 +1690,27 @@ describe("#3589 a fork starts with the parent's widget files", () => {
  * `/reload`, such as the fix-run lost-edit notice, is dropped as its scope's
  * and never reaches the model.
  */
-describe("#3612 a queued agent advisory follows /reload", () => {
-	/** Observe (not replace) the coordinators index.ts resets. */
-	function coordinators(): RuntimeCoordinator[] {
-		const seen: RuntimeCoordinator[] = [];
-		const reset = RuntimeCoordinator.prototype.resetForSession;
-		vi.spyOn(
-			RuntimeCoordinator.prototype,
-			"resetForSession",
-		).mockImplementation(function (this: RuntimeCoordinator, ...args) {
+/** Observe (not replace) the coordinators index.ts resets. */
+function coordinators(): RuntimeCoordinator[] {
+	const seen: RuntimeCoordinator[] = [];
+	const reset = RuntimeCoordinator.prototype.resetForSession;
+	vi.spyOn(RuntimeCoordinator.prototype, "resetForSession").mockImplementation(
+		function (this: RuntimeCoordinator, ...args) {
 			seen.push(this);
 			return reset.apply(this, args);
-		});
-		return seen;
-	}
+		},
+	);
+	return seen;
+}
 
-	async function contextText(runtime: AgentSessionRuntime): Promise<string> {
-		const messages = await runtime.session.extensionRunner.emitContext([
-			{ role: "user", content: "keep working", timestamp: Date.now() },
-		] as never);
-		return JSON.stringify(messages);
-	}
+async function contextText(runtime: AgentSessionRuntime): Promise<string> {
+	const messages = await runtime.session.extensionRunner.emitContext([
+		{ role: "user", content: "keep working", timestamp: Date.now() },
+	] as never);
+	return JSON.stringify(messages);
+}
 
+describe("#3612 a queued agent advisory follows /reload", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -1999,6 +2005,189 @@ describe("#3612 a queued agent advisory follows /reload", () => {
 				expect(activeSituational(primary)).toEqual(["ast_grep_search"]);
 			});
 		}
+	});
+});
+
+/**
+ * #3758: the pending runner-findings store is process-global, and every
+ * activation's turn_end drains it. A concurrent secondary (an in-process
+ * subagent) keeps ending turns while the primary goes through `/new`, so its
+ * turn_end in the gap between the primary's shutdown and the next start
+ * delivered the ended session's late runner result into the subagent's own
+ * conversation. The recurrence: a drain that delivers an entry whose scope
+ * has retired.
+ */
+describe("#3758 pending runner findings and session scope", () => {
+	afterEach(() => {
+		resetPendingRunnerFindings();
+		vi.restoreAllMocks();
+	});
+
+	/** A collect-later runner result, deferred the way the dispatcher does. */
+	function deferFailedRunner(
+		session: ReturnType<RuntimeCoordinator["captureSessionGeneration"]>,
+		runnerId: string,
+	): void {
+		deferRunnerFindings({
+			filePath: path.join(cwd, "a.ts"),
+			cwd,
+			projectRoot: cwd,
+			runnerId,
+			markedAtMs: Date.now(),
+			promise: Promise.resolve({
+				status: "failed",
+				diagnostics: [],
+				semantic: "warning",
+				failureKind: "exception",
+				failureMessage: `${runnerId} crashed`,
+			}),
+			session,
+		});
+	}
+
+	/** pi's turn_end, without the sidecar wait (in-memory sessions). */
+	async function endTurn(runtime: AgentSessionRuntime): Promise<void> {
+		await runtime.session.extensionRunner.emit({
+			type: "turn_end",
+			turnIndex: 0,
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				api: "x",
+				provider: "x",
+				model: "x",
+				usage,
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+			toolResults: [],
+		} as never);
+	}
+
+	/** A concurrent secondary in its own project, so its record is its own. */
+	async function startSubagent(): Promise<AgentSessionRuntime> {
+		const subCwd = path.join(root, "sub");
+		fs.mkdirSync(path.join(subCwd, ".git"), { recursive: true });
+		return startRuntime(SessionManager.inMemory(subCwd), [], [], subCwd);
+	}
+
+	it("drops, and counts, a result whose session ended before a secondary's turn end drains it", async () => {
+		const seen = coordinators();
+		let subagent: AgentSessionRuntime | undefined;
+		let subagentSaw: string | undefined;
+		let dropped: string[] | undefined;
+		// Runs after pi-lens's own session_shutdown handler has retired the
+		// primary's scope, and before pi builds the next session (whose start
+		// resets the in-memory ledger, so the row is read here).
+		const inTheGap = (pi: ExtensionAPI) => {
+			pi.on("session_shutdown", async () => {
+				if (!subagent) return;
+				await endTurn(subagent);
+				subagentSaw = await contextText(subagent);
+				dropped = getDegradationSummary()
+					.find((group) => group.kind === "generation-guard-stale-write")
+					?.latestReasons.map((row) => row.subject)
+					.filter((subject) => subject.includes("probe-3758"));
+			});
+		};
+		const primary = await startRuntime(SessionManager.inMemory(cwd), [
+			inTheGap,
+		]);
+		subagent = await startSubagent();
+		// A session that has ended a turn holds the analyzer clients, which
+		// stay resident across the shutdown (#2467): the gap's turn_end runs.
+		await endTurn(primary);
+		deferFailedRunner(seen[0]!.captureSessionGeneration(), "probe-3758");
+
+		await primary.newSession();
+
+		expect({
+			subagentSees: subagentSaw?.includes("probe-3758 crashed"),
+			pending: pendingRunnerFindingsSize(),
+			dropped,
+		}).toEqual({
+			subagentSees: false,
+			pending: 0,
+			dropped: [
+				`runtime-session:turn-end:probe-3758:${path.join(cwd, "a.ts")}`,
+			],
+		});
+	});
+
+	it("lets a secondary that ends its turn first take a live primary's result (accepted residual until S4, #3758)", async () => {
+		// Pinned so S4 (#3613) flips it deliberately. A secondary's own tool
+		// results capture the coordinator's scope, which is the primary's
+		// (S1, #3611), so the store cannot tell the primary's result from the
+		// secondary's own. Draining by the activation's scope would move every
+		// secondary result to the primary instead.
+		const seen = coordinators();
+		const primary = await startRuntime(SessionManager.inMemory(cwd));
+		const subagent = await startSubagent();
+		deferFailedRunner(seen[0]!.captureSessionGeneration(), "probe-3758-live");
+
+		await endTurn(subagent);
+		const subagentSees = (await contextText(subagent)).includes(
+			"probe-3758-live crashed",
+		);
+		await endTurn(primary);
+
+		expect({
+			subagentSees,
+			primarySees: (await contextText(primary)).includes(
+				"probe-3758-live crashed",
+			),
+		}).toEqual({ subagentSees: true, primarySees: false });
+	});
+});
+
+/**
+ * #3763 item 4, the host wiring: index.ts hands `ast_grep_replace` the
+ * capture of its coordinator's session. The recurrence: the tool built with
+ * no capture, so every in-pi rewrite reaches the bridge without a lineage and
+ * stays fail-open while every unit test of the tool stays green.
+ */
+describe("#3763 ast_grep_replace is wired to the live session", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("passes the session scope the call ran in to the apply", async () => {
+		const seen = coordinators();
+		const runtime = await startRuntime(SessionManager.inMemory(cwd));
+		vi.spyOn(AstGrepClient.prototype, "ensureAvailable").mockResolvedValue(
+			true,
+		);
+		const replace = vi
+			.spyOn(AstGrepClient.prototype, "replace")
+			.mockResolvedValue({
+				matches: [],
+				totalMatches: 0,
+				truncated: false,
+				applied: true,
+			});
+		const tool = runtime.session.getToolDefinition("ast_grep_replace");
+		if (!tool) throw new Error("ast_grep_replace is not registered");
+
+		await tool.execute(
+			"call-3763-wired",
+			{
+				pattern: "var $X",
+				rewrite: "let $X",
+				lang: "typescript",
+				apply: true,
+			} as never,
+			undefined,
+			undefined,
+			runtime.session.extensionRunner.createToolContext(
+				"call-3763-wired",
+				undefined,
+			),
+		);
+
+		const lineage = (
+			replace.mock.calls[0]?.[5] as { lineage?: { scopeId: number } }
+		)?.lineage;
+		expect(lineage?.scopeId).toBe(seen[0]!.captureSessionGeneration().scopeId);
 	});
 });
 

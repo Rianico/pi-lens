@@ -17,7 +17,7 @@
  * containing spaces, word-split by `read -ra`) sat red. Every check-run
  * GitHub reports on the head is now a row, and every row GATES unless it is
  * on the advisory allowlist (`scripts/lib/ci-checks.mjs`'s
- * `isAdvisoryCheck` -- the SAME list #2185's real merge-train gate already
+ * `isAdvisoryCheck` -- the SAME list the merge-train warden (#2185) already
  * uses). `run()` also attempts a LIVE read of `master`'s branch-protection
  * required-status-check names via `gh api`, and treats those names as
  * gating unconditionally (never excusable by the static advisory allowlist)
@@ -235,8 +235,15 @@ const VERDICT_KIND_BY_EXIT = new Map([
 	[EXIT_TRANSPORT, "transport"],
 ]);
 
-/** The kind a plain verdict exit code prints; modes override with their own. */
-function verdictExitKind(exitCode) {
+/** The kind a plain verdict exit code prints; modes override with their own.
+ * The exit-code table is deliberately coarse: `cancelled`, `infra-rerun`,
+ * `absent-rearm` and `fork-approval` all print `(pending)`, which existing
+ * shell and warden readers match on. The one verdict kind the CLI documents
+ * as readable on this surface is `in-queue` (#3754): a queued PR is exit 3,
+ * and the plain line must not read as an ordinary `pending` (#3883 F4). */
+function verdictExitKind(exitCode, verdictKind) {
+	if (exitCode === EXIT_PENDING && verdictKind === "in-queue")
+		return "in-queue";
 	return VERDICT_KIND_BY_EXIT.get(exitCode) ?? "unknown";
 }
 
@@ -283,8 +290,47 @@ export function crashExit() {
  * a minute or two; ten is well past that without hiding a stuck retarget. */
 export const ABSENT_REQUIRED_REARM_MINUTES = 10;
 
+// The ci.yml workflow's own name, the one `fetchRerunState` and the absent-run
+// lookup both key on (#3861).
+const CI_WORKFLOW_NAME = "CI";
+
 export function formatAbsentRequiredReason(sha, minutes = 0) {
 	return `required checks absent for ${Math.max(0, Math.floor(Number(minutes) || 0))} min on ${sha} (auto-merge on) — push or merge master to re-arm`;
+}
+
+/**
+ * #3861: the head's `ci.yml` run is already registered, so "push or merge
+ * master to re-arm" is wrong advice -- the run exists and the queue is just
+ * slow. Report the run identity and its age instead; only a POSITIVE no-run
+ * answer authorizes re-arm (`formatAbsentRequiredReason`).
+ *
+ * #3861 F3: a TERMINAL run (`completed` / `cancelled`) cannot produce the
+ * missing check-runs, so "no re-arm is needed" is false comfort. Name the
+ * terminal state and the manual inspect/rerun, and say plainly that nothing
+ * re-arms automatically (#3795 item 3 stays held).
+ */
+export function formatAbsentRunReason({ state, id, ageMinutes, sha }) {
+	const label =
+		state === "in_progress" ? "in progress" : String(state ?? "registered");
+	const idText = id == null ? "an unnamed run" : `run ${id}`;
+	const ageText = Number.isFinite(ageMinutes)
+		? ` (${Math.max(0, Math.floor(ageMinutes))} min old)`
+		: "";
+	if (state === "completed" || state === "cancelled") {
+		const rerunText =
+			id == null ? "" : ` or re-run it manually (gh run rerun ${id})`;
+		return `ci.yml ${idText} is ${label}${ageText} for ${sha}: the run is terminal and cannot produce the missing check-runs -- inspect it${rerunText}; the verdict never re-arms automatically`;
+	}
+	return `ci.yml ${idText} is ${label}${ageText} for ${sha}: the run is registered, so no re-arm is needed`;
+}
+
+/**
+ * #3861: the run lookup itself failed. An unreadable lookup is not evidence
+ * of a missing run, so it must never authorize the re-arm advice; the
+ * bounded line names the gap and stops there.
+ */
+export function formatAbsentRunUnknownReason(sha, minutes = 0) {
+	return `required checks absent for ${Math.max(0, Math.floor(Number(minutes) || 0))} min on ${sha} and the ci.yml run lookup was unreadable: no re-arm advice without a run answer`;
 }
 
 /** Never approves: GitHub shows a fork PR's first runs as `action_required`
@@ -482,6 +528,7 @@ export function computeVerdict(
 	rerunState = null,
 	absentContext = null,
 	noiseRowIds = null,
+	queueContext = null,
 ) {
 	const checkRuns = Array.isArray(checkRunsPayload?.check_runs)
 		? checkRunsPayload.check_runs
@@ -578,6 +625,7 @@ export function computeVerdict(
 
 	let exitCode;
 	let reason;
+	let queueFailedRows = null;
 	// #3700: the machine-readable state `--watch-open` and `--all` key on, so
 	// neither has to text-match `reason`.
 	let kind;
@@ -622,20 +670,59 @@ export function computeVerdict(
 			const approvalRuns = Array.isArray(context?.actionRequiredRuns)
 				? context.actionRequiredRuns
 				: [];
+			// #3861: a re-arm is authorized ONLY by a POSITIVE "no ci.yml run
+			// for the head" answer. A registered run, an unreadable lookup, and a
+			// missing head-run answer (the REST transport has no run context)
+			// are all NOT evidence of a missing run, so none of them prints the
+			// re-arm advice: neither the absent-rearm line nor the fallback's
+			// conditional retarget clause.
+			const headRun = context?.headRun ?? null;
+			const rearmAuthorized = headRun?.state === "none";
 			if (approvalRuns.length > 0) {
 				kind = "fork-approval";
 				reason = formatForkApprovalReason(context.repository, approvalRuns);
 			} else if (
+				rearmAuthorized &&
 				context?.autoMerge === true &&
 				context.absentMinutes >= ABSENT_REQUIRED_REARM_MINUTES
 			) {
 				kind = "absent-rearm";
 				reason = formatAbsentRequiredReason(context.sha, context.absentMinutes);
-			} else {
+			} else if (
+				headRun &&
+				context?.autoMerge === true &&
+				context.absentMinutes >= ABSENT_REQUIRED_REARM_MINUTES
+			) {
+				// A run is registered, or the lookup failed: name that fact
+				// instead of the re-arm advice #3861 removed.
 				reason =
-					mergeable == null
-						? "one or more required checks are absent and there is no PR context (bare-SHA target) to confirm they are not merge-conflicted; treating as pending, not DIRTY -- pass a PR number, or wait for CI to register"
-						: `one or more required checks are absent but the PR is not merge-conflicted (mergeable=${mergeable}); CI likely hasn't registered yet -- treating as pending, not DIRTY -- if the base was retargeted after this PR opened, push a commit or close/reopen to re-arm ci.yml`;
+					headRun.state === "unknown"
+						? formatAbsentRunUnknownReason(context.sha, context.absentMinutes)
+						: formatAbsentRunReason({
+								state: headRun.state,
+								id: headRun.id,
+								ageMinutes: headRun.ageMinutes,
+								sha: context.sha,
+							});
+			} else if (mergeable == null) {
+				reason =
+					"one or more required checks are absent and there is no PR context (bare-SHA target) to confirm they are not merge-conflicted; treating as pending, not DIRTY -- pass a PR number, or wait for CI to register";
+			} else if (rearmAuthorized) {
+				reason = `one or more required checks are absent but the PR is not merge-conflicted (mergeable=${mergeable}); CI likely hasn't registered yet -- treating as pending, not DIRTY -- if the base was retargeted after this PR opened, push a commit or close/reopen to re-arm ci.yml`;
+			} else if (headRun && headRun.state !== "unknown") {
+				// A registered run below the re-arm threshold, or with auto-merge
+				// off: name it instead of the retarget clause (the same fact the
+				// over-threshold branch prints).
+				reason = formatAbsentRunReason({
+					state: headRun.state,
+					id: headRun.id,
+					ageMinutes: headRun.ageMinutes,
+					sha: context.sha,
+				});
+			} else {
+				// An unreadable lookup, a missing head-run answer, or no context:
+				// the quiet pending text, with no re-arm advice.
+				reason = `one or more required checks are absent but the PR is not merge-conflicted (mergeable=${mergeable}); CI likely hasn't registered yet -- treating as pending, not DIRTY`;
 			}
 		} else {
 			// Only non-completed rows reach this branch; latest cancellations have
@@ -652,12 +739,29 @@ export function computeVerdict(
 			reason = `gating check(s) ${parts.join("; ")}`;
 		}
 	} else {
-		exitCode = EXIT_SUCCESS;
-		kind = "success";
-		reason =
-			noiseRows.length > 0
-				? `post-merge noise, not a failure: ${noiseRows.map((row) => row.name).join(", ")} could not fetch refs/pull/N/merge after the PR merged; every other gating check concluded success`
-				: "every gating check concluded success";
+		// #3754: the head's own gating checks are green, which only makes the PR
+		// ELIGIBLE for the merge queue. Read lazily (only here, so a red or
+		// pending head costs no extra call): a PR in the queue is waiting on the
+		// `merge_group` run, and a PR whose queue run failed was ejected.
+		const queue =
+			typeof queueContext === "function" ? queueContext() : queueContext;
+		if (queue?.entry) {
+			exitCode = EXIT_PENDING;
+			kind = "in-queue";
+			reason = formatInQueueReason(queue.entry);
+		} else if (queue?.failedRows?.length > 0) {
+			exitCode = EXIT_FAILURE;
+			kind = "failed";
+			queueFailedRows = queue.failedRows;
+			reason = formatQueueFailedReason(queue);
+		} else {
+			exitCode = EXIT_SUCCESS;
+			kind = "success";
+			reason =
+				noiseRows.length > 0
+					? `post-merge noise, not a failure: ${noiseRows.map((row) => row.name).join(", ")} could not fetch refs/pull/N/merge after the PR merged; every other gating check concluded success`
+					: "every gating check concluded success";
+		}
 	}
 	// #3801: the heavy advisory jobs do not exist as check-runs until the
 	// required checks passed (ci.yml's `heavy-gate`). Each absent one is listed
@@ -683,7 +787,7 @@ export function computeVerdict(
 		reason,
 		mergeState,
 		kind,
-		failingRows: failingGatingRows,
+		failingRows: queueFailedRows ?? failingGatingRows,
 		cancelledRows: cancelledLatestRows,
 	};
 }
@@ -836,6 +940,7 @@ export async function pollVerdict({
 	classification = null,
 	rerunState = null,
 	absentContext = null,
+	queueContext = null,
 	sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 	now = () => Date.now(),
 	onRetry = () => {},
@@ -860,6 +965,8 @@ export async function pollVerdict({
 			classification,
 			currentRerunState,
 			absentContext,
+			null,
+			queueContext,
 		);
 		polls += 1;
 		if (verdict.exitCode !== EXIT_PENDING) break;
@@ -930,8 +1037,14 @@ export function resolveHeadSha(
 			["pr", "view", String(target), "--json", "headRefOid,mergeable"],
 			{ timeoutMs },
 		);
-		const parsed = JSON.parse(raw);
-		return { sha: parsed.headRefOid, mergeable: parsed.mergeable ?? null };
+		try {
+			const parsed = JSON.parse(raw);
+			return { sha: parsed.headRefOid, mergeable: parsed.mergeable ?? null };
+		} catch (error) {
+			throw new Error(
+				`could not parse the PR view JSON for ${target}: ${error instanceof Error ? error.message : error}`,
+			);
+		}
 	}
 	return { sha: String(target).trim(), mergeable: null };
 }
@@ -983,15 +1096,21 @@ export function fetchCheckRunsPayload(
 	let totalCount;
 	let page = 1;
 	for (;;) {
-		const payload = JSON.parse(
-			ghExec(
-				[
-					"api",
-					`repos/${repository}/commits/${sha}/check-runs?per_page=100&page=${page}`,
-				],
-				{ timeoutMs },
-			),
+		const raw = ghExec(
+			[
+				"api",
+				`repos/${repository}/commits/${sha}/check-runs?per_page=100&page=${page}`,
+			],
+			{ timeoutMs },
 		);
+		let payload;
+		try {
+			payload = JSON.parse(raw);
+		} catch (error) {
+			throw new Error(
+				`could not parse the check-runs JSON for ${sha} (page ${page}): ${error instanceof Error ? error.message : error}`,
+			);
+		}
 		if (typeof payload?.total_count === "number")
 			totalCount = payload.total_count;
 		if (Array.isArray(payload?.check_runs))
@@ -1007,10 +1126,49 @@ export function fetchCheckRunsPayload(
 	return { total_count: totalCount ?? checkRuns.length, check_runs: checkRuns };
 }
 
-/** Fork-approval runs for `sha`. GitHub reports one as `status: "completed"`
- * with `conclusion: "action_required"` -- never `status: "action_required"` --
- * and its head has no CI check-run rows at all (#3694). */
-export function fetchActionRequiredRuns(
+/** A run state the absent-required message can name (#3861). `unknown` is a
+ * failed or unrecognized lookup: it never authorizes the re-arm advice. */
+function summarizeHeadRun(runs) {
+	const ciRuns = runs.filter(
+		(run) => run?.name === CI_WORKFLOW_NAME && run?.event !== "merge_group",
+	);
+	if (ciRuns.length === 0)
+		return { state: "none", id: null, startedAtMs: null };
+	const sorted = [...ciRuns].sort(
+		(a, b) =>
+			Number(a.run_attempt ?? 1) - Number(b.run_attempt ?? 1) ||
+			Date.parse(a.created_at ?? "") - Date.parse(b.created_at ?? ""),
+	);
+	const latest = sorted.at(-1);
+	const startedAtMs = Date.parse(
+		latest?.run_started_at ?? latest?.created_at ?? "",
+	);
+	return {
+		state: runStateFromStatus(String(latest?.status ?? ""), latest?.conclusion),
+		id: latest?.id ?? null,
+		startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : null,
+	};
+}
+
+function runStateFromStatus(status, conclusion) {
+	if (status === "in_progress") return "in_progress";
+	if (status === "queued" || status === "waiting" || status === "requested")
+		return "queued";
+	if (status === "completed")
+		return conclusion === "cancelled" ? "cancelled" : "completed";
+	return "unknown";
+}
+
+/**
+ * The head's workflow runs, read once (#3861): the fork-approval runs AND the
+ * `ci.yml` run state the absent-required message needs to decide whether a
+ * re-arm is even meaningful. The single `actions/runs?head_sha=` read is
+ * already the fork-approval seam (#3694); this reuses it rather than adding a
+ * second call. A failed read fails open to an empty approval list and an
+ * `unknown` run state, so an unreadable lookup never authorizes the re-arm
+ * advice; `failOpen: false` rethrows for `--approve-fork`.
+ */
+export function fetchHeadRuns(
 	repository,
 	sha,
 	ghExec = gh,
@@ -1027,16 +1185,46 @@ export function fetchActionRequiredRuns(
 				{ timeoutMs },
 			),
 		);
-		return (Array.isArray(payload?.workflow_runs) ? payload.workflow_runs : [])
-			.filter(
-				(run) => run?.head_sha === sha && run?.conclusion === "action_required",
-			)
-			.map((run) => ({ id: run.id }));
+		if (!Array.isArray(payload?.workflow_runs)) {
+			// #3861 F1: a 200 that violates the documented shape (no
+			// `workflow_runs` array) is a contract violation, not the empty
+			// success answer; the catch below fails open to `unknown`, which
+			// never authorizes a re-arm. A genuine "no run for the head" answer
+			// carries `workflow_runs: []` (verified live), which the array path
+			// below still resolves to `none`.
+			throw new Error(
+				"malformed actions/runs response: workflow_runs is not an array",
+			);
+		}
+		const runs = payload.workflow_runs.filter((run) => run?.head_sha === sha);
+		return {
+			actionRequiredRuns: runs
+				.filter((run) => run?.conclusion === "action_required")
+				.map((run) => ({ id: run.id })),
+			headRun: summarizeHeadRun(runs),
+		};
 	} catch (error) {
-		// The verdict text fails open to "none"; an approval must not.
+		// The verdict text fails open to "unknown"; an approval must not.
 		if (!failOpen) throw error;
-		return [];
+		return {
+			actionRequiredRuns: [],
+			headRun: { state: "unknown", id: null, startedAtMs: null },
+		};
 	}
+}
+
+/** Fork-approval runs for `sha`. GitHub reports one as `status: "completed"`
+ * with `conclusion: "action_required"` -- never `status: "action_required"` --
+ * and its head has no CI check-run rows at all (#3694). */
+export function fetchActionRequiredRuns(
+	repository,
+	sha,
+	ghExec = gh,
+	timeoutMs = DEFAULT_GH_TIMEOUT_MS,
+	failOpen = true,
+) {
+	return fetchHeadRuns(repository, sha, ghExec, timeoutMs, failOpen)
+		.actionRequiredRuns;
 }
 
 /**
@@ -1122,7 +1310,7 @@ export function fetchRerunState(
 		const attempts = (
 			Array.isArray(payload?.workflow_runs) ? payload.workflow_runs : []
 		)
-			.filter((run) => run?.name === "CI" && run?.head_sha === sha)
+			.filter((run) => run?.name === CI_WORKFLOW_NAME && run?.head_sha === sha)
 			.filter((run) => Number(run?.run_attempt) > 0)
 			.sort((a, b) => Number(a.run_attempt) - Number(b.run_attempt));
 		const original = attempts.find((run) => Number(run.run_attempt) === 1);
@@ -1139,6 +1327,169 @@ export function fetchRerunState(
 		};
 	} catch {
 		return null;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3754: the GitHub merge queue. Once enabled, a PR whose head checks are green
+// is ENQUEUED (`gh pr merge --auto`), and the queue tests it merged onto the
+// latest master in a `gh-readonly-queue/<base>/pr-<N>-<sha>` ref via a
+// `merge_group` workflow run. Three states the head's check-runs cannot show:
+// in the queue (waiting, not absent and not done), ejected after a failed
+// queue run (a FAIL event), and neither (plain eligible/success).
+// ---------------------------------------------------------------------------
+
+const MERGE_QUEUE_STATE_QUERY =
+	"query($owner:String!,$name:String!,$branch:String!,$number:Int!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){id} pullRequest(number:$number){isInMergeQueue mergeQueueEntry{state position}}}}";
+
+function formatInQueueReason(entry) {
+	const position = Number.isFinite(entry?.position)
+		? `, position ${entry.position}`
+		: "";
+	// F1: the entry is read defensively now that `isInMergeQueue` (not the
+	// `mergeQueueEntry` object) decides queue membership, so a non-string state
+	// renders as the default rather than as its own stringified junk.
+	const state =
+		typeof entry?.state === "string" ? entry.state.toLowerCase() : "queued";
+	return `in the merge queue (${state}${position}): every gating check on the head passed and the merge_group run decides the merge -- waiting is correct; it is neither absent nor done`;
+}
+
+function formatQueueFailedReason(queue) {
+	return `merge queue run failed and ejected the PR: ${queue.failedRuns
+		.map((failed) => failed.url)
+		.join(
+			", ",
+		)} -- failing: ${queue.failedRows.map((row) => row.name).join(", ")}`;
+}
+
+function graphqlFieldArgs(query, fields) {
+	return [
+		"api",
+		"graphql",
+		"-f",
+		`query=${query}`,
+		...Object.entries(fields).flatMap(([name, value]) => [
+			typeof value === "number" ? "-F" : "-f",
+			`${name}=${value}`,
+		]),
+	];
+}
+
+/**
+ * One GraphQL read answering both questions: does `PROTECTED_BRANCH` have a
+ * merge queue, and is this PR in it. `null` when unreadable or not a PR
+ * target: every caller then behaves as before the queue existed, and a
+ * repository without a queue costs exactly this one read (#3694's "a healthy
+ * head costs nothing extra" guard, which the queue must not break).
+ */
+export function readMergeQueueState(
+	target,
+	repository,
+	ghExec = gh,
+	timeoutMs = DEFAULT_GH_TIMEOUT_MS,
+) {
+	if (!isPrNumber(target)) return null;
+	const [owner, name] = String(repository).split("/");
+	try {
+		const found = JSON.parse(
+			ghExec(
+				graphqlFieldArgs(MERGE_QUEUE_STATE_QUERY, {
+					owner,
+					name,
+					branch: PROTECTED_BRANCH,
+					number: Number(target),
+				}),
+				{ timeoutMs },
+			),
+		)?.data?.repository;
+		if (!found) return null;
+		const pullRequest = found.pullRequest;
+		// #3754 F1: `isInMergeQueue` is the authoritative state; the entry is a
+		// detail read defensively. Gating the entry on `mergeQueueEntry` (a
+		// nullable object the schema may omit) turned a queued PR into a green
+		// success when the flag was true and the object absent.
+		return {
+			enabled: Boolean(found.mergeQueue),
+			entry: pullRequest?.isInMergeQueue
+				? {
+						state: pullRequest.mergeQueueEntry?.state ?? null,
+						position: pullRequest.mergeQueueEntry?.position ?? null,
+					}
+				: null,
+		};
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The failed `merge_group` runs of this PR's LATEST queue attempt that began
+ * after the head was pushed, as gating rows (one per failed job, with its job
+ * URL, so `readFailureDetails` names the failing tests exactly as for a PR
+ * run). A queue attempt's branch is `gh-readonly-queue/<base>/pr-<N>-<sha>`;
+ * a run that began before the push is an earlier head's ejection. Fails open
+ * to "none".
+ */
+export function fetchFailedQueueRuns(
+	target,
+	repository,
+	pushedMs,
+	ghExec = gh,
+	timeoutMs = DEFAULT_GH_TIMEOUT_MS,
+) {
+	const none = { failedRuns: [], failedRows: [] };
+	if (!isPrNumber(target) || !Number.isFinite(pushedMs)) return none;
+	const prefix = `gh-readonly-queue/${PROTECTED_BRANCH}/pr-${Number(target)}-`;
+	try {
+		const runs = (
+			JSON.parse(
+				ghExec(
+					[
+						"api",
+						`repos/${repository}/actions/runs?event=merge_group&status=completed&per_page=50`,
+					],
+					{ timeoutMs },
+				),
+			).workflow_runs ?? []
+		)
+			.filter(
+				(candidate) =>
+					String(candidate?.head_branch ?? "").startsWith(prefix) &&
+					candidate.conclusion === "failure" &&
+					Date.parse(candidate.created_at) >= pushedMs,
+			)
+			.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+		const latestBranch = runs[0]?.head_branch;
+		const failedRuns = runs
+			.filter((candidate) => candidate.head_branch === latestBranch)
+			.map((candidate) => ({ id: candidate.id, url: candidate.html_url }));
+		const failedRows = failedRuns.flatMap((failed) =>
+			(
+				JSON.parse(
+					ghExec(
+						[
+							"api",
+							`repos/${repository}/actions/runs/${failed.id}/jobs?per_page=100`,
+						],
+						{ timeoutMs },
+					),
+				).jobs ?? []
+			)
+				.filter((job) => job?.conclusion === "failure")
+				.map((job) => ({
+					name: job.name,
+					present: true,
+					id: job.id,
+					status: "completed",
+					conclusion: "failure",
+					url: job.html_url,
+					detailsUrl: job.html_url,
+					gating: true,
+				})),
+		);
+		return failedRows.length > 0 ? { failedRuns, failedRows } : none;
+	} catch {
+		return none;
 	}
 }
 
@@ -1402,8 +1753,14 @@ export function readFailureDetails({
 			? readMasterSha(repository, ghExec, timeoutMs)
 			: null;
 		if (mergeBase && masterSha && masterSha !== mergeBase) {
+			const moved = `master moved since this failure's merge base (${mergeBase.slice(0, 9)} -> ${masterSha.slice(0, 9)})`;
+			// #3754: with a merge queue on master the queue tests the PR against the
+			// latest master itself, and an update-branch push re-runs every check
+			// (and ejects a queued PR): the update-branch remedy is moot.
 			hints.push(
-				`master moved since this failure's merge base (${mergeBase.slice(0, 9)} -> ${masterSha.slice(0, 9)}): gh run rerun replays the old merge commit and cannot pick up what master gained -- use gh pr update-branch ${target}`,
+				readMergeQueueState(target, repository, ghExec, timeoutMs)?.enabled
+					? `${moved}: the merge queue tests the PR on the latest master, so do not update-branch ${target} (it re-runs every check and ejects a queued PR); fix the failure and let the queue run`
+					: `${moved}: gh run rerun replays the old merge commit and cannot pick up what master gained -- use gh pr update-branch ${target}`,
 			);
 		}
 	}
@@ -1678,7 +2035,20 @@ async function restGet(
 			{ stderr: `HTTP ${response.status}: ${excerpt} (${path})` },
 		);
 	}
-	return text.length > 0 ? JSON.parse(text) : {};
+	if (text.length === 0) return {};
+	try {
+		return JSON.parse(text);
+	} catch (error) {
+		// A non-JSON body from an `application/vnd.github+json` request is a
+		// contract violation, not an empty answer; name the path so `run()`'s
+		// catch prints which call broke (AGENTS.md shape 13).
+		throw Object.assign(
+			new Error(
+				`GitHub REST API returned invalid JSON for ${path}: ${error instanceof Error ? error.message : error}`,
+			),
+			{ stderr: `invalid JSON from ${path} (HTTP ${response.status})` },
+		);
+	}
 }
 
 /**
@@ -1934,21 +2304,26 @@ function formatEventLine(stream, number, kind, sha, reason) {
 }
 
 export function readOpenPrs(ghExec = gh, timeoutMs = DEFAULT_GH_TIMEOUT_MS) {
-	return JSON.parse(
-		ghExec(
-			[
-				"pr",
-				"list",
-				"--state",
-				"open",
-				"--limit",
-				"100",
-				"--json",
-				"number,author,headRefOid,autoMergeRequest",
-			],
-			{ timeoutMs },
-		),
+	const raw = ghExec(
+		[
+			"pr",
+			"list",
+			"--state",
+			"open",
+			"--limit",
+			"100",
+			"--json",
+			"number,author,headRefOid,autoMergeRequest",
+		],
+		{ timeoutMs },
 	);
+	try {
+		return JSON.parse(raw);
+	} catch (error) {
+		throw new Error(
+			`could not parse the open PR list JSON: ${error instanceof Error ? error.message : error}`,
+		);
+	}
 }
 
 function readViewerLogin(ghExec, timeoutMs) {
@@ -2609,27 +2984,73 @@ export async function run({
 							initialTimeoutMs,
 							headInfo.pushedMs,
 						);
+						const { actionRequiredRuns, headRun } = fetchHeadRuns(
+							repository,
+							sha,
+							ghExec,
+							initialTimeoutMs,
+						);
+						const nowMs = clock();
 						return {
 							repository,
 							sha,
-							actionRequiredRuns: fetchActionRequiredRuns(
-								repository,
-								sha,
-								ghExec,
-								initialTimeoutMs,
-							),
+							actionRequiredRuns,
 							autoMerge: headInfo.autoMerge,
 							absentMinutes: Math.max(
 								0,
 								Math.floor(
-									(clock() -
+									(nowMs -
 										(Number.isFinite(headInfo.pushedMs)
 											? headInfo.pushedMs
-											: (absentSinceMs ?? (firstAbsentMs ??= clock())))) /
+											: (absentSinceMs ?? (firstAbsentMs ??= nowMs)))) /
 										60_000,
 								),
 							),
+							headRun: {
+								state: headRun.state,
+								id: headRun.id,
+								ageMinutes: Number.isFinite(headRun.startedAtMs)
+									? Math.max(
+											0,
+											Math.floor((nowMs - headRun.startedAtMs) / 60_000),
+										)
+									: null,
+							},
 						};
+					}
+				: null;
+		// #3754: read lazily, only when computeVerdict reaches its green branch
+		// (a red or pending head costs no extra call): whether the PR sits in the
+		// merge queue, else whether a queue run of this head failed and ejected
+		// it. PR targets on the gh transport only (the queue state is GraphQL).
+		const queueContext =
+			transport === TRANSPORT_GH && isPrNumber(target)
+				? () => {
+						const state = readMergeQueueState(
+							target,
+							repository,
+							ghExec,
+							initialTimeoutMs,
+						);
+						if (state?.entry) return { entry: state.entry };
+						// No queue on the repository (or an unreadable answer): the green
+						// head is plain success, at the cost of the one read above.
+						if (!state?.enabled) return null;
+						headInfo = fetchAutoMergeAge(
+							target,
+							repository,
+							sha,
+							ghExec,
+							initialTimeoutMs,
+							headInfo.pushedMs,
+						);
+						return fetchFailedQueueRuns(
+							target,
+							repository,
+							headInfo.pushedMs,
+							ghExec,
+							initialTimeoutMs,
+						);
 					}
 				: null;
 		// #2609: read once, before polling starts (branch protection does not
@@ -2674,6 +3095,7 @@ export async function run({
 			classification: ciClassification,
 			rerunState,
 			absentContext,
+			queueContext,
 			onRetry: stderr,
 			...(sleepImpl ? { sleepImpl } : {}),
 			...(now ? { now } : {}),
@@ -2700,6 +3122,7 @@ export async function run({
 					typeof rerunState === "function" ? rerunState() : rerunState,
 					absentContext,
 					found.noiseRowIds,
+					queueContext,
 				);
 			}
 			verdict = { ...verdict, details: found.details, hints: found.hints };
@@ -2738,7 +3161,10 @@ export async function run({
 				}),
 			);
 		stdout(verdict.reason);
-		return { code: verdict.exitCode, kind: verdictExitKind(verdict.exitCode) };
+		return {
+			code: verdict.exitCode,
+			kind: verdictExitKind(verdict.exitCode, verdict.kind),
+		};
 	} catch (error) {
 		// Transport/unexpected (F3): `gh` missing from PATH, a call that hit its
 		// own timeout, malformed JSON, or anything else that means this script

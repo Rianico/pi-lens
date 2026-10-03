@@ -43,8 +43,11 @@ import { holdFileMutationQueue } from "./file-mutation-queue.js";
 import { renderFixRunLoss } from "./fix-run-restore.js";
 import { getAmbientAbortSignal } from "./safe-spawn.js";
 import { type ProjectChangeSource } from "./project-changes.js";
-import type { PathSetLike, RuntimeCoordinator } from "./runtime-coordinator.js";
-import { recordDroppedRead } from "./session-scope.js";
+import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import {
+	recordDroppedRead,
+	sessionFencedFixedThisTurn,
+} from "./session-scope.js";
 import {
 	getAutofixPolicyForFile,
 	hasBiomeConfig,
@@ -410,16 +413,10 @@ export async function handleAgentEnd({
 	const deferredAutofixChanged = new Set<string>();
 	// #3576: runAutofix marks a file fixed after its fixer awaits; a replaced
 	// session's mark would skip the next session's own autofix of that file.
-	const sessionFixedThisTurn = runtime.fixedThisTurn;
-	const fixedThisTurn: PathSetLike = {
-		...sessionFixedThisTurn,
-		add: (fixedPath) => {
-			session.guardedWrite(fixedPath, () =>
-				sessionFixedThisTurn.add(fixedPath),
-			);
-			return fixedThisTurn;
-		},
-	};
+	const fixedThisTurn = sessionFencedFixedThisTurn(
+		runtime.fixedThisTurn,
+		session,
+	);
 	// #3528 r2: every claimed file a replaced session's drain does not start is
 	// named once, not only the first one each loop meets.
 	const skipReplaced = (filePath: string): void => {

@@ -12,6 +12,7 @@ import {
 	deferRunnerFindings,
 	dropStaleRunnerFindings,
 	pendingRunnerFindingsSize,
+	requeueRunnerFindings,
 	resetPendingRunnerFindings,
 } from "../../../clients/dispatch/pending-runner-findings.js";
 import { createGenerationSource } from "../../../clients/generation-guard.js";
@@ -352,5 +353,39 @@ describe("observed runner collect-later tier (#2116)", () => {
 		it("no-drop (shape 54): a dispatch still in its session defers its runner", async () => {
 			expect(await deferAfterGate(false)).toBe(1);
 		});
+	});
+
+	it("drops a requeued, capacity-held result once its scope has retired (#3758/#3813)", async () => {
+		const sessions = createGenerationSource("test-runtime-session");
+		deferRunnerFindings({
+			filePath,
+			cwd: projectRoot,
+			projectRoot,
+			runnerId: "requeue-runner",
+			markedAtMs: Date.now(),
+			promise: Promise.resolve({
+				status: "succeeded",
+				diagnostics: [],
+				semantic: "warning",
+			}),
+			session: sessions.capture(),
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		// The turn-end cap cut the part that carried this settled answer, so the
+		// delivery hold hands it back for the next turn end (#3813). The drained
+		// entry carries the producer's handle; without it the requeue re-enters
+		// unfenced and the next drain delivers it into the successor scope.
+		const drained = (await drainPendingRunnerFindings(0))[0]!;
+		requeueRunnerFindings({ ...drained, result: drained.result! });
+		// `/new`: the scope that owned the result retired before the next turn end.
+		sessions.bump();
+
+		expect(await drainPendingRunnerFindings(0)).toEqual([]);
+		expect(pendingRunnerFindingsSize()).toBe(0);
+		expect(
+			getDegradationSummary()
+				.filter((entry) => entry.kind === "generation-guard-stale-write")
+				.flatMap((entry) => entry.latestReasons.map((row) => row.subject)),
+		).toEqual([expect.stringContaining("turn-end:requeue-runner")]);
 	});
 });

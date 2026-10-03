@@ -14,6 +14,7 @@ import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { getLastLoggedPhase } from "../../clients/latency-logger.js";
 import * as latencyLogger from "../../clients/latency-logger.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import type { LineageHandle } from "../../clients/session-scope.js";
 import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
 import {
 	createTempFile,
@@ -3099,10 +3100,11 @@ describe("runtime-agent-end deferred records queued before a /tree (#3521 R2-F1)
 		filePath: string,
 		cwd: string,
 		readGuardBranchEpoch: number,
+		lineage?: LineageHandle,
 	) =>
 		expect(
 			recordMutationThroughSeam(
-				{ filePath, kind: "write", readGuardBranchEpoch },
+				{ filePath, kind: "write", readGuardBranchEpoch, lineage },
 				{
 					getRuntime: () => runtime as never,
 					getCacheManager: () => ({ addModifiedRange: () => {} }),
@@ -3132,7 +3134,9 @@ describe("runtime-agent-end deferred records queued before a /tree (#3521 R2-F1)
 	// #3677 round 3 (verify r2 V2): a settle that captured epoch 2 replays drift
 	// after `resetForSession`, whose new guard restarts at 0. Round 2 queued that
 	// dead session's write at the CURRENT epoch, so this drain credited it to the
-	// new session one hop after the bridge's own stamp refused it.
+	// new session one hop after the bridge's own stamp refused it. The settle
+	// hands over the lineage it captured with the epoch (S3, #3759), which is
+	// what refuses the replay since #3763 item 5.
 	const deadSessionReplay = (
 		runtime: RuntimeCoordinator,
 		filePath: string,
@@ -3142,10 +3146,11 @@ describe("runtime-agent-end deferred records queued before a /tree (#3521 R2-F1)
 		runtime.readGuard.retainBranch(new Set());
 		runtime.readGuard.retainBranch(new Set());
 		const captured = runtime.readGuard.currentBranchEpoch;
+		const lineage = runtime.captureSessionGeneration();
 		runtime.resetForSession();
 		expect(runtime.readGuard.currentBranchEpoch).toBeLessThan(captured);
 		if (queueFirst) runtime.deferFormat(filePath, cwd, "edit", cwd);
-		sweepReplay(runtime, filePath, cwd, captured);
+		sweepReplay(runtime, filePath, cwd, captured, lineage);
 	};
 
 	it("drains nothing a dead session's sweep replay queued after a session reset", async () => {

@@ -10,6 +10,7 @@ import {
 	parseArgs,
 	pathsFromPrFiles,
 	PR_FILES_API_CAP,
+	ghPrFiles,
 	run,
 } from "../../scripts/ci-changed-files.mjs";
 
@@ -106,6 +107,55 @@ describe("classifyChangedFiles: the strict docs allowlist", () => {
 	});
 });
 
+// N2 (#3861): the per-line parse `ghPrFiles` wraps is the ONE place a
+// `pulls/{n}/files` body is read; a malformed `--jq` line must throw (the
+// full-suite direction) rather than read as an empty list. `exec` is the
+// process boundary, so the fake stands in for `gh`, not for the parse.
+describe("ghPrFiles: one JSON object per gh --jq line (#3861 N2)", () => {
+	it("parses every non-empty line and carries a rename's previous path", () => {
+		const exec = () =>
+			'{"filename":"clients/a.ts"}\n\n{"filename":"docs/b.md","previous_filename":"clients/c.ts"}\n';
+		expect(ghPrFiles("acme/repo", "1", exec)).toEqual([
+			"clients/a.ts",
+			"docs/b.md",
+			"clients/c.ts",
+		]);
+	});
+
+	it("throws on a malformed line, never reads it as an empty file list", () => {
+		const exec = () => '{"filename":"clients/a.ts"}\nnot json\n';
+		expect(() => ghPrFiles("acme/repo", "1", exec)).toThrow(
+			/malformed gh api --jq line/,
+		);
+	});
+
+	// #3861 A1: only a whitespace-only line is a blank `--jq` separator; the
+	// trim must catch tabs and a bare carriage return too, so none of them
+	// reaches `JSON.parse`.
+	it("skips whitespace-only and carriage-return-only lines", () => {
+		const exec = () =>
+			'{"filename":"clients/a.ts"}\n   \n\t\n\r\n{"filename":"docs/b.md"}\n';
+		expect(ghPrFiles("acme/repo", "1", exec)).toEqual([
+			"clients/a.ts",
+			"docs/b.md",
+		]);
+	});
+
+	// #3861 A2: the error excerpt is bounded to 200 characters; a longer
+	// malformed line must not carry its tail into the message.
+	it("caps the malformed-line excerpt at 200 characters", () => {
+		const exec = () => `${"Z".repeat(250)}TRAILING\n`;
+		let message = "";
+		try {
+			ghPrFiles("acme/repo", "1", exec);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain("malformed gh api --jq line");
+		expect(message.endsWith("Z".repeat(200))).toBe(true);
+	});
+});
+
 describe("run (the CLI the changes job calls)", () => {
 	function withOutput(
 		test: (files: { output: string; summary: string }) => void,
@@ -162,10 +212,10 @@ describe("run (the CLI the changes job calls)", () => {
 		});
 	});
 
-	// Recurrence: master and merge-train replays losing the full suite. Only a
-	// pull_request is ever classified; every other event runs everything and
-	// never reads the API.
-	it.each(["push", "repository_dispatch", "merge_group", "workflow_dispatch"])(
+	// Recurrence: master losing the full suite when a non-PR event was read as
+	// docs-only. Only a pull_request is ever classified; every other event runs
+	// everything and never reads the API.
+	it.each(["push", "merge_group", "workflow_dispatch"])(
 		"runs everything for a %s event without reading the API",
 		(event) => {
 			withOutput((files) => {

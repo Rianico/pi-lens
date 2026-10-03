@@ -345,13 +345,25 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).toContain("deadbeef0000".slice(0, 12));
 	});
 
-	it("discloses a truncated related-test population on scored, partial, and zero reports", () => {
+	it("discloses a truncated test population on scored, partial, and zero reports", () => {
 		// Recurrence M3648-2: a bounded test population must not render as a
 		// complete score or an unexplained zero/partial result in the PR comment.
-		const testCap = { selected: 47, total: 155, dropped: 108 };
+		const testSelection = {
+			mode: "coverage",
+			pool: 155,
+			covering: 60,
+			kept: 47,
+			dropped: 13,
+			own: 2,
+			unknown: 0,
+		};
 		const scored = renderMutationMarkdown({
 			files: {},
-			piLensMutationDiff: { counts: { Killed: 1 }, score: "100.00", testCap },
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection,
+			},
 		});
 		const partial = renderMutationMarkdown({
 			files: {},
@@ -359,21 +371,261 @@ describe("renderMutationMarkdown", () => {
 				partial: { evaluated: 1, total: 2, reason: "budget expired" },
 				counts: { Killed: 1 },
 				score: "100.00",
-				testCap,
+				testSelection,
 			},
 		});
 		const zero = renderMutationMarkdown({
 			files: {},
 			piLensMutationDiff: {
 				zeroMutants: { reason: "no mutable lines" },
-				testCap,
+				testSelection,
 			},
 		});
 		for (const markdown of [scored, partial, zero]) {
-			expect(markdown).toContain("47 of 155 related tests selected");
-			expect(markdown).toContain("108 dropped");
+			expect(markdown).toContain("13 covering test(s) dropped by the test cap");
 			expect(markdown).toContain("truncated test population");
 		}
+	});
+
+	it("reports related -> covering -> kept on every report kind, and names the truncation only when a test was dropped (S12)", () => {
+		// Recurrence S12: the note must not appear when nothing was dropped (a
+		// complete population is not "truncated"), and kept < covering is not the
+		// trigger -- an own test that covers nothing is kept regardless.
+		const whole = {
+			mode: "coverage",
+			pool: 72,
+			covering: 16,
+			kept: 16,
+			dropped: 0,
+			own: 3,
+			unknown: 0,
+		};
+		const scored = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: whole,
+			},
+		});
+		const zero = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				zeroMutants: { reason: "no mutable lines" },
+				testSelection: whole,
+			},
+		});
+		for (const markdown of [scored, zero]) {
+			expect(markdown).toContain(
+				"**Test selection:** related 72 → covering 16 → kept 16 (3 own)",
+			);
+			expect(markdown).not.toContain("truncated test population");
+			expect(markdown).not.toContain("dropped by the test cap");
+		}
+		const ownExtra = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: { ...whole, covering: 13, kept: 16 },
+			},
+		});
+		expect(ownExtra).not.toContain("truncated test population");
+	});
+
+	it("says coverage was unavailable when the kept set came from the import graph alone, and names probe failures", () => {
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: {
+					mode: "import-graph",
+					pool: 30,
+					covering: null,
+					kept: 30,
+					dropped: 0,
+					own: 0,
+					unknown: 2,
+				},
+			},
+		});
+		expect(markdown).toContain(
+			"related 30 → covering coverage unavailable (import-graph ranking) → kept 30 (2 probe failed)",
+		);
+		const truncated = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: {
+					mode: "import-graph",
+					pool: 72,
+					covering: null,
+					kept: 47,
+					dropped: 25,
+					own: 0,
+					unknown: 0,
+				},
+			},
+		});
+		expect(truncated).toContain("25 related test(s) dropped by the test cap");
+	});
+
+	it("renders the exact selection line: bare without extras, comma-joined with both", () => {
+		const render = (extra: { own?: number; unknown?: number }) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					testSelection: {
+						mode: "coverage",
+						pool: 72,
+						covering: 16,
+						kept: 16,
+						dropped: 0,
+						own: 0,
+						unknown: 0,
+						...extra,
+					},
+				},
+			});
+		expect(render({})).toMatch(
+			/^- \*\*Test selection:\*\* related 72 → covering 16 → kept 16$/m,
+		);
+		expect(render({ own: 3, unknown: 2 })).toMatch(
+			/^- \*\*Test selection:\*\* .* kept 16 \(3 own, 2 probe failed\)$/m,
+		);
+	});
+
+	it.each([
+		["pool", { pool: "72" }],
+		["kept", { kept: "16" }],
+		["dropped", { dropped: "0" }],
+		["covering", { covering: "16" }],
+	])("ignores a selection whose %s is not a number", (_field, bad) => {
+		// Each of the four fields is validated on its own: a selection that is
+		// well-formed except for one must not render NaN or "undefined".
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: {
+					pool: 72,
+					covering: 16,
+					kept: 16,
+					dropped: 4,
+					own: 0,
+					unknown: 0,
+					...bad,
+				},
+			},
+		});
+		expect(markdown).not.toContain("Test selection");
+		expect(markdown).not.toContain("dropped by the test cap");
+	});
+
+	it("needs both reuse counts to claim a count, and says so when only one is a number", () => {
+		const render = (incremental: {
+			state: string;
+			reused?: number | null;
+			total?: number | null;
+		}) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					incremental,
+				},
+			});
+		const unavailable = "restored cache accepted (reuse count unavailable)";
+		expect(render({ state: "warm", reused: 5, total: null })).toContain(
+			unavailable,
+		);
+		expect(render({ state: "warm", reused: null, total: 6 })).toContain(
+			unavailable,
+		);
+	});
+
+	it("names the inputs that made the cache cold, five at most", () => {
+		const render = (changed: unknown) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					incremental: { state: "cold-inputs-changed", changed },
+				},
+			});
+		const plain =
+			"- **Incremental:** cold (a kept test or another changed file differs from the cached run)";
+		expect(render(["node", "tests/a.test.ts"])).toContain(
+			`${plain}: \`node\`, \`tests/a.test.ts\``,
+		);
+		const six = ["a", "b", "c", "d", "e", "f"];
+		expect(render(six)).toMatch(/: `a`, `b`, `c`, `d`, `e` and 1 more$/m);
+		expect(render(["a", "b", "c", "d", "e"])).toMatch(/`d`, `e`$/m);
+		expect(render(["a", 7, null])).toMatch(/: `a`$/m);
+		for (const none of [[], undefined, "node", [7]]) {
+			expect(render(none)).toMatch(
+				new RegExp(`${plain.replace(/[()*]/g, "\\$&")}$`, "m"),
+			);
+		}
+	});
+
+	it("does not name changed inputs for a state that is not cold-inputs-changed", () => {
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				incremental: { state: "cold-no-cache", changed: ["node"] },
+			},
+		});
+		expect(markdown).toContain("**Incremental:** cold (no restored cache)");
+		expect(markdown).not.toContain("`node`");
+	});
+
+	it("ignores a malformed test selection instead of rendering NaN", () => {
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: { pool: "many", kept: 1, dropped: 2 },
+			},
+		});
+		expect(markdown).not.toContain("Test selection");
+		expect(markdown).not.toContain("dropped by the test cap");
+	});
+
+	it("reports the incremental cache state, with the reuse count only for a warm run", () => {
+		const render = (incremental: unknown) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					incremental,
+				},
+			});
+		expect(render({ state: "warm", reused: 41, total: 57 })).toContain(
+			"**Incremental:** 41 of 57 mutant result(s) reused from the previous push",
+		);
+		expect(render({ state: "warm", reused: null, total: null })).toContain(
+			"restored cache accepted (reuse count unavailable)",
+		);
+		expect(render({ state: "cold-no-cache" })).toContain(
+			"**Incremental:** cold (no restored cache)",
+		);
+		expect(render({ state: "cold-inputs-changed" })).toContain(
+			"cold (a kept test or another changed file differs from the cached run)",
+		);
+		expect(render({ state: "mystery" })).not.toContain("Incremental");
+		expect(render(null)).not.toContain("Incremental");
 	});
 
 	it("carries the sticky-comment marker so the workflow can find and update its own comment", () => {

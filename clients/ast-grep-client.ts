@@ -26,6 +26,7 @@ import { reportBundledResourceDirHealth } from "./bundled-resource-health.js";
 import { getDegradationLedgerGeneration } from "./degradation-ledger.js";
 import { logLatency } from "./latency-logger.js";
 import { getMutationBridge } from "./mutation-bridge.js";
+import type { LineageHandle } from "./session-scope.js";
 import { resolvePackagePath } from "./package-root.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import {
@@ -82,7 +83,10 @@ function reportAstGrepRulesHealth(bundledRuleDir: string): void {
  * Exported for tests: they drive it against a registered bridge instead of
  * spawning ast-grep.
  */
-function recordAstGrepApply(matches: AstGrepMatch[]): void {
+function recordAstGrepApply(
+	matches: AstGrepMatch[],
+	lineage: LineageHandle | undefined,
+): void {
 	const bridge = getMutationBridge();
 	if (!bridge || matches.length === 0) return;
 	const rangesByFile = new Map<string, Array<[number, number]>>();
@@ -99,6 +103,9 @@ function recordAstGrepApply(matches: AstGrepMatch[]): void {
 			kind: "edit",
 			editRanges,
 			consumer: "ast_grep_replace",
+			// #3763: the call's session, so an apply that lands after `/new`
+			// writes none of the next session's state.
+			...(lineage && { lineage }),
 		});
 	}
 }
@@ -697,7 +704,7 @@ export class AstGrepClient {
 		lang: string,
 		paths: string[],
 		apply = false,
-		options?: { strictness?: string },
+		options?: { strictness?: string; lineage?: LineageHandle },
 	): Promise<{
 		matches: AstGrepMatch[];
 		totalMatches: number;
@@ -779,7 +786,7 @@ export class AstGrepClient {
 		// the same seam an extension would use. Fire-and-forget: the bridge never
 		// throws, and a missing bridge (pi-lens not activated, guard disabled) is
 		// a silent no-op.
-		recordAstGrepApply(preCheck.matches);
+		recordAstGrepApply(preCheck.matches, options?.lineage);
 		return {
 			matches: preCheck.matches,
 			totalMatches: preCheck.totalMatches,

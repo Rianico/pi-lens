@@ -405,7 +405,9 @@ describe("#3677: a foreign readGuardBranchEpoch cannot poison a deferred record"
 		// restarts at 0. Round 1 read "captured 2 > current 0" as a foreign
 		// future value, stripped it to undefined, and credited the dead
 		// session's write to the new one — the exact false credit #3521 exists
-		// to prevent. The captured epoch must stay fail-closed at the stamp.
+		// to prevent. Since S3 (#3759) the settled sweep hands the bridge the
+		// lineage it captured with the epoch, and that lineage, not the epoch
+		// value, refuses the dead session's write (#3763 item 5).
 		const env = setupTestEnvironment("pi-lens-3677-reset-");
 		const previousDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
@@ -427,6 +429,7 @@ describe("#3677: a foreign readGuardBranchEpoch cannot poison a deferred record"
 			runtime.readGuard.retainBranch(new Set());
 			const captured = runtime.readGuard.currentBranchEpoch;
 			expect(captured).toBe(2);
+			const lineage = runtime.captureSessionGeneration();
 
 			// The real reset seam: a new session's guard restarts at 0.
 			runtime.resetForSession();
@@ -440,6 +443,7 @@ describe("#3677: a foreign readGuardBranchEpoch cannot poison a deferred record"
 					touchedLines: [1, 2],
 					provenance: "settled-sweep",
 					readGuardBranchEpoch: captured,
+					lineage,
 				},
 				makeDeps({
 					tmpDir: env.tmpDir,
@@ -453,12 +457,12 @@ describe("#3677: a foreign readGuardBranchEpoch cannot poison a deferred record"
 			expect((runtime.readGuard as any).wasWrittenThisSession(filePath)).toBe(
 				false,
 			);
-			// ... and the refusal is observable through the read guard's own record.
+			// ... and the refusal is observable through the lineage's own record.
 			expect(
-				getDegradationSummary().find(
-					(group) => group.kind === "read-guard-write-after-branch-move",
-				)?.count,
-			).toBe(1);
+				getDegradationSummary()
+					.find((group) => group.kind === "generation-guard-stale-write")
+					?.latestReasons.map((row) => row.subject),
+			).toEqual([`runtime-session:${filePath}`]);
 			// No bridge record: the epoch is well-formed, just not this guard's.
 			expect(
 				getDegradationSummary().find(
@@ -968,6 +972,64 @@ describe("#3620/#3709: a retired scope's replay writes no session state", () => 
 				"block",
 			);
 		});
+	});
+
+	// #3763 item 5 (the #3705 residual): a well-formed epoch above the live one
+	// was taken for a dead session's capture and skipped: no stamp, no
+	// deferral, and nothing recorded under no-read-guard. Session currency is
+	// the lineage's now (the only in-process epoch sender, the settled sweep,
+	// carries its own), and a producer without one cannot hold an epoch at
+	// all, so the value is ignored like a malformed one. The recurrence: a
+	// forward epoch that silently loses its write's format pass.
+	function forwardEpochCase(readGuardOn: boolean): void {
+		withScopes(
+			`forward-${readGuardOn ? "on" : "off"}`,
+			({ filePath, tmpDir, runtime, cacheManager }) => {
+				expect(runtime.readGuard.currentBranchEpoch).toBe(0);
+				recordMutationThroughSeam(
+					{
+						filePath,
+						kind: "edit",
+						touchedLines: [1, 2],
+						consumer: "third-party",
+						readGuardBranchEpoch: 5,
+					},
+					makeDeps({
+						tmpDir,
+						runtime,
+						cacheManager,
+						shouldStampReadGuard: () => readGuardOn,
+					}),
+				);
+				const epochRecord = getDegradationSummary().find(
+					(group) => group.kind === "mutation-bridge-invalid-branch-epoch",
+				);
+				expect({
+					verdict: runtime.readGuard.checkEdit(filePath, [1, 1]).action,
+					queued: runtime
+						.consumeDeferredFormatFiles()
+						.map((record) => record.readGuardBranchEpoch),
+					recorded: epochRecord?.count,
+					// #3763 item 5: the above-live value is named in the record, so
+					// the ignored epoch is observable, not a silent skip (kills the
+					// reason-string mutant on this added line).
+					reason: epochRecord?.latestReasons[0]?.reason,
+				}).toEqual({
+					verdict: readGuardOn ? "allow" : "block",
+					queued: [0],
+					recorded: 1,
+					reason: "ignored a readGuardBranchEpoch above the live epoch (5 > 0)",
+				});
+			},
+		);
+	}
+
+	it("ignores an epoch above the live one from a producer without a lineage, and queues its write (read guard on)", () => {
+		forwardEpochCase(true);
+	});
+
+	it("ignores an epoch above the live one from a producer without a lineage, and queues its write (read guard off)", () => {
+		forwardEpochCase(false);
 	});
 });
 

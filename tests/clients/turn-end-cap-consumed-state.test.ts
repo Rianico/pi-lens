@@ -886,6 +886,51 @@ describe("M3c: late runner findings vs the cap (#3813)", () => {
 			rig.cleanup();
 		}
 	});
+
+	// #3824 S3: the session-carry requeue through the REAL production trigger.
+	// The unit replay in runner-collect-later.test.ts calls drain/requeue
+	// directly; this drives the cap cut, the delivery hold's `onHeld` requeue
+	// and the successor's own `handleTurnEnd`, so the scope fence is proven at
+	// the entry point production uses, not a parallel helper.
+	it("drops a requeued result at a successor scope's turn end after its owner retired (#3758/#3813)", async () => {
+		const rig = makeRig("pi-lens-3813-m3c-scope-");
+		try {
+			const fillerFile = fillerBlocker(rig, 1000);
+			const file = touch(rig, "run-scope.ts");
+			const past = new Date(Date.now() - 10_000);
+			fs.utimesSync(file, past, past);
+			// The producer's captured handle, taken before its work settled.
+			const handle = rig.runtime.captureSessionGeneration();
+			deferRunnerFindings({
+				filePath: file,
+				cwd: rig.cwd,
+				projectRoot: rig.cwd,
+				runnerId: "slow-runner",
+				markedAtMs: Date.now(),
+				promise: Promise.resolve({
+					status: "succeeded",
+					semantic: "warning",
+					diagnostics: [runnerDiagnostic(file, `${PAD}${RUNNER_END}`)],
+				}),
+				session: handle,
+			});
+
+			// The cap cut the part; the hold handed the settled result back.
+			expect(await endTurn(rig)).not.toContain(RUNNER_END);
+			expect(pendingRunnerFindingsSize()).toBe(1);
+			clearFiller(rig, fillerFile);
+			// `/new` retires the scope before the next session_start clears the
+			// store. The successor's turn end drains an entry whose handle has
+			// retired, so it must be dropped with its counted row, not delivered.
+			rig.runtime.resetForSession();
+			nextTurn(rig, 2);
+			expect(await endTurn(rig)).not.toContain(RUNNER_END);
+			expect(pendingRunnerFindingsSize()).toBe(0);
+			expect(ledgerCount("generation-guard-stale-write")).toBeGreaterThan(0);
+		} finally {
+			rig.cleanup();
+		}
+	});
 });
 
 const AUX_END = "ENDAUX";

@@ -30,6 +30,13 @@ vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
 }));
 
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
+import { CacheManager } from "../../clients/cache-manager.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import { readChangesSince } from "../../clients/project-changes.js";
+import {
+	_observedMutationStateForTests,
+	resetObservedMutationNet,
+} from "../../clients/observed-mutation.js";
 
 function gate() {
 	let open!: () => void;
@@ -621,5 +628,90 @@ describe("#3601: lsp_navigation's rename refuses an edit on a file that changed"
 		expect(result.isError).toBeUndefined();
 		expect(fs.readFileSync(fileA, "utf8")).toBe("let = 1;\n");
 		expect(staleRows()).toEqual([]);
+	});
+});
+
+/**
+ * #3763 item 4: `lsp_navigation`'s bookkeeping (the turn-state range, the
+ * change-log receipt, the bridge fallback) runs after the rename's server call
+ * and its apply. `bookkeepLspMutation` already drops a replaced session's
+ * bookkeeping through `context.session` (#3576), but the tool never set it, so
+ * a rename that applied after `/new` listed session 1's file in session 2's
+ * turn-state worklist (#2504's shape). The recurrence: the tool's mutation
+ * context built without the session it was called in.
+ */
+describe("#3763 lsp_navigation bookkeeps under the session it was called in", () => {
+	it("a rename that applies after the replacement lists nothing in session 2's turn state", async () => {
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		resetObservedMutationNet();
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const parked = gate();
+			const resume = gate();
+			lsp.service = makeLspServiceDouble({
+				supportsLSP: () => true,
+				hasLSP: async () => true,
+				rename: async () => {
+					parked.open();
+					await resume.p;
+					return valueEdit();
+				},
+			});
+			const tool = createLspNavigationTool((flag) => flag === "lens-lsp", {
+				runtime,
+				cacheManager,
+				readGuard: runtime.readGuard,
+			});
+			const pending = tool.execute(
+				"rename-3763",
+				{
+					operation: "rename",
+					path: fileA,
+					line: 1,
+					character: 1,
+					newName: "let",
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			await parked.p;
+			runtime.resetForSession();
+			runtime.beginTurn();
+			resume.open();
+			await pending;
+			expect({
+				applied: fs.readFileSync(fileA, "utf8"),
+				turnFiles: Object.keys(
+					cacheManager.readTurnState(env.tmpDir).files ?? {},
+				).map((file) => path.basename(file)),
+				// #3763 r2 (F2): the bytes did change, so the disk facts stay
+				// (I5): the change-log receipt, the file's seq (the staleness key
+				// of test-runner and actionable-warning verdicts) and the settled
+				// sweep's handled mark.
+				receipts: readChangesSince(env.tmpDir, 0).map((change) => [
+					path.basename(change.filePath),
+					change.source,
+				]),
+				fileSeq: runtime.getFileSeq(fileA),
+				handled: _observedMutationStateForTests().handled.some((key) =>
+					key.endsWith("a.ts"),
+				),
+			}).toEqual({
+				applied: "let = 1;\n",
+				turnFiles: [],
+				receipts: [["a.ts", "lsp-rename"]],
+				fileSeq: 1,
+				handled: true,
+			});
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+		}
 	});
 });

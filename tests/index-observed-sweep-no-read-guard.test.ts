@@ -83,6 +83,32 @@ vi.mock("../clients/runtime-session.js", () => ({
 vi.mock("../clients/runtime-agent-end.js", () => ({
 	handleAgentEnd: vi.fn(async () => undefined),
 }));
+// #3763 item 5 / #3824 S2: observe what the REAL settled-sweep producer hands
+// the bridge. The mounted bridge is frozen, so the capture rides the producer's
+// own recorder (index.ts's `runObservedSettledSweepSafely`) instead. The floor
+// below proves this probe saw the producer's epoch; the safety clause pins that
+// no real producer sends an epoch without the lineage it captured beside it.
+const replayedProducerEntries = vi.hoisted(
+	() => [] as Array<{ epoch: number | undefined; hasLineage: boolean }>,
+);
+vi.mock("../clients/observed-mutation-sources.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<
+			typeof import("../clients/observed-mutation-sources.js")
+		>();
+	return {
+		...actual,
+		replayThroughMutationBridge: (
+			entry: Parameters<typeof actual.replayThroughMutationBridge>[0],
+		) => {
+			replayedProducerEntries.push({
+				epoch: entry.readGuardBranchEpoch,
+				hasLineage: entry.lineage !== undefined,
+			});
+			return actual.replayThroughMutationBridge(entry);
+		},
+	};
+});
 
 import { CacheManager } from "../clients/cache-manager.js";
 import extension from "../index.js";
@@ -102,6 +128,7 @@ describe("#2465 round 2: the observed-mutation settled sweep runs under --no-rea
 		prevDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(tmp, "data");
 		resetObservedMutationNet();
+		replayedProducerEntries.length = 0;
 	});
 
 	afterEach(() => {
@@ -177,5 +204,17 @@ describe("#2465 round 2: the observed-mutation settled sweep runs under --no-rea
 				source: "agent-tool:settled-sweep",
 			}),
 		);
+
+		// Floor: the probe observed the settled sweep's own replay with an epoch.
+		expect(
+			replayedProducerEntries.some((entry) => entry.epoch !== undefined),
+		).toBe(true);
+		// Safety: no production entry carries an epoch without its lineage, so no
+		// real producer can reach the bridge's no-lineage above-live branch.
+		expect(
+			replayedProducerEntries
+				.filter((entry) => entry.epoch !== undefined)
+				.every((entry) => entry.hasLineage),
+		).toBe(true);
 	});
 });

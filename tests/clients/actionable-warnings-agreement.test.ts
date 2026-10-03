@@ -442,22 +442,27 @@ describe("#3576: a quickfix pass whose session was replaced", () => {
 		expect(runtime.getFileSeq(b!)).toBe(1);
 	});
 
-	it("an edit already writing when /new lands completes, and its bookkeeping stays out of the next session", async () => {
+	it("an edit already writing when /new lands completes, keeps its disk facts, and its session bookkeeping stays out of the next session", async () => {
 		const [a] = files();
 		const runtime = new RuntimeCoordinator();
 		runtime.projectRoot = env.tmpDir;
 		const cache = new CacheManager(false);
 		const addModifiedRange = vi.spyOn(cache, "addModifiedRange");
+		const recordAutofix = vi.fn();
 		const applying = applyWorkspaceEdit(quickfix(a!).edit, env.tmpDir, {
-			mutationContext: drainContext(runtime, cache),
+			mutationContext: { ...drainContext(runtime, cache), recordAutofix },
 		});
 		// The write is in flight (its first await); the next session starts.
 		runtime.resetForSession();
 		await applying;
 		expect(fs.readFileSync(a!, "utf8")).toBe("const = 1;\n");
-		expect(runtime.getFileSeq(a!)).toBe(0);
-		expect(runtime.projectSeq).toBe(0);
+		// #3763 r2: the bytes changed, so the file's seq and the change log say
+		// so (I5); only the session's own state (turn state) is dropped.
+		expect(runtime.getFileSeq(a!)).toBe(1);
+		expect(runtime.projectSeq).toBe(1);
 		expect(addModifiedRange).not.toHaveBeenCalled();
+		// The turn summary is the session's own state too.
+		expect(recordAutofix).not.toHaveBeenCalled();
 		expect(
 			getDegradationSummary()
 				.filter((group) => group.kind === "generation-guard-stale-write")

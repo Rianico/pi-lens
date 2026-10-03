@@ -23,7 +23,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import {
 	type LspMutationContext,
@@ -315,5 +315,74 @@ describe("bookkeepLspMutation — direct path and bridge fallback are equivalent
 				emitSummary: false,
 			};
 		}
+	});
+
+	// #3763 r2 (F2): an LSP edit that lands after its caller's session was
+	// replaced drops only that session's state (the read-guard stamp, the
+	// turn-state entry) and keeps the facts about the bytes (the receipt and
+	// the file's seq), on both branches: the direct one in
+	// `bookkeepLspMutation`, the fallback through the bridge's lineage fence.
+	// The recurrence: a dead-session fence that skipped the whole file.
+	it("keep the receipt and drop the turn state on both branches once the session is replaced", () => {
+		const record = (
+			dir: string,
+			runtime: RuntimeCoordinator,
+			context: Omit<LspMutationContext, "session">,
+		) => {
+			const filePath = writeFixture(dir, "dead.ts");
+			// Aged, so only an explicit read-guard credit can allow an edit.
+			const longAgo = new Date("2000-01-01T00:00:00Z");
+			fs.utimesSync(filePath, longAgo, longAgo);
+			const session = runtime.captureSessionGeneration();
+			runtime.resetForSession();
+			recordLspMutation(
+				{ ...context, session },
+				{ results: resultsFor(filePath) },
+			);
+			return filePath;
+		};
+		const stamp = vi.fn();
+		const direct = record(dirDirect, runtimeDirect, {
+			cwd: dirDirect,
+			correlationId: "equiv-dead-direct",
+			tool: "lsp_navigation:rename",
+			source: "lsp-rename",
+			runtime: runtimeDirect as never,
+			cacheManager: cacheManagerDirect,
+			readGuard: { recordWritten: stamp },
+			emitSummary: false,
+		});
+		const bridge = record(dirBridge, runtimeBridge, {
+			cwd: dirBridge,
+			correlationId: "equiv-dead-bridge",
+			tool: "lsp_navigation:rename",
+			source: "lsp-rename",
+			emitSummary: false,
+		});
+		const facts = (
+			dir: string,
+			filePath: string,
+			runtime: RuntimeCoordinator,
+			cacheManager: CacheManager,
+		) => ({
+			receipt: readChangesSince(dir, 0).some(
+				(change) => change.filePath === filePath,
+			),
+			fileSeq: runtime.getFileSeq(filePath),
+			inTurnState: Object.keys(
+				cacheManager.readTurnState(dir).files ?? {},
+			).some((key) => key.endsWith("dead.ts")),
+			// The live session's read guard: the bridge stamps it through its
+			// live getter, so only the lineage keeps the dead edit out.
+			verdict: runtime.readGuard.checkEdit(filePath, [1, 1]).action,
+		});
+		expect([
+			facts(dirDirect, direct, runtimeDirect, cacheManagerDirect),
+			facts(dirBridge, bridge, runtimeBridge, cacheManagerBridge),
+		]).toEqual([
+			{ receipt: true, fileSeq: 1, inTurnState: false, verdict: "block" },
+			{ receipt: true, fileSeq: 1, inTurnState: false, verdict: "block" },
+		]);
+		expect(stamp).not.toHaveBeenCalled();
 	});
 });

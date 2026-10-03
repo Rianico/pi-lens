@@ -150,9 +150,9 @@ function simulate(
 							.map((l) => l.split("=")),
 					)
 		) as { code: string; formal: string };
-		const results: Record<string, string> = {
-			...(changesFails ? { changes: "failure" } : {}),
-		};
+		const results: Record<string, string> = changesFails
+			? { changes: "failure" }
+			: {};
 		const outputs: Record<string, Record<string, string>> = {
 			changes,
 			"heavy-gate": { ready: gateReady },
@@ -328,8 +328,8 @@ describe("#3801 docs-only pull requests skip only the heavy advisory jobs", () =
 		expect(results["mutation-comment"]).toBe("success");
 	});
 
-	// Recurrence: master, merge-train replays and (later) merge_group losing the
-	// full suite to the classifier.
+	// Recurrence: master and (later) merge_group losing the full suite to the
+	// classifier.
 	it.each(["push", "merge_group"])(
 		"runs the full suite for a %s event even for a docs-only file list",
 		(event) => {

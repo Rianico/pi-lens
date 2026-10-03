@@ -17,7 +17,9 @@
  * - `deferRunnerFindings` (#3568: a collect-later runner's deferral into the
  *   turn-end store, whose compute also settles under the scheduler);
  * - `recordLspMutation` with a session on its context (#3576: the quickfix
- *   pass's bookkeeping into the change log, the read guard and turn state).
+ *   pass's bookkeeping into the read guard and turn state; its change-log
+ *   receipt and file seq are facts about the bytes and stay, #3763 r2, so
+ *   the oracle reads the turn-state writes and the session each landed in).
  * - the widget's write guard (#3540 r2: `recordDiagnostics` under the order
  *   token `runtime.nextWriteOrderToken()` draws when the writer is issued).
  *   The widget is not session-guarded: a `/reload` keeps it and its guard,
@@ -55,6 +57,7 @@ import type { CascadeRun } from "../../clients/cascade-types.js";
 import {
 	deferRunnerFindings,
 	drainPendingRunnerFindings,
+	requeueRunnerFindings,
 	resetPendingRunnerFindings,
 } from "../../clients/dispatch/pending-runner-findings.js";
 import type { RunnerResult } from "../../clients/dispatch/types.js";
@@ -81,13 +84,26 @@ const PROPERTY_TIMEOUT_MS = 20_000;
 
 // --- Generated commands --------------------------------------------------
 
-type WriterKind = "cascade" | "runner" | "bookkeep" | "widget";
+type WriterKind = "cascade" | "runner" | "runnerBare" | "bookkeep" | "widget";
 type Command =
 	| { t: "write"; kind: WriterKind }
 	| { t: "turn" }
 	/** `keepWidget`: a `/reload` (the widget and its guard survive) or `/new`. */
 	| { t: "start"; keepWidget: boolean }
-	| { t: "shutdown" };
+	| { t: "shutdown" }
+	/**
+	 * #3813/#3824: a turn end whose delivery cap cut the late-runner part, so
+	 * the drain-then-restore hold hands every settled answer it drained back to
+	 * the store for the next turn. It models the worst case (every part cut).
+	 */
+	| { t: "cap" }
+	/**
+	 * A raw generation bump with no store clear: the window between a scope's
+	 * retirement and the next `session_start`'s `resetPendingRunnerFindings`
+	 * (#3758). `start` clears and bumps in one tick; this models the gap a
+	 * concurrent secondary's turn end drains in.
+	 */
+	| { t: "retire" };
 
 const commandArb: fc.Arbitrary<Command> = fc.oneof(
 	{
@@ -97,6 +113,7 @@ const commandArb: fc.Arbitrary<Command> = fc.oneof(
 			kind: fc.constantFrom<WriterKind>(
 				"cascade",
 				"runner",
+				"runnerBare",
 				"bookkeep",
 				"widget",
 			),
@@ -111,6 +128,8 @@ const commandArb: fc.Arbitrary<Command> = fc.oneof(
 		}),
 	},
 	{ weight: 1, arbitrary: fc.constant({ t: "shutdown" as const }) },
+	{ weight: 2, arbitrary: fc.constant({ t: "cap" as const }) },
+	{ weight: 1, arbitrary: fc.constant({ t: "retire" as const }) },
 );
 
 const commandsArb = fc.array(commandArb, { minLength: 1, maxLength: 10 });
@@ -168,6 +187,15 @@ async function execute(
 	const runtime = new RuntimeCoordinator();
 	runtime.projectRoot = root;
 	const cacheManager = new CacheManager(false);
+	// Observed, not replaced: each turn-state write and the session it landed in.
+	const turnStateWrites: Array<{ file: string; session: number }> = [];
+	const addModifiedRange = cacheManager.addModifiedRange.bind(cacheManager);
+	vi.spyOn(cacheManager, "addModifiedRange").mockImplementation(
+		(filePath, ...rest) => {
+			turnStateWrites.push({ file: normalizeMapKey(filePath), session });
+			return addModifiedRange(filePath, ...rest);
+		},
+	);
 	resetPendingRunnerFindings();
 	clearWidgetState();
 	let session = 1;
@@ -180,8 +208,17 @@ async function execute(
 
 	const write = (
 		writer: Writer,
-		handle: ReturnType<RuntimeCoordinator["captureSessionGeneration"]>,
+		handle:
+			| ReturnType<RuntimeCoordinator["captureSessionGeneration"]>
+			| undefined,
 	) => {
+		// Only a runnerBare writer (a released producer, shape 57) may arrive
+		// without a handle; every other kind captured one at issue.
+		const handleFor = () => {
+			if (handle === undefined)
+				throw new Error(`${writer.kind} w${writer.id} has no captured handle`);
+			return handle;
+		};
 		if (writer.kind === "cascade") {
 			const computed: CascadeRun = {
 				filePath: writer.file,
@@ -191,7 +228,7 @@ async function execute(
 			};
 			runtime.appendCascadePromise(
 				s.schedule(Promise.resolve(computed), `compute:${writer.id}`),
-				handle,
+				handleFor(),
 				writer.file,
 			);
 		} else if (writer.kind === "widget") {
@@ -201,12 +238,16 @@ async function execute(
 				writer.token,
 			);
 			writer.wroteAt = ++step;
-		} else if (writer.kind === "runner") {
+		} else if (writer.kind === "runner" || writer.kind === "runnerBare") {
 			const result: RunnerResult = {
 				status: "succeeded",
 				diagnostics: [],
 				semantic: "warning",
 			};
+			// runnerBare is shape 57: a released writer with no captured handle.
+			// The deferral must be admitted fail-open, and both readers must not
+			// fence it out. Omitting `session` (rather than passing `undefined`)
+			// keeps the call assignable under exactOptionalPropertyTypes.
 			deferRunnerFindings({
 				filePath: writer.file,
 				cwd: root,
@@ -214,7 +255,7 @@ async function execute(
 				runnerId: `runner-${writer.id}`,
 				markedAtMs: 0,
 				promise: s.schedule(Promise.resolve(result), `runner:${writer.id}`),
-				session: handle,
+				...(handle !== undefined && { session: handle }),
 			});
 		} else {
 			recordLspMutation(
@@ -226,7 +267,7 @@ async function execute(
 					runtime,
 					cacheManager,
 					readGuard: runtime.readGuard,
-					session: handle,
+					session: handleFor(),
 					emitSummary: false,
 				},
 				{
@@ -272,8 +313,10 @@ async function execute(
 		};
 		fs.writeFileSync(writer.file, `export const w${id} = ${id};\n`);
 		run.writers.push(writer);
-		// The production capture, taken when the writer starts.
-		const handle = runtime.captureSessionGeneration();
+		// The production capture, taken when the writer starts. A runnerBare
+		// writer (a released producer) never captured one (shape 57).
+		const handle =
+			kind === "runnerBare" ? undefined : runtime.captureSessionGeneration();
 		// The widget order token, drawn when the writer starts (#3540 r2).
 		if (kind === "widget") writer.token = runtime.nextWriteOrderToken();
 		note(`issue ${kind} w${id} in session ${session}`);
@@ -289,7 +332,24 @@ async function execute(
 			label: `cmd${index}`,
 			builder: async () => {
 				if (command.t === "write") issueWriter(command.kind, index);
-				else if (command.t === "turn") {
+				else if (command.t === "cap") {
+					// The drain removes every settled answer; the cap cut the part, so
+					// `onHeld` hands each one back for the next turn end (#3813). The
+					// requeue carries the producer's captured handle (#3824).
+					const drained = await drainPendingRunnerFindings(0);
+					for (const entry of drained) {
+						if (entry.result)
+							requeueRunnerFindings({ ...entry, result: entry.result });
+					}
+					note(`turn-end cap: drained ${drained.length}, requeued`);
+				} else if (command.t === "retire") {
+					// A raw generation bump with NO store clear: the retirement window
+					// #3758's drain fence defends, before the next session_start clears.
+					runtime.resetForSession();
+					turnOpen = false;
+					session += 1;
+					note(`session retire (no store clear) -> session ${session}`);
+				} else if (command.t === "turn") {
 					runtime.beginTurn();
 					turnOpen = true;
 					note("turn_start");
@@ -329,7 +389,11 @@ async function execute(
 	await runtime.settleCascadeRuns(0);
 	run.cascade = runtime.consumeCascadeRuns().map((r) => r.filePath);
 	run.runner = (await drainPendingRunnerFindings(0)).map((e) => e.filePath);
-	const bookkept = new Set(runtime.getFileSeqEntries().map(([key]) => key));
+	const bookkept = new Set(
+		turnStateWrites
+			.filter((write) => write.session === session)
+			.map((write) => write.file),
+	);
 	run.bookkeep = run.writers
 		.filter((w) => bookkept.has(normalizeMapKey(w.file)))
 		.map((w) => w.file);
@@ -345,7 +409,7 @@ async function execute(
 function heldBy(run: Run, kind: Exclude<WriterKind, "widget">): string[] {
 	return kind === "cascade"
 		? run.cascade
-		: kind === "runner"
+		: kind === "runner" || kind === "runnerBare"
 			? run.runner
 			: run.bookkeep;
 }
@@ -362,13 +426,34 @@ function liveness(run: Run): string[] {
 function noStaleWrite(run: Run): string[] {
 	const out: string[] = [];
 	for (const w of run.writers) {
-		if (w.kind === "widget" || w.session === run.finalSession) continue;
+		// runnerBare carries no handle, so it is unfenced by design (shape 57);
+		// `noHandleDelivered` is its no-drop direction.
+		if (
+			w.kind === "widget" ||
+			w.kind === "runnerBare" ||
+			w.session === run.finalSession
+		)
+			continue;
 		if (heldBy(run, w.kind).includes(w.file))
 			out.push(
 				`${w.kind} w${w.id} from session ${w.session} is in session ${run.finalSession}'s state`,
 			);
 	}
 	return out;
+}
+
+/**
+ * Shape 57 (released writer, no captured handle): a runner deferred without a
+ * handle is unfenced by design, so every no-handle writer of the final session
+ * must still reach its state, whether or not the cap drained and requeued it.
+ * The drain's absence of a `guardedWrite` is the no-drop direction of the
+ * `session === undefined` branch.
+ */
+function noHandleDelivered(run: Run): string[] {
+	return run.writers
+		.filter((w) => w.kind === "runnerBare" && w.session === run.finalSession)
+		.filter((w) => !run.runner.includes(w.file))
+		.map((w) => `runnerBare w${w.id} of the final session was dropped`);
 }
 
 /**
@@ -406,6 +491,7 @@ const PROPERTIES = {
 	liveness,
 	noStaleWrite,
 	noOwnDrop,
+	noHandleDelivered,
 	widgetLatest,
 } satisfies Record<string, (run: Run) => string[]>;
 type PropertyName = keyof typeof PROPERTIES;

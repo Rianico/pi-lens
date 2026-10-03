@@ -25,8 +25,13 @@ import {
 	EXIT_SUCCESS,
 	EXIT_TRANSPORT,
 	EXIT_USAGE,
+	fetchActionRequiredRuns,
 	fetchCheckRunsPayload,
+	fetchFailedQueueRuns,
+	fetchHeadRuns,
+	fetchRerunState,
 	formatAbsentRequiredReason,
+	formatAbsentRunReason,
 	formatExitLine,
 	formatVerdictTable,
 	HARD_CAP_SECONDS,
@@ -36,6 +41,8 @@ import {
 	POLL_INTERVAL_SECONDS,
 	parseArgs,
 	pollVerdict,
+	readMergeQueueState,
+	readOpenPrs,
 	resolveClassification,
 	resolveGhTimeoutMs,
 	resolveHeadSha,
@@ -411,9 +418,24 @@ describe("computeVerdict — absent-check verdict is mergeable-aware (#2539 roun
 	// ever registers) with a MERGEABLE head. The issue claimed this exited 0;
 	// it already exits 3 (see the doc comment above computeVerdict), so this
 	// pins that exit code AND the issue's optional hint text, which is the
-	// one piece #2664 actually adds.
+	// one piece #2664 actually adds. #3861 F2: the hint requires the POSITIVE
+	// "no run for the head" answer; a missing run answer is not evidence.
 	it("A5 (#2664): both required rows absent + MERGEABLE exits 3 with the retarget hint", () => {
-		const verdict = computeVerdict({ check_runs: [] }, undefined, "MERGEABLE");
+		const verdict = computeVerdict(
+			{ check_runs: [] },
+			undefined,
+			"MERGEABLE",
+			null,
+			null,
+			{
+				repository: "acme/repo",
+				sha: "a".repeat(40),
+				actionRequiredRuns: [],
+				autoMerge: false,
+				absentMinutes: 5,
+				headRun: { state: "none", id: null, ageMinutes: null },
+			},
+		);
 		expect(verdict.exitCode).toBe(EXIT_PENDING);
 		expect(verdict.rows.every((row) => !row.present)).toBe(true);
 		expect(verdict.reason).toContain("mergeable=MERGEABLE");
@@ -790,20 +812,18 @@ describe("computeVerdict — every check-run gates unless advisory (#2609)", () 
 		expect(verdict.reason).toContain(REAL_PROD_INSTALL_BUILD_NAME);
 	});
 
-	// Not hypothetical: this repository's `record-post-merge-validation` job
-	// (ci.yml AND lint.yml) has a job-level `if: ... event_name ==
-	// 'repository_dispatch'` and reports "skipped" on every ordinary
-	// pull_request run (confirmed live on PR #2588, 2026-09-06 -- two "Record
-	// post-merge validation" rows, both "skipping" in `gh pr checks`). A bare
-	// `conclusion !== "success"` check (the pre-#2609 comparison, applied to a
-	// newly-discovered row) would red every PR forever.
+	// Not hypothetical: a discovered job can report "skipped" on an ordinary
+	// pull_request run (a job-level `if:` that evaluated false, or a skipped
+	// `needs:`). A bare `conclusion !== "success"` check (the pre-#2609
+	// comparison, applied to a newly-discovered row) would red every PR
+	// forever.
 	it("a discovered gating check that concluded 'skipped' does not fail the verdict", () => {
 		const payload = {
 			check_runs: [
 				checkRun({ name: "Unit tests", id: 1 }),
 				checkRun({ name: "Lint & type-check", id: 2 }),
 				checkRun({
-					name: "Record post-merge validation",
+					name: "Production install build (--omit=dev, from source)",
 					conclusion: "skipped",
 					id: 3,
 				}),
@@ -900,11 +920,11 @@ describe("computeVerdict — every check-run gates unless advisory (#2609)", () 
 //  discovered  | absent     | --                   | impossible by construction -- a discovered row's name, by definition, appeared in the payload
 //  advisory    | any incl. failure | --            | 0 (existing)      | 2 (existing)
 describe("computeVerdict — required rows reject skip/neutral/failure while latest cancellation reruns (#3373)", () => {
-	// The exact reported shape: ci.yml:253's `test` job (`Unit tests`) has
-	// `needs: validate-merge-train-dispatch` with no `if:` -- a failed/skipped
-	// dependency skips it outright, and the pre-fix-round-2 code (which
-	// exempted EVERY gating row's skipped/neutral conclusion, not just
-	// discovered ones) read that as a clean pass.
+	// The exact reported shape: ci.yml's `Unit tests` aggregate requires the
+	// `test` matrix job, and a failed/skipped dependency skips the aggregate
+	// outright, so the pre-fix-round-2 code (which exempted EVERY gating row's
+	// skipped/neutral conclusion, not just discovered ones) read that as a
+	// clean pass.
 	it("RED PROOF: a required 'Unit tests' that concluded skipped no longer passes", () => {
 		const payload = {
 			check_runs: [
@@ -953,11 +973,10 @@ describe("computeVerdict — required rows reject skip/neutral/failure while lat
 });
 
 describe("computeVerdict — a discovered row's cancelled conclusion is uncertain, not failing (#2618 fix-round-2, F2)", () => {
-	// RED PROOF against the pre-fix-round-2 code, reproduced with the REAL
-	// check_suite id and started_at GitHub returned for PR #2607's
-	// "Record post-merge validation" oldest (cancelled) run, live-probed
-	// 2026-09-06: `gh api repos/apmantza/pi-lens/commits/<sha>/check-runs`
-	// returned THREE check-suites for that name on ONE commit -- 17:21:06
+	// RED PROOF against the pre-fix-round-2 code, reproduced with a REAL
+	// check_suite id and started_at GitHub returned for PR #2607's oldest
+	// (cancelled) run, live-probed 2026-09-06: `gh api repos/apmantza/pi-lens/commits/<sha>/check-runs`
+	// returned THREE check-suites for that named job on ONE commit -- 17:21:06
 	// cancelled, 17:25:29 skipped, 17:32:15 skipped. This fixture carries
 	// ONLY the cancelled one, reproducing the transient window before either
 	// replacement had posted (`cancel-in-progress: true`, ci.yml:15-16).
@@ -967,7 +986,7 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 				checkRun({ name: "Unit tests", id: 1 }),
 				checkRun({ name: "Lint & type-check", id: 2 }),
 				checkRun({
-					name: "Record post-merge validation",
+					name: "Production install build (--omit=dev, from source)",
 					conclusion: "cancelled",
 					started_at: "2026-09-06T17:21:06Z",
 					id: 101527303167,
@@ -991,15 +1010,9 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 				checkRun({ name: "Unit tests", id: 1 }),
 				checkRun({ name: "Lint & type-check", id: 2 }),
 				checkRun({
-					name: "Record post-merge validation",
+					name: "Production install build (--omit=dev, from source)",
 					conclusion: "cancelled",
 					id: 3,
-				}),
-				checkRun({
-					name: "Production install build (--omit=dev, from source)",
-					status: "in_progress",
-					conclusion: null,
-					id: 4,
 				}),
 			],
 		};
@@ -1023,19 +1036,19 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 				checkRun({ name: "Unit tests", id: 1 }),
 				checkRun({ name: "Lint & type-check", id: 2 }),
 				checkRun({
-					name: "Record post-merge validation",
+					name: "Production install build (--omit=dev, from source)",
 					conclusion: "cancelled",
 					started_at: "2026-09-06T17:21:06Z",
 					id: 101527303167,
 				}),
 				checkRun({
-					name: "Record post-merge validation",
+					name: "Production install build (--omit=dev, from source)",
 					conclusion: "skipped",
 					started_at: "2026-09-06T17:25:29Z",
 					id: 101527918964,
 				}),
 				checkRun({
-					name: "Record post-merge validation",
+					name: "Production install build (--omit=dev, from source)",
 					conclusion: "skipped",
 					started_at: "2026-09-06T17:32:15Z",
 					id: 101528845721,
@@ -1045,7 +1058,7 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 		const verdict = computeVerdict(payload, undefined, "MERGEABLE");
 		expect(verdict.exitCode).toBe(EXIT_SUCCESS);
 		const row = verdict.rows.find(
-			(r) => r.name === "Record post-merge validation",
+			(r) => r.name === "Production install build (--omit=dev, from source)",
 		);
 		expect(row?.conclusion).toBe("skipped");
 	});
@@ -1056,7 +1069,7 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 				checkRun({ name: "Unit tests", id: 1 }),
 				checkRun({ name: "Lint & type-check", id: 2 }),
 				checkRun({
-					name: "Record post-merge validation",
+					name: "Production install build (--omit=dev, from source)",
 					conclusion: "cancelled",
 					id: 3,
 				}),
@@ -1489,7 +1502,6 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 			"Dependency boundaries",
 			"Close-keyword syntax",
 			"Changelog fragment (fast-fail)",
-			"Validate merge-train dispatch",
 			"Install test (ubuntu-latest)",
 			"Install test (windows-latest)",
 			"Install test (macos-latest)",
@@ -2211,6 +2223,16 @@ describe("run --wait — transient gh errors back off instead of exiting 70 (#29
 					comments: [],
 				});
 			if (String(args[1]).endsWith("/protection")) throw ghError("HTTP 404");
+			// #3754: the green head's one merge-queue read (a repository with no queue).
+			if (args[1] === "graphql")
+				return JSON.stringify({
+					data: {
+						repository: {
+							mergeQueue: null,
+							pullRequest: { isInMergeQueue: false, mergeQueueEntry: null },
+						},
+					},
+				});
 			// #3779: the advisory MUTATION read is not a check-runs call.
 			if (String(args[1]).endsWith("/comments")) return "[]";
 			checkRunsCalls += 1;
@@ -2604,6 +2626,8 @@ interface Gh3694Options {
 	committedAt?: string | null;
 	checkSuites?: unknown[] | null;
 	runsThrow?: boolean;
+	/** A raw `actions/runs` body, for the malformed-shape contract (#3861 F1). */
+	runsApiBody?: string | null;
 }
 
 function gh3694({
@@ -2615,6 +2639,7 @@ function gh3694({
 	committedAt = null,
 	checkSuites = null,
 	runsThrow = false,
+	runsApiBody = null,
 }: Gh3694Options = {}) {
 	const calls: string[] = [];
 	const ghExec = (args: string[]) => {
@@ -2629,7 +2654,7 @@ function gh3694({
 		if (endpoint.includes("/check-runs")) return JSON.stringify(checkRuns);
 		if (endpoint.includes("/actions/runs")) {
 			if (runsThrow) throw new Error("HTTP 502");
-			return JSON.stringify({ workflow_runs: workflowRuns });
+			return runsApiBody ?? JSON.stringify({ workflow_runs: workflowRuns });
 		}
 		if (endpoint.includes(`/commits/${sha}/check-suites`)) {
 			if (checkSuites === null) throw new Error("HTTP 502");
@@ -2900,5 +2925,1242 @@ describe("run — absent-required re-arm message (#3694)", () => {
 		expect(calls.some((call) => call.includes("/actions/runs"))).toBe(false);
 		expect(calls.some((call) => call.includes("autoMergeRequest"))).toBe(false);
 		expect(calls.some((call) => call.includes("/check-suites"))).toBe(false);
+	});
+});
+
+// #3861: the absent-required re-arm advice is WRONG when a `ci.yml` run for
+// the exact head is already registered -- the usual cause is runner
+// starvation or the concurrency group holding a cancelled run's `if:
+// always()` job, and an empty re-arm commit only adds a run to a saturated
+// queue (observed on PR #3842, 2026-09-30). The run lookup is one read of
+// the same `actions/runs?head_sha=` endpoint the fork-approval read already
+// uses; only a POSITIVE no-run answer authorizes re-arm, and an unreadable
+// lookup never does.
+const headRun = (overrides: Record<string, unknown> = {}) => ({
+	id: 4242,
+	name: "CI",
+	event: "pull_request",
+	head_sha: FORK_APPROVAL.sha,
+	status: "queued",
+	conclusion: null,
+	run_attempt: 1,
+	created_at: minutesBefore(45),
+	run_started_at: minutesBefore(45),
+	...overrides,
+});
+
+const armedAbsent = {
+	checkRuns: { check_runs: [] },
+	autoMergeRequest: {},
+	checkSuites: suitesAt(minutesBefore(45)),
+};
+
+describe("run — a registered ci.yml run suppresses the re-arm advice (#3861)", () => {
+	// N1: pin the exact rendered lines, never the formatter under test, so a
+	// formatter regression reds here.
+	const REARM_LINE = `required checks absent for 45 min on ${FORK_APPROVAL.sha} (auto-merge on) — push or merge master to re-arm`;
+	const REGISTERED_TAIL = "the run is registered, so no re-arm is needed";
+	const TERMINAL_TAIL =
+		"the run is terminal and cannot produce the missing check-runs -- inspect it or re-run it manually (gh run rerun 4242); the verdict never re-arms automatically";
+	const UNKNOWN_LINE = `required checks absent for 45 min on ${FORK_APPROVAL.sha} and the ci.yml run lookup was unreadable: no re-arm advice without a run answer`;
+	// The same literal through the fallback branch (auto-merge off or under the
+	// threshold) and the over-threshold branch: one rendered run line.
+	const QUEUED_LINE = `ci.yml run 4242 is queued (45 min old) for ${FORK_APPROVAL.sha}: ${REGISTERED_TAIL}`;
+
+	it.each([
+		["queued", "queued", REGISTERED_TAIL],
+		["in_progress", "in progress", REGISTERED_TAIL],
+		["completed", "completed", TERMINAL_TAIL],
+	] as const)(
+		"a %s run for the head prints run id and age, never re-arm",
+		async (status, label, tail) => {
+			const run_ = headRun({ status, run_started_at: minutesBefore(45) });
+			const { exitCode, reason } = await runVerdict(["3679"], {
+				...armedAbsent,
+				workflowRuns: [run_],
+			});
+			expect(exitCode).toBe(EXIT_PENDING);
+			expect(reason).toBe(
+				`ci.yml run 4242 is ${label} (45 min old) for ${FORK_APPROVAL.sha}: ${tail}`,
+			);
+			expect(reason).toContain(`run 4242 is ${label}`);
+			expect(reason).not.toContain("push or merge master to re-arm");
+		},
+	);
+
+	// F3: a terminal run cannot produce the missing check-runs, so it names the
+	// manual rerun instead of the false-comfort "no re-arm is needed", and it
+	// never fires an automatic re-arm (#3795 item 3 stays held).
+	it("a terminal run names the manual rerun and never says no re-arm is needed", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			workflowRuns: [headRun({ status: "completed", conclusion: "success" })],
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toContain("gh run rerun 4242");
+		expect(reason).toContain("never re-arms automatically");
+		expect(reason).not.toContain("no re-arm is needed");
+	});
+
+	it("a cancelled attempt for the head still suppresses the re-arm advice", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			workflowRuns: [headRun({ status: "completed", conclusion: "cancelled" })],
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(
+			`ci.yml run 4242 is cancelled (45 min old) for ${FORK_APPROVAL.sha}: ${TERMINAL_TAIL}`,
+		);
+		expect(reason).not.toContain("no re-arm is needed");
+		expect(reason).not.toContain("push or merge master to re-arm");
+	});
+
+	// F1: a 200 body that violates the documented `workflow_runs` shape is a
+	// contract violation, not the positive "none" that authorizes a re-arm.
+	it.each([
+		["an empty object", "{}"],
+		["a JSON null", "null"],
+		["a JSON array", "[]"],
+		["a bare total_count without workflow_runs", '{"total_count":0}'],
+		["a Not Found message", '{"message":"Not Found","documentation_url":"x"}'],
+		["an object where the array belongs", '{"workflow_runs":{}}'],
+		["a truncated body", '{"workflow_runs":['],
+	])(
+		"a %s actions/runs body is unreadable, never a positive none",
+		async (_label, body) => {
+			const { exitCode, reason } = await runVerdict(["3679"], {
+				...armedAbsent,
+				runsApiBody: body,
+			});
+			expect(exitCode).toBe(EXIT_PENDING);
+			expect(reason).toBe(UNKNOWN_LINE);
+			expect(reason).not.toContain("push or merge master to re-arm");
+		},
+	);
+
+	it("a valid empty workflow_runs array stays the positive none that re-arms", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			runsApiBody: JSON.stringify({ total_count: 0, workflow_runs: [] }),
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(REARM_LINE);
+	});
+
+	// F2: the fallback branch (auto-merge off, or under the threshold) used to
+	// append the same retarget clause while a run for the head was registered.
+	it("auto-merge off with a registered run prints the run line, not the retarget clause", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			workflowRuns: [headRun({ status: "queued" })],
+			checkRuns: { check_runs: [] },
+			autoMergeRequest: null,
+			checkSuites: suitesAt(minutesBefore(45)),
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(QUEUED_LINE);
+		expect(reason).not.toContain("push a commit or close/reopen to re-arm");
+	});
+
+	it("under the re-arm threshold with a registered run prints the run line, not the retarget clause", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			workflowRuns: [headRun({ status: "queued" })],
+			checkSuites: suitesAt(minutesBefore(2)),
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(QUEUED_LINE);
+		expect(reason).not.toContain("push a commit or close/reopen to re-arm");
+	});
+
+	// F2: a context with no head-run answer (the REST transport, or a legacy
+	// caller) is NOT evidence of a missing run: it must not re-arm.
+	it.each([
+		["null", null],
+		["absent", undefined],
+	] as const)(
+		"a %s head-run answer never authorizes a re-arm",
+		(_label, value) => {
+			const verdict = computeVerdict(
+				{ check_runs: [] },
+				undefined,
+				"MERGEABLE",
+				null,
+				null,
+				{
+					repository: "acme/repo",
+					sha: FORK_APPROVAL.sha,
+					actionRequiredRuns: [],
+					autoMerge: true,
+					absentMinutes: 45,
+					headRun: value,
+				},
+			);
+			expect(verdict.kind).toBe("pending");
+			expect(verdict.reason).not.toContain("push or merge master to re-arm");
+			expect(verdict.reason).not.toContain(
+				"push a commit or close/reopen to re-arm",
+			);
+		},
+	);
+
+	it("no run for the head still advises the re-arm", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			workflowRuns: [],
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(REARM_LINE);
+	});
+
+	it("an unreadable run lookup never advises the re-arm", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			runsThrow: true,
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(UNKNOWN_LINE);
+		expect(reason).not.toContain("push or merge master to re-arm");
+	});
+
+	it("a run for another head does not suppress the re-arm", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			workflowRuns: [headRun({ head_sha: "0".repeat(40) })],
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(REARM_LINE);
+	});
+
+	it("a merge_group run never counts as the head's ci.yml run", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			workflowRuns: [headRun({ event: "merge_group", id: 7 })],
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(REARM_LINE);
+	});
+
+	it("another workflow's run does not count as the head's ci.yml run", async () => {
+		const { exitCode, reason } = await runVerdict(["3679"], {
+			...armedAbsent,
+			workflowRuns: [headRun({ name: "CodeQL", id: 9 })],
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(reason).toBe(REARM_LINE);
+	});
+});
+
+// N2 (#3861): `readOpenPrs` names a malformed open-PR list instead of leaking a
+// bare SyntaxError; `run()`'s message-only catch then prints the named form.
+describe("readOpenPrs guards its JSON parse (#3861 N2)", () => {
+	it("throws a named error on a malformed open-PR list", () => {
+		expect(() => readOpenPrs(() => "not json")).toThrow(
+			/could not parse the open PR list JSON/,
+		);
+	});
+
+	it("returns the parsed list for a valid payload", () => {
+		expect(
+			readOpenPrs(() => JSON.stringify([{ number: 1, headRefOid: "abc" }])),
+		).toEqual([{ number: 1, headRefOid: "abc" }]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// #3754: the GitHub merge queue. The fixture is REAL: the `merge_group` runs
+// and jobs of github/docs (a public repo with a queue on `main`), fetched
+// 2026-09-30, so `head_branch` is the real `gh-readonly-queue/<base>/pr-<N>-<sha>`
+// shape and `mergeQueue{id}` is the real GraphQL answer. The queue was empty
+// when fetched, so the entry's `state`/`position` come from schema
+// introspection of MergeQueueEntry (see the fixture's own `graphqlNote`).
+// ---------------------------------------------------------------------------
+const MERGE_GROUP = JSON.parse(
+	readFileSync(
+		join(process.cwd(), "tests/fixtures/ci-verdict/merge-group-runs.real.json"),
+		"utf8",
+	),
+);
+const QUEUE_PR = "43130";
+const QUEUE_SHA = "c0ffee".padEnd(40, "0");
+const FAILED_JOB = MERGE_GROUP.failedRunJobs.find(
+	(job: { conclusion: string }) => job.conclusion === "failure",
+);
+// github/docs queues onto `main`; this repository's queue is on `master`, so
+// only the base segment of the real branch name is rewritten.
+const QUEUE_RUNS = MERGE_GROUP.workflow_runs.map(
+	(candidate: { head_branch: string }) => ({
+		...candidate,
+		head_branch: candidate.head_branch.replace(
+			"gh-readonly-queue/main/",
+			"gh-readonly-queue/master/",
+		),
+	}),
+);
+
+interface QueueFake {
+	enabled?: boolean;
+	/** The authoritative `isInMergeQueue` flag; defaults to `entry !== null`. */
+	inQueue?: boolean;
+	entry?: unknown;
+	runs?: unknown[];
+	pushedAt?: string;
+	checkRuns?: unknown;
+}
+function ghQueue({
+	enabled = true,
+	inQueue,
+	entry = null,
+	runs = [],
+	pushedAt = "2026-02-26T20:00:00Z",
+	checkRuns = BOTH_SUCCESS,
+}: QueueFake = {}) {
+	const isInMergeQueue = inQueue ?? entry !== null;
+	const calls: string[] = [];
+	const ghExec = (args: string[]) => {
+		calls.push(args.join(" "));
+		if (args[0] === "repo") return "acme/repo";
+		if (args[0] === "pr" && args.includes("autoMergeRequest"))
+			return JSON.stringify({ autoMergeRequest: {} });
+		if (args[0] === "pr" && args.includes("headRefOid,labels,comments"))
+			return JSON.stringify({
+				headRefOid: QUEUE_SHA,
+				labels: [],
+				comments: [],
+			});
+		if (args[0] === "pr")
+			return JSON.stringify({ headRefOid: QUEUE_SHA, mergeable: "MERGEABLE" });
+		if (args[1] === "graphql")
+			return JSON.stringify({
+				data: {
+					repository: {
+						mergeQueue: enabled ? { id: "MQ_kwDOC01lZ80xjw" } : null,
+						pullRequest: {
+							isInMergeQueue,
+							mergeQueueEntry: entry,
+						},
+					},
+				},
+			});
+		const endpoint = String(args.at(-1));
+		if (endpoint.endsWith("/protection")) throw new Error("HTTP 404");
+		if (endpoint.includes("/check-runs")) return JSON.stringify(checkRuns);
+		if (endpoint.includes("/check-suites"))
+			return JSON.stringify({ check_suites: [{ created_at: pushedAt }] });
+		if (endpoint.includes("/actions/runs?event=merge_group"))
+			return JSON.stringify({ workflow_runs: runs });
+		if (
+			endpoint.endsWith(`/actions/runs/${QUEUE_RUNS[0].id}/jobs?per_page=100`)
+		)
+			return JSON.stringify({ jobs: MERGE_GROUP.failedRunJobs });
+		if (/\/actions\/runs\/\d+\/jobs/.test(endpoint))
+			return JSON.stringify({ jobs: [] });
+		if (endpoint.endsWith(`/actions/jobs/${FAILED_JOB.id}`))
+			return JSON.stringify({
+				steps: [{ name: "Run content linter", conclusion: "failure" }],
+			});
+		if (endpoint.endsWith(`/actions/jobs/${FAILED_JOB.id}/logs`))
+			return " FAIL  default  tests/content/linter.test.ts > flags a broken link\n";
+		throw new Error(`unmocked gh call: ${args.join(" ")}`);
+	};
+	return { ghExec, calls };
+}
+async function runQueue(options: QueueFake = {}) {
+	const { ghExec, calls } = ghQueue(options);
+	const lines: string[] = [];
+	const { code: exitCode, kind } = await run({
+		argv: [QUEUE_PR],
+		ghExec,
+		stdout: (line: string) => lines.push(line),
+		stderr: () => {},
+	});
+	return {
+		exitCode,
+		kind,
+		out: lines.join("\n"),
+		reason: lines.at(-1) ?? "",
+		calls,
+	};
+}
+const graphqlCalls = (calls: string[]) =>
+	calls.filter((call) => call.startsWith("api graphql")).length;
+
+describe("run — merge queue states (#3754)", () => {
+	// Recurrence it prevents: with the queue on, a PR that was enqueued still
+	// shows a green head, so a reader concluded "done" (exit 0) while the
+	// merge_group run, the thing that actually merges it, was still running.
+	it("reports a PR in the queue as pending with its queue state, not as success", async () => {
+		const { exitCode, kind, reason } = await runQueue({
+			entry: { state: "AWAITING_CHECKS", position: 2 },
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		// F2: the plain `ci-verdict <pr>` line must carry this kind, not `pending`.
+		expect(kind).toBe("in-queue");
+		expect(reason).toContain(
+			"in the merge queue (awaiting_checks, position 2)",
+		);
+		expect(reason).toContain("neither absent nor done");
+	});
+
+	// #3765 F1: `isInMergeQueue` is the authoritative state; a null
+	// `mergeQueueEntry` (or absent/garbage metadata) must not read green again.
+	it("reports a queued PR as in-queue when the entry object is absent", async () => {
+		const { exitCode, kind, reason } = await runQueue({
+			inQueue: true,
+			entry: null,
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(kind).toBe("in-queue");
+		expect(reason).toContain("in the merge queue (queued)");
+	});
+
+	it("reads broken entry metadata defensively without leaving the queue", async () => {
+		const { exitCode, kind, reason } = await runQueue({
+			inQueue: true,
+			entry: { state: 42, position: "behind" },
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(kind).toBe("in-queue");
+		expect(reason).toContain("in the merge queue (queued)");
+		expect(reason).not.toContain("position");
+	});
+
+	it("ignores a stray entry object when the flag is false", async () => {
+		const { exitCode, kind } = await runQueue({
+			inQueue: false,
+			entry: { state: "AWAITING_CHECKS", position: 2 },
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(kind).toBe("green");
+	});
+
+	// #3765 F2: the named `in-queue` kind is the one exception to the coarse
+	// exit-code table; `cancelled` and `infra-rerun` still read `pending`.
+	it("keeps the coarse exit-line kind for non-queue verdicts", async () => {
+		const pending = await runQueue({
+			checkRuns: {
+				check_runs: [
+					checkRun({
+						name: "Unit tests",
+						status: "in_progress",
+						conclusion: null,
+					}),
+					checkRun({ name: "Lint & type-check", id: 2 }),
+				],
+			},
+		});
+		expect(pending.kind).toBe("pending");
+		const red = await runQueue({
+			checkRuns: {
+				check_runs: [
+					checkRun({ name: "Unit tests", conclusion: "failure", id: 1 }),
+					checkRun({ name: "Lint & type-check", id: 2 }),
+				],
+			},
+		});
+		expect(red.kind).toBe("red");
+	});
+
+	// Recurrence: a failed queue run ejects the PR, leaving a green head and no
+	// queue entry -- indistinguishable from "eligible" without reading the
+	// merge_group run. It must be a FAIL event that names the failing job and
+	// test, like any red PR run.
+	it("reports a failed queue run of this head as FAIL, naming the failing job and test", async () => {
+		const { exitCode, out, reason } = await runQueue({
+			runs: QUEUE_RUNS.filter(
+				(candidate: { conclusion: string }) =>
+					candidate.conclusion === "failure",
+			),
+		});
+		expect(exitCode).toBe(EXIT_FAILURE);
+		expect(reason).toContain("merge queue run failed and ejected the PR");
+		expect(reason).toContain(QUEUE_RUNS[0].html_url);
+		expect(out).toContain(
+			`${FAILED_JOB.name} (job ${FAILED_JOB.id}): failed step: Run content linter`,
+		);
+		expect(out).toContain("  FAIL  default  tests/content/linter.test.ts");
+	});
+
+	// Recurrence: a queue failure from BEFORE the head's last push belongs to an
+	// earlier head; counting it would fail every PR that was ever ejected.
+	it("ignores a failed queue run that began before this head was pushed", async () => {
+		const { exitCode } = await runQueue({
+			runs: QUEUE_RUNS,
+			pushedAt: "2026-09-30T00:00:00Z",
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+	});
+
+	// Recurrence: a PR queued twice (ejected, fixed, re-queued) has failed runs
+	// on TWO queue branches; naming the older attempt's run as current sends the
+	// reader to a log the latest head never produced.
+	it("names only the latest queue attempt's failed runs", async () => {
+		const older = {
+			...QUEUE_RUNS[1],
+			id: 1,
+			html_url: "https://github.com/acme/repo/actions/runs/1",
+			head_branch: "gh-readonly-queue/master/pr-43130-aaaaaaaa",
+			created_at: "2026-02-26T20:10:00Z",
+		};
+		const { exitCode, reason } = await runQueue({
+			runs: [older, QUEUE_RUNS[0]],
+		});
+		expect(exitCode).toBe(EXIT_FAILURE);
+		expect(reason).toContain(QUEUE_RUNS[0].html_url);
+		expect(reason).not.toContain(older.html_url);
+	});
+
+	// Recurrence: branch-prefix matching by bare `pr-<N>`: `pr-4313` must not
+	// claim PR 43130's queue run.
+	it("does not claim another PR's queue run (pr-4313 vs pr-43130)", async () => {
+		const { ghExec } = ghQueue({ runs: QUEUE_RUNS });
+		const lines: string[] = [];
+		const { code: exitCode } = await run({
+			argv: ["4313"],
+			ghExec: (args: string[]) =>
+				args[0] === "pr" && args.includes("headRefOid,labels,comments")
+					? JSON.stringify({ headRefOid: QUEUE_SHA, labels: [], comments: [] })
+					: ghExec(args),
+			stdout: (line: string) => lines.push(line),
+			stderr: () => {},
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+	});
+
+	// #3694's cost guard, kept: a repository with no queue pays exactly the one
+	// GraphQL read on a green head, and nothing on a red or pending one.
+	it("costs one GraphQL read on a green head without a queue, and none on a red or pending head", async () => {
+		const green = await runQueue({ enabled: false });
+		expect(green.exitCode).toBe(EXIT_SUCCESS);
+		expect(graphqlCalls(green.calls)).toBe(1);
+		expect(green.calls.some((call) => call.includes("/actions/runs"))).toBe(
+			false,
+		);
+		expect(green.calls.some((call) => call.includes("/check-suites"))).toBe(
+			false,
+		);
+		const red = await runQueue({
+			checkRuns: {
+				check_runs: [
+					checkRun({ name: "Unit tests", conclusion: "failure", id: 1 }),
+					checkRun({ name: "Lint & type-check", id: 2 }),
+				],
+			},
+		});
+		expect(red.exitCode).toBe(EXIT_FAILURE);
+		expect(graphqlCalls(red.calls)).toBe(0);
+		const pending = await runQueue({
+			checkRuns: {
+				check_runs: [
+					checkRun({
+						name: "Unit tests",
+						status: "in_progress",
+						conclusion: null,
+					}),
+					checkRun({ name: "Lint & type-check", id: 2 }),
+				],
+			},
+		});
+		expect(pending.exitCode).toBe(EXIT_PENDING);
+		expect(graphqlCalls(pending.calls)).toBe(0);
+	});
+
+	// Recurrence: an unreadable queue answer must not turn a green head red or
+	// pending: every queue read fails open to the pre-queue verdict.
+	it("fails open to success when the queue read is unreadable", async () => {
+		const { ghExec } = ghQueue();
+		const { code: exitCode } = await run({
+			argv: [QUEUE_PR],
+			ghExec: (args: string[]) => {
+				if (args[1] === "graphql") throw new Error("HTTP 502");
+				return ghExec(args);
+			},
+			stdout: () => {},
+			stderr: () => {},
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+	});
+
+	// Same guard for the second queue read: a failed `merge_group` runs lookup
+	// must not turn a green head into a transport error (exit 70).
+	it("fails open to success when the merge_group runs read fails", async () => {
+		const { ghExec } = ghQueue({ runs: QUEUE_RUNS });
+		const { code: exitCode } = await run({
+			argv: [QUEUE_PR],
+			ghExec: (args: string[]) => {
+				if (String(args.at(-1)).includes("event=merge_group"))
+					throw new Error("HTTP 502");
+				return ghExec(args);
+			},
+			stdout: () => {},
+			stderr: () => {},
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+	});
+
+	// The real GraphQL answer of a repository whose queue is empty must parse to
+	// "enabled, not in the queue".
+	it("parses the real GraphQL mergeQueue answer", () => {
+		const state = readMergeQueueState(QUEUE_PR, "acme/repo", () =>
+			JSON.stringify(MERGE_GROUP.graphqlMergeQueue),
+		);
+		expect(state).toEqual({ enabled: true, entry: null });
+		expect(readMergeQueueState("abc1234", "acme/repo", () => "{}")).toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// #3754: the two queue reads and the queue branch as units. The `run`-level
+// cases above prove the verdict; these pin the internal contract of each read
+// (its exact argv and record shape) and the queue branch's `kind`, so a mutant
+// that only changes a field, a flag, or a boundary has a witness.
+// ---------------------------------------------------------------------------
+const NONE_QUEUE = { failedRuns: [], failedRows: [] };
+const QUEUE_RUN_URL = "https://github.com/acme/repo/actions/runs/555";
+const queueRun = (overrides: Record<string, unknown> = {}) => ({
+	id: 555,
+	html_url: QUEUE_RUN_URL,
+	head_branch: `gh-readonly-queue/master/pr-${QUEUE_PR}-abc`,
+	conclusion: "failure",
+	created_at: "2026-02-26T20:30:00Z",
+	...overrides,
+});
+const QUEUE_JOBS = [
+	{
+		id: 9,
+		name: "Unit tests",
+		conclusion: "failure",
+		html_url: "https://github.com/acme/repo/actions/runs/555/job/9",
+	},
+	{
+		id: 10,
+		name: "Lint",
+		conclusion: "success",
+		html_url: "https://github.com/acme/repo/actions/runs/555/job/10",
+	},
+];
+
+interface ArgCall {
+	args: string[];
+	options?: { timeoutMs?: number; maxBuffer?: number };
+}
+
+function argCaptured(answer: (args: string[]) => string): {
+	calls: ArgCall[];
+	ghExec: (args: string[], options?: { timeoutMs?: number }) => string;
+} {
+	const calls: ArgCall[] = [];
+	return {
+		calls,
+		ghExec: (args, options) => {
+			calls.push({ args, options });
+			return answer(args);
+		},
+	};
+}
+
+describe("readMergeQueueState — the queue read's exact shape (#3754)", () => {
+	it("asks one GraphQL read with typed -F numbers and -f strings", () => {
+		const { calls, ghExec } = argCaptured(() =>
+			JSON.stringify({
+				data: {
+					repository: {
+						mergeQueue: { id: "MQ_x" },
+						pullRequest: { isInMergeQueue: false, mergeQueueEntry: null },
+					},
+				},
+			}),
+		);
+		readMergeQueueState(QUEUE_PR, "acme/repo", ghExec, 1234);
+		expect(calls).toHaveLength(1);
+		const { args, options } = calls[0];
+		expect(args.slice(0, 3)).toEqual(["api", "graphql", "-f"]);
+		expect(args[3].startsWith("query=")).toBe(true);
+		expect(args[3]).toContain("mergeQueue(branch:");
+		expect(args.slice(4)).toEqual([
+			"-f",
+			"owner=acme",
+			"-f",
+			"name=repo",
+			"-f",
+			"branch=master",
+			"-F",
+			"number=43130",
+		]);
+		expect(options).toEqual({ timeoutMs: 1234 });
+	});
+
+	it("returns null without a read for a non-PR target", () => {
+		const { calls, ghExec } = argCaptured(() => "{}");
+		expect(readMergeQueueState("abc1234", "acme/repo", ghExec)).toBeNull();
+		expect(calls).toEqual([]);
+	});
+
+	it("returns null for unreadable, shapeless, and null-repository answers", () => {
+		expect(
+			readMergeQueueState(QUEUE_PR, "acme/repo", () => "not json"),
+		).toBeNull();
+		expect(
+			readMergeQueueState(QUEUE_PR, "acme/repo", () =>
+				JSON.stringify({ data: {} }),
+			),
+		).toBeNull();
+		expect(
+			readMergeQueueState(QUEUE_PR, "acme/repo", () =>
+				JSON.stringify({ data: { repository: null } }),
+			),
+		).toBeNull();
+	});
+
+	it("reads an enabled queue and a PR's entry", () => {
+		const state = readMergeQueueState(QUEUE_PR, "acme/repo", () =>
+			JSON.stringify({
+				data: {
+					repository: {
+						mergeQueue: { id: "MQ_x" },
+						pullRequest: {
+							isInMergeQueue: true,
+							mergeQueueEntry: { state: "AWAITING_CHECKS", position: 2 },
+						},
+					},
+				},
+			}),
+		);
+		expect(state).toEqual({
+			enabled: true,
+			entry: { state: "AWAITING_CHECKS", position: 2 },
+		});
+	});
+
+	// #3765 F1: the entry is derived from the authoritative `isInMergeQueue`
+	// flag, never gated on the nullable `mergeQueueEntry` object.
+	it("derives the entry from isInMergeQueue, not from mergeQueueEntry", () => {
+		const answer = (pullRequest: unknown) =>
+			JSON.stringify({
+				data: { repository: { mergeQueue: { id: "MQ_x" }, pullRequest } },
+			});
+		expect(
+			readMergeQueueState(QUEUE_PR, "acme/repo", () =>
+				answer({ isInMergeQueue: true, mergeQueueEntry: null }),
+			),
+		).toEqual({ enabled: true, entry: { state: null, position: null } });
+		expect(
+			readMergeQueueState(QUEUE_PR, "acme/repo", () =>
+				answer({
+					isInMergeQueue: false,
+					mergeQueueEntry: { state: "AWAITING_CHECKS", position: 1 },
+				}),
+			),
+		).toEqual({ enabled: true, entry: null });
+	});
+});
+
+describe("fetchFailedQueueRuns — the failed-queue-run read (#3754)", () => {
+	const pushMs = Date.parse("2026-02-26T20:00:00Z");
+	const runsAnswer = (runs: unknown[]) => (args: string[]) =>
+		String(args.at(-1)).includes("event=merge_group")
+			? JSON.stringify({ workflow_runs: runs })
+			: JSON.stringify({ jobs: QUEUE_JOBS });
+
+	it("returns the exact empty record and makes no call for a non-PR or unreadable age", () => {
+		const { calls, ghExec } = argCaptured(() => "{}");
+		expect(
+			fetchFailedQueueRuns("abc1234", "acme/repo", pushMs, ghExec),
+		).toEqual(NONE_QUEUE);
+		expect(
+			fetchFailedQueueRuns(QUEUE_PR, "acme/repo", Number.NaN, ghExec),
+		).toEqual(NONE_QUEUE);
+		expect(calls).toEqual([]);
+	});
+
+	it("reads the merge_group runs and the failed job names, with exact argv", () => {
+		const { calls, ghExec } = argCaptured(runsAnswer([queueRun()]));
+		const result = fetchFailedQueueRuns(
+			QUEUE_PR,
+			"acme/repo",
+			pushMs,
+			ghExec,
+			4321,
+		);
+		expect(result.failedRuns).toEqual([{ id: 555, url: QUEUE_RUN_URL }]);
+		expect(result.failedRows).toHaveLength(1);
+		expect(result.failedRows[0]).toEqual({
+			name: "Unit tests",
+			present: true,
+			id: 9,
+			status: "completed",
+			conclusion: "failure",
+			url: "https://github.com/acme/repo/actions/runs/555/job/9",
+			detailsUrl: "https://github.com/acme/repo/actions/runs/555/job/9",
+			gating: true,
+		});
+		expect(calls[0].args).toEqual([
+			"api",
+			"repos/acme/repo/actions/runs?event=merge_group&status=completed&per_page=50",
+		]);
+		expect(calls[0].options).toEqual({ timeoutMs: 4321 });
+		expect(calls[1].args).toEqual([
+			"api",
+			"repos/acme/repo/actions/runs/555/jobs?per_page=100",
+		]);
+		expect(calls[1].options).toEqual({ timeoutMs: 4321 });
+	});
+
+	it("excludes a run that succeeded and returns no rows when every job succeeded", () => {
+		const successRun = argCaptured(
+			runsAnswer([queueRun({ conclusion: "success" })]),
+		);
+		expect(
+			fetchFailedQueueRuns(QUEUE_PR, "acme/repo", pushMs, successRun.ghExec),
+		).toEqual(NONE_QUEUE);
+		// A failing run whose every job succeeded yields no failing rows, so the
+		// function returns the exact empty record, not a run with empty rows.
+		const noFailedJobs = argCaptured((args) =>
+			String(args.at(-1)).includes("event=merge_group")
+				? JSON.stringify({ workflow_runs: [queueRun()] })
+				: JSON.stringify({
+						jobs: [{ ...QUEUE_JOBS[1], conclusion: "success" }],
+					}),
+		);
+		expect(
+			fetchFailedQueueRuns(QUEUE_PR, "acme/repo", pushMs, noFailedJobs.ghExec),
+		).toEqual(NONE_QUEUE);
+	});
+
+	it("includes a failure created at exactly the push time and excludes an earlier one", () => {
+		const atPush = queueRun({ created_at: new Date(pushMs).toISOString() });
+		const before = queueRun({
+			id: 556,
+			created_at: new Date(pushMs - 1).toISOString(),
+		});
+		const { ghExec } = argCaptured(runsAnswer([atPush, before]));
+		const result = fetchFailedQueueRuns(QUEUE_PR, "acme/repo", pushMs, ghExec);
+		expect(result.failedRuns.map((run) => run.id)).toEqual([555]);
+	});
+
+	it("returns the exact empty record when the read throws", () => {
+		expect(
+			fetchFailedQueueRuns(QUEUE_PR, "acme/repo", pushMs, () => {
+				throw new Error("HTTP 502");
+			}),
+		).toEqual(NONE_QUEUE);
+	});
+});
+
+describe("computeVerdict — queue context shapes (#3754)", () => {
+	const verdictWith = (
+		queueContext:
+			| { entry?: { state: string | null; position: number | null } }
+			| { failedRows?: unknown[] }
+			| (() => unknown)
+			| null,
+	) =>
+		computeVerdict(
+			BOTH_SUCCESS,
+			["Unit tests", "Lint & type-check"],
+			"MERGEABLE",
+			null,
+			null,
+			null,
+			null,
+			queueContext as never,
+		);
+
+	it("names the in-queue kind", () => {
+		const verdict = verdictWith(() => ({
+			entry: { state: "AWAITING_CHECKS", position: 2 },
+		}));
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.kind).toBe("in-queue");
+		expect(verdict.reason).toContain("position 2");
+	});
+
+	it("names the failed kind, carries the queue rows, and joins runs and names", () => {
+		const failedRows = [
+			{
+				name: "Unit tests",
+				present: true,
+				id: 9,
+				status: "completed",
+				conclusion: "failure",
+				url: "u",
+				gating: true,
+			},
+			{
+				name: "Lint & type-check",
+				present: true,
+				id: 10,
+				status: "completed",
+				conclusion: "failure",
+				url: "v",
+				gating: true,
+			},
+		];
+		const verdict = verdictWith(() => ({
+			failedRuns: [
+				{ id: 1, url: "r1" },
+				{ id: 2, url: "r2" },
+			],
+			failedRows,
+		}));
+		expect(verdict.exitCode).toBe(EXIT_FAILURE);
+		expect(verdict.kind).toBe("failed");
+		expect(verdict.failingRows).toBe(failedRows);
+		expect(verdict.reason).toContain("r1, r2");
+		expect(verdict.reason).toContain("Unit tests, Lint & type-check");
+	});
+
+	it("treats a queue context with no entry and no failed rows as success", () => {
+		const verdict = verdictWith(() => ({}));
+		expect(verdict.exitCode).toBe(EXIT_SUCCESS);
+		expect(verdict.kind).toBe("success");
+	});
+
+	it("formats a null queue state without a position", () => {
+		const verdict = verdictWith(() => ({
+			entry: { state: null, position: null },
+		}));
+		expect(verdict.reason).toContain("in the merge queue (queued)");
+	});
+
+	it("joins multiple post-merge noise rows", () => {
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					checkRun({ name: "flake watch", id: 11 }),
+					checkRun({ name: "nightly smoke", id: 12 }),
+				],
+			},
+			[],
+			"MERGEABLE",
+			null,
+			null,
+			null,
+			new Set([11, 12]),
+		);
+		expect(verdict.exitCode).toBe(EXIT_SUCCESS);
+		expect(verdict.reason).toContain("flake watch, nightly smoke");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// #3861 added-line mutation coverage (direct unit seams)
+//
+// The `run`-level #3861 suites above drive the whole path with one run at a
+// time; they leave the formatter ternaries, the multi-run head selection, the
+// status mapping, the malformed-response direction, and the argv contract
+// unnamed. Each block below drives the REAL exported seam and pins the literal
+// result, so the mutation it names cannot survive.
+// ---------------------------------------------------------------------------
+
+const HEAD_SHA = "a".repeat(40);
+
+const workflowRun = (
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+	id: 1,
+	name: "CI",
+	event: "pull_request",
+	head_sha: HEAD_SHA,
+	status: "completed",
+	conclusion: "success",
+	run_attempt: 1,
+	created_at: "2026-01-01T00:00:00Z",
+	run_started_at: "2026-01-01T00:00:00Z",
+	...overrides,
+});
+
+const headRunsBody = (runs: Array<Record<string, unknown> | null>) =>
+	JSON.stringify({ total_count: runs.length, workflow_runs: runs });
+
+describe("formatAbsentRunReason — unnamed run, omitted age, terminal rerun text (#3861)", () => {
+	it("names an unnamed terminal run and appends no rerun command", () => {
+		const text = formatAbsentRunReason({
+			state: "completed",
+			id: null,
+			ageMinutes: null,
+			sha: "abc123",
+		});
+		expect(text).toBe(
+			"ci.yml an unnamed run is completed for abc123: the run is terminal and cannot produce the missing check-runs -- inspect it; the verdict never re-arms automatically",
+		);
+		expect(text).not.toContain("Stryker");
+		expect(text).not.toContain("gh run rerun");
+	});
+
+	it("names an unnamed registered run with no age text", () => {
+		const text = formatAbsentRunReason({
+			state: "queued",
+			id: null,
+			ageMinutes: null,
+			sha: "abc123",
+		});
+		expect(text).toBe(
+			"ci.yml an unnamed run is queued for abc123: the run is registered, so no re-arm is needed",
+		);
+		expect(text).not.toContain("Stryker");
+	});
+});
+
+describe("computeVerdict — the absent-required re-arm threshold is inclusive (#3861 C2)", () => {
+	it("at exactly the threshold a registered unknown run names the unreadable lookup", () => {
+		const verdict = computeVerdict(
+			{ check_runs: [] },
+			undefined,
+			"MERGEABLE",
+			null,
+			null,
+			{
+				repository: "acme/repo",
+				sha: HEAD_SHA,
+				actionRequiredRuns: [],
+				autoMerge: true,
+				absentMinutes: ABSENT_REQUIRED_REARM_MINUTES,
+				headRun: { state: "unknown", id: null, ageMinutes: null },
+			},
+		);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.reason).toBe(
+			`required checks absent for ${ABSENT_REQUIRED_REARM_MINUTES} min on ${HEAD_SHA} and the ci.yml run lookup was unreadable: no re-arm advice without a run answer`,
+		);
+	});
+});
+
+describe("resolveHeadSha — malformed PR view JSON (#3861 D)", () => {
+	it("throws a named error rather than returning a fallback object", () => {
+		expect(() => resolveHeadSha("2539", () => "not json")).toThrow(
+			/could not parse the PR view JSON for 2539/,
+		);
+	});
+});
+
+describe("fetchCheckRunsPayload — malformed check-runs JSON (#3861 E)", () => {
+	it("throws a named error rather than returning an empty payload", () => {
+		expect(() =>
+			fetchCheckRunsPayload("acme/repo", "deadbeef", () => "not json"),
+		).toThrow(/could not parse the check-runs JSON for deadbeef \(page 1\)/);
+	});
+});
+
+describe("fetchHeadRuns — the head's latest ci.yml run (#3861 F)", () => {
+	const attemptRun = (
+		id: number,
+		run_attempt: number,
+		created_at: string,
+		run_started_at: string,
+	) =>
+		workflowRun({
+			id,
+			run_attempt,
+			created_at,
+			run_started_at,
+			status: "completed",
+			conclusion: "success",
+		});
+	const orderedRuns = [
+		attemptRun(1, 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+		attemptRun(2, 2, "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"),
+		// The latest run's run_started_at deliberately differs from its
+		// created_at: `startedAtMs` must prefer run_started_at.
+		attemptRun(3, 3, "2026-01-03T00:00:00Z", "2026-01-04T00:00:00Z"),
+	];
+
+	it("picks the latest attempt from every input order", () => {
+		for (const order of [
+			[0, 1, 2],
+			[0, 2, 1],
+			[1, 0, 2],
+			[1, 2, 0],
+			[2, 0, 1],
+			[2, 1, 0],
+		]) {
+			const result = fetchHeadRuns("acme/repo", HEAD_SHA, () =>
+				headRunsBody(order.map((index) => orderedRuns[index]!)),
+			);
+			expect(result.headRun.id, `input order ${order}`).toBe(3);
+			expect(result.headRun.startedAtMs, `input order ${order}`).toBe(
+				Date.parse("2026-01-04T00:00:00Z"),
+			);
+		}
+	});
+
+	// The tie-break: two runs for the SAME attempt (GitHub can report a rerun
+	// this way) resolve by ascending created_at, never by input order.
+	const sameAttempt = [
+		workflowRun({
+			id: 11,
+			run_attempt: 1,
+			created_at: "2026-01-01T00:00:00Z",
+			run_started_at: "2026-01-01T00:00:00Z",
+		}),
+		workflowRun({
+			id: 12,
+			run_attempt: 1,
+			created_at: "2026-01-02T00:00:00Z",
+			run_started_at: "2026-01-02T00:00:00Z",
+		}),
+	];
+
+	it("breaks a same-attempt tie by created_at from either input order", () => {
+		for (const order of [
+			[0, 1],
+			[1, 0],
+		]) {
+			const result = fetchHeadRuns("acme/repo", HEAD_SHA, () =>
+				headRunsBody(order.map((index) => sameAttempt[index]!)),
+			);
+			expect(result.headRun.id, `input order ${order}`).toBe(12);
+		}
+	});
+
+	it("orders by run_attempt first, never by created_at when attempts differ", () => {
+		// A rerun (attempt 2) created EARLIER than its original (attempt 1): the
+		// attempt ladder, not the clock, chooses the latest.
+		const original = workflowRun({
+			id: 21,
+			run_attempt: 1,
+			created_at: "2026-01-02T00:00:00Z",
+			run_started_at: "2026-01-02T00:00:00Z",
+		});
+		const rerun = workflowRun({
+			id: 22,
+			run_attempt: 2,
+			created_at: "2026-01-01T00:00:00Z",
+			run_started_at: "2026-01-01T00:00:00Z",
+		});
+		const result = fetchHeadRuns("acme/repo", HEAD_SHA, () =>
+			headRunsBody([original, rerun]),
+		);
+		expect(result.headRun.id).toBe(22);
+	});
+});
+
+describe("fetchHeadRuns — status mapping (#3861 G)", () => {
+	it.each([
+		["queued", "queued"],
+		["waiting", "queued"],
+		["requested", "queued"],
+		["in_progress", "in_progress"],
+		["completed", "completed"],
+		["pending", "unknown"],
+	])("maps a %j status to %s", (status, expected) => {
+		const result = fetchHeadRuns("acme/repo", HEAD_SHA, () =>
+			headRunsBody([workflowRun({ status, conclusion: null })]),
+		);
+		expect(result.headRun.state).toBe(expected);
+	});
+
+	it("maps a completed cancelled run to cancelled", () => {
+		const result = fetchHeadRuns("acme/repo", HEAD_SHA, () =>
+			headRunsBody([
+				workflowRun({ status: "completed", conclusion: "cancelled" }),
+			]),
+		);
+		expect(result.headRun.state).toBe("cancelled");
+	});
+});
+
+describe("fetchHeadRuns — off-schema responses and null elements (#3861 H)", () => {
+	it.each([
+		["an empty object", "{}"],
+		["a JSON null", "null"],
+		["an object where the array belongs", '{"workflow_runs":{}}'],
+	])("rethrows the named malformed error for %s", (_label, body) => {
+		expect(() =>
+			fetchActionRequiredRuns(
+				"acme/repo",
+				HEAD_SHA,
+				() => body,
+				undefined,
+				false,
+			),
+		).toThrow(
+			/malformed actions\/runs response: workflow_runs is not an array/,
+		);
+	});
+
+	it("keeps the real run when the head's list carries a null element", () => {
+		const real = workflowRun({
+			id: 77,
+			status: "in_progress",
+			conclusion: null,
+		});
+		const result = fetchHeadRuns("acme/repo", HEAD_SHA, () =>
+			headRunsBody([null, real]),
+		);
+		expect(result.headRun.id).toBe(77);
+		expect(result.headRun.state).toBe("in_progress");
+	});
+});
+
+describe("fetchRerunState — the exact ci.yml head runs form the ladder (#3861 I)", () => {
+	it("keeps only the CI workflow's exact-head runs and reports the latest attempt", () => {
+		const result = fetchRerunState("acme/repo", HEAD_SHA, () =>
+			JSON.stringify({
+				total_count: 5,
+				workflow_runs: [
+					workflowRun({
+						id: 10,
+						run_attempt: 1,
+						status: "completed",
+						conclusion: "failure",
+					}),
+					workflowRun({
+						id: 11,
+						run_attempt: 2,
+						status: "in_progress",
+						conclusion: null,
+					}),
+					workflowRun({
+						id: 20,
+						name: "CodeQL",
+						run_attempt: 5,
+						status: "completed",
+						conclusion: "failure",
+					}),
+					workflowRun({
+						id: 30,
+						head_sha: "b".repeat(40),
+						run_attempt: 6,
+						status: "completed",
+						conclusion: "failure",
+					}),
+					null,
+				],
+			}),
+		);
+		expect(result).toEqual({
+			originalFailed: true,
+			latestAttempt: {
+				status: "in_progress",
+				conclusion: null,
+				run_attempt: 2,
+			},
+		});
+	});
+});
+
+describe("readOpenPrs — the exact pr list argv and caller timeout (#3861 K)", () => {
+	it("passes the exact argv and the caller's timeoutMs", () => {
+		const calls: Array<{ args: string[]; options: unknown }> = [];
+		const ghExec = (args: string[], options: unknown) => {
+			calls.push({ args, options });
+			return "[]";
+		};
+		expect(readOpenPrs(ghExec, 12_345)).toEqual([]);
+		expect(calls).toEqual([
+			{
+				args: [
+					"pr",
+					"list",
+					"--state",
+					"open",
+					"--limit",
+					"100",
+					"--json",
+					"number,author,headRefOid,autoMergeRequest",
+				],
+				options: { timeoutMs: 12_345 },
+			},
+		]);
 	});
 });

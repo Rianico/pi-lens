@@ -15,7 +15,7 @@
  *                      them; `TLA+ models` model-checks only then.
  *
  * Direction of every doubt is FULL SUITE (AGENTS.md shape 48): a non-PR event
- * (push to master, merge_group, repository_dispatch), an unreadable file list,
+ * (push to master, merge_group), an unreadable file list,
  * an empty list, a list at GitHub's 3000-file cap, or any path this file does
  * not recognise as docs all give code=true. The script exits 0 in each of
  * those cases; only bad arguments exit 2.
@@ -124,8 +124,20 @@ export function pathsFromPrFiles(files) {
 	return paths;
 }
 
-function ghPrFiles(repo, pr) {
-	const raw = execFileSync(
+/**
+ * One `pulls/{n}/files` read: `gh api --jq '.[]'` prints one JSON object per
+ * line. A malformed line is an unreadable file list, not an empty one, so it
+ * throws and `run()` falls back to the full suite (AGENTS.md shape 48). `exec`
+ * is injectable so a test can prove the malformed-line direction without a
+ * real `gh`.
+ *
+ * @param {string} repo
+ * @param {string} pr
+ * @param {(file: string, args: string[], options: { encoding: string; timeout: number; maxBuffer: number }) => string} [exec]
+ * @returns {string[]}
+ */
+export function ghPrFiles(repo, pr, exec = execFileSync) {
+	const raw = exec(
 		"gh",
 		[
 			"api",
@@ -136,12 +148,21 @@ function ghPrFiles(repo, pr) {
 		],
 		{ encoding: "utf8", timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
 	);
-	return pathsFromPrFiles(
-		raw
-			.split("\n")
-			.filter((line) => line.trim() !== "")
-			.map((line) => JSON.parse(line)),
-	);
+	const files = [];
+	for (const line of raw.split("\n")) {
+		if (line.trim() === "") continue;
+		try {
+			files.push(JSON.parse(line));
+		} catch (error) {
+			// `gh api --jq '.[]'` prints one JSON object per line; malformed
+			// output is an unreadable file list, and `run()` falls back to the
+			// full suite rather than guessing (AGENTS.md shape 48).
+			throw new Error(
+				`malformed gh api --jq line (${error instanceof Error ? error.message : String(error)}): ${line.slice(0, 200)}`,
+			);
+		}
+	}
+	return pathsFromPrFiles(files);
 }
 
 /**

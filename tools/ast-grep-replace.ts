@@ -6,6 +6,7 @@
 
 import { Type } from "../clients/deps/typebox.js";
 import type { AstGrepClient } from "../clients/ast-grep-client.js";
+import type { LineageHandle } from "../clients/session-scope.js";
 import {
 	astGrepRemediationHint,
 	classifyAstGrepError,
@@ -39,7 +40,14 @@ function lineCount(value: string): number {
 	return lines;
 }
 
-export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
+/**
+ * `captureLineage`: the host's session capture (#3763). The tool takes it at
+ * `execute` entry, before its first await, and the apply records under it.
+ */
+export function createAstGrepReplaceTool(
+	astGrepClient: AstGrepClient,
+	captureLineage?: () => LineageHandle,
+) {
 	return {
 		name: "ast_grep_replace" as const,
 		label: "AST Replace",
@@ -123,6 +131,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 			_onUpdate: unknown,
 			ctx: { cwd?: string; resultMaxItems?: number },
 		) {
+			const lineage = captureLineage?.();
 			const startedAt = Date.now();
 			const {
 				pattern,
@@ -296,7 +305,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 				lang,
 				searchPaths,
 				applyFlag,
-				{ strictness },
+				{ strictness, lineage },
 			);
 
 			if (result.stalePreview) {

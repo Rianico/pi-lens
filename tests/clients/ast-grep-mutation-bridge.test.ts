@@ -12,6 +12,9 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { AstGrepClient } from "../../clients/ast-grep-client.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import type { LineageHandle } from "../../clients/session-scope.js";
+import { createAstGrepReplaceTool } from "../../tools/ast-grep-replace.js";
 
 const MUTATION_BRIDGE_KEY = Symbol.for("pi-lens:mutation-bridge");
 
@@ -20,6 +23,7 @@ type Recorded = {
 	kind: string;
 	editRanges?: [number, number][];
 	consumer?: string;
+	lineage?: LineageHandle;
 };
 
 const recorded: Recorded[] = [];
@@ -123,5 +127,49 @@ describe("#2423 ast_grep_replace records its applied rewrites", () => {
 		);
 		expect(result.stalePreview).toBe(true);
 		expect(recorded).toHaveLength(0);
+	});
+});
+
+/**
+ * #3763 item 4: the bridge fences a replay by the lineage its producer
+ * captured (S3), and an entry without one stays fail-open. ast_grep_replace
+ * sent none, so an apply that finished after `/new` stamped, listed and
+ * queued session 1's rewrite in session 2. The recurrence: a producer that
+ * records without the session it was called in, or captures it only after
+ * its first await (the apply spawn), when it is already the next session's.
+ */
+describe("#3763 ast_grep_replace records under the session it was called in", () => {
+	it("tags every rewritten file with the scope captured before its first await", async () => {
+		recorded.length = 0;
+		const runtime = new RuntimeCoordinator();
+		const entered = runtime.captureSessionGeneration();
+		const client = clientWithExec(execFor(MATCHES));
+		vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+		vi.spyOn(client, "formatMatches").mockReturnValue("");
+		const tool = createAstGrepReplaceTool(client, () =>
+			runtime.captureSessionGeneration(),
+		);
+
+		const run = tool.execute(
+			"call-3763-ast-grep",
+			{ pattern: "var $X", rewrite: "let $X", lang: "typescript", apply: true },
+			new AbortController().signal,
+			undefined,
+			{ cwd: "." },
+		);
+		// `/new` while the call awaits its first spawn: the preview, the apply
+		// and the record all land after it.
+		runtime.resetForSession();
+		await run;
+
+		expect(
+			recorded.map((entry) => ({
+				scopeId: entry.lineage?.scopeId,
+				current: entry.lineage?.isCurrent(),
+			})),
+		).toEqual([
+			{ scopeId: entered.scopeId, current: false },
+			{ scopeId: entered.scopeId, current: false },
+		]);
 	});
 });

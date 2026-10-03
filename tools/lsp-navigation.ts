@@ -1018,6 +1018,9 @@ export function createLspNavigationTool(
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
+			// #3763: before the first await, so the rename's bookkeeping drops
+			// once this session is replaced (`context.session`, #3576).
+			const session = mutationDeps?.runtime?.captureSessionGeneration?.();
 			const startedAt = Date.now();
 			let supported: boolean | null = null;
 			let diagnosticsMode: "pull" | "push-only" | "unknown" = "unknown";
@@ -1210,6 +1213,7 @@ export function createLspNavigationTool(
 					tool: `lsp_navigation:${operation}`,
 					source: mutationSource,
 					...mutationDeps,
+					session,
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined
 						: mutationDeps?.readGuard,

@@ -8,6 +8,7 @@ import {
 } from "../../scripts/red-on-base.mjs";
 import { setupTestEnvironment } from "../clients/test-utils.js";
 import { gitExecFileSync, gitFixtureEnv } from "../support/git-fixture-env.js";
+import { acquireTestLock, getLockPath } from "../../scripts/lib/suite-lock.mjs";
 
 // flake-shape: real-process-spawn — the real CLI, Git worktree lifecycle,
 // signal delivery and child-process cleanup ordering are the contract;
@@ -130,19 +131,26 @@ function run(
 	argv: string[],
 	extraEnv: Record<string, string> = {},
 ) {
+	const env: NodeJS.ProcessEnv = {
+		...gitFixtureEnv(repo.root),
+		PATH: `${repo.bin}${path.delimiter}${process.env.PATH}`,
+		TMPDIR: repo.tmp,
+		PI_LENS_HOME: repo.ambientHome,
+		PROBE_LOG: repo.probeLog,
+		CLEANUP_LOG: repo.cleanupLog,
+		...extraEnv,
+	};
+	// A hermetic fixture: the ambient runner's test-lock bypass (CI sets
+	// `PI_LENS_TEST_NO_LOCK=1` for an isolated box) must not leak into the
+	// child, or the #3853 exclusive-holder arm silently skips the lock it
+	// exists to prove. The bypass stays production behavior; a test that wants
+	// it passes it through `extraEnv`.
+	if (!("PI_LENS_TEST_NO_LOCK" in extraEnv)) delete env.PI_LENS_TEST_NO_LOCK;
 	return spawnSync(process.execPath, [CLI, ...argv, "--test-command", FAKE], {
 		cwd: repo.root,
 		encoding: "utf8",
 		timeout: 120_000,
-		env: {
-			...gitFixtureEnv(repo.root),
-			PATH: `${repo.bin}${path.delimiter}${process.env.PATH}`,
-			TMPDIR: repo.tmp,
-			PI_LENS_HOME: repo.ambientHome,
-			PROBE_LOG: repo.probeLog,
-			CLEANUP_LOG: repo.cleanupLog,
-			...extraEnv,
-		},
+		env,
 	});
 }
 
@@ -600,5 +608,42 @@ describe("red-on-base interruption", () => {
 			"unlink-before-remove",
 			"unlink-before-remove",
 		]);
+	});
+});
+
+describe("shared test-suite slot (#3853)", () => {
+	it("waits behind a live exclusive holder and refuses to run vitest", async () => {
+		// The whole red-on-base run takes one shared slot. A full-suite
+		// (exclusive) holder must make it wait and then refuse, never run
+		// concurrently: a real in-process store plus the real spawned CLI, no
+		// mocked lock.
+		const repo = makeRepo(
+			{ files: { [A]: file(pass("t")) } },
+			{ files: { [A]: file(pass("t")) } },
+		);
+		fs.mkdirSync(repo.ambientHome, { recursive: true });
+		const previousHome = process.env.PI_LENS_HOME;
+		process.env.PI_LENS_HOME = repo.ambientHome;
+		const exclusive = await acquireTestLock({
+			lockPath: getLockPath(),
+			slots: 2,
+			pollIntervalMs: 10,
+			heartbeatIntervalMs: 5_000,
+		});
+		try {
+			const result = run(repo, [A, "--base", "HEAD~1"], {
+				PI_LENS_TEST_LOCK_TIMEOUT_MS: "250",
+			});
+			expect(result.status).toBe(3);
+			expect(result.stderr).toContain("exclusive test-suite lock held by PID");
+			// The slot was never free: no test process ran.
+			expect(probes(repo).filter((entry) => entry.phase === "test")).toEqual(
+				[],
+			);
+		} finally {
+			await exclusive.release();
+			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = previousHome;
+		}
 	});
 });

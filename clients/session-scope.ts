@@ -33,6 +33,7 @@ import {
 	createGenerationSource,
 	type GenerationHandle,
 } from "./generation-guard.js";
+import type { PathSetLike } from "./runtime-coordinator.js";
 import { logLatency } from "./latency-logger.js";
 import { getProcessSingleton } from "./process-singletons.js";
 import { PI_LENS_EVALUATION_ORDINAL } from "./startup-timing.js";
@@ -51,6 +52,25 @@ export interface LineageHandle extends GenerationHandle {
 	/** The scope's branch epoch at capture. */
 	readonly branchEpoch: number;
 	isCurrent(level?: LineageLevel): boolean;
+}
+
+/**
+ * Keep fixed-this-turn marks in the session that captured the work. A fixer
+ * can finish after `/new`; its late mark must not suppress the successor's
+ * own fixer for the same file (#3576).
+ */
+export function sessionFencedFixedThisTurn(
+	set: PathSetLike,
+	handle: Pick<GenerationHandle, "guardedWrite">,
+): PathSetLike {
+	const fixedThisTurn: PathSetLike = {
+		...set,
+		add: (fixedPath) => {
+			handle.guardedWrite(fixedPath, () => set.add(fixedPath));
+			return fixedThisTurn;
+		},
+	};
+	return fixedThisTurn;
 }
 
 export interface SessionScope {

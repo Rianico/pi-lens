@@ -21,7 +21,10 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
-import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import {
+	clearLastAnalyzedStateCache,
+	handleToolResult,
+} from "../../clients/runtime-tool-result.js";
 import {
 	clearFormatterRuntimeState,
 	getFormattersForFile,
@@ -1971,6 +1974,16 @@ describe("monorepo turn-state cwd alignment", () => {
 					current: h.isCurrent(),
 				})),
 			).toEqual([{ generation: entered, current: false }]);
+			// #3763 item 1: the second file's write receipt resumed after the
+			// replacement too. Session 2 edits that file, then writes it: a dead
+			// receipt in session 2's turn would demote the write to deferred.
+			expect(
+				[directPath, existingPath].map((written) => {
+					runtime.recordMutationToolReceipt(written, "edit");
+					return runtime.recordMutationToolReceipt(written, "write")
+						.autofixMode;
+				}),
+			).toEqual(["immediate", "immediate"]);
 		} finally {
 			env.cleanup();
 		}
@@ -2194,6 +2207,104 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 				expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
 			},
 		);
+	});
+	it("a session-1 pipeline finishing in session 2's turn does not mark session 2's bytes analysed (#3763)", async () => {
+		// #3763 item 2: the already-analysed latch is keyed by the LIVE turn
+		// index, so a dead pipeline that settled after session 2's turn_start
+		// told session 2's own write of the same bytes that they were analysed:
+		// session 2's write was never dispatched, and the skip also passes over
+		// its turn-state range and change-log receipt.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const entered = gatedPromise<void>();
+		const release = gatedPromise<void>();
+		await acrossReplacement(
+			"latch",
+			async ({ filePath, runtime, cacheManager }) => {
+				vi.mocked(runPipeline).mockReset();
+				vi.mocked(runPipeline).mockImplementation(async () => {
+					if (vi.mocked(runPipeline).mock.calls.length === 1) {
+						entered.resolve();
+						await release.promise;
+					}
+					return {
+						output: "",
+						hasBlockers: false,
+						isError: false,
+						fileModified: false,
+					};
+				});
+				const handler = handleToolResult(
+					toolResultDeps({ filePath, runtime, cacheManager }),
+				);
+				await entered.promise;
+				runtime.resetForSession();
+				runtime.beginTurn();
+				// index.ts' turn_start clears the latch for the new turn.
+				clearLastAnalyzedStateCache();
+				release.resolve();
+				await handler;
+				await handleToolResult(
+					toolResultDeps({ filePath, runtime, cacheManager }),
+				);
+				expect(vi.mocked(runPipeline).mock.calls.length).toBe(2);
+			},
+		);
+	});
+
+	// #3763 r2 (F1): the pipeline's immediate autofix marks the file fixed
+	// after its fixer awaits (`runAutofix`), through the `fixedThisTurn` the
+	// handler hands `runPipeline`. A write whose autofix finished after the
+	// replacement marked session 2's copy, so session 2's own autofix of that
+	// file was skipped as already fixed. The recurrence: the raw set handed to
+	// the pipeline instead of one fenced by the handler's session.
+	async function immediateAutofixMark(replaced: boolean): Promise<boolean> {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const entered = gatedPromise<void>();
+		const release = gatedPromise<void>();
+		let marked = false;
+		await acrossReplacement(
+			replaced ? "fixed-mark" : "fixed-mark-live",
+			async ({ filePath, runtime, cacheManager }) => {
+				vi.mocked(runPipeline).mockReset();
+				vi.mocked(runPipeline).mockImplementation(async (ctx, deps) => {
+					entered.resolve();
+					await release.promise;
+					// What `runAutofix` does once its fixer returned (pipeline.ts).
+					if (ctx.autofixMode === "immediate") deps.fixedThisTurn.add(filePath);
+					return {
+						output: "",
+						hasBlockers: false,
+						isError: false,
+						fileModified: false,
+					};
+				});
+				const handler = handleToolResult({
+					...toolResultDeps({ filePath, runtime, cacheManager }),
+					event: {
+						toolName: "write",
+						input: { path: filePath, content: "export const x = 2;\n" },
+						content: [{ type: "text", text: "ok" }],
+					},
+				});
+				await entered.promise;
+				if (replaced) {
+					runtime.resetForSession();
+					runtime.beginTurn();
+				}
+				release.resolve();
+				await handler;
+				marked = runtime.fixedThisTurn.has(filePath);
+			},
+		);
+		return marked;
+	}
+
+	it("a session-1 autofix finishing after the replacement leaves session 2's file unmarked (#3763)", async () => {
+		expect(await immediateAutofixMark(true)).toBe(false);
+	});
+
+	it("an immediate autofix in its own session marks the file fixed (#3763)", async () => {
+		expect(await immediateAutofixMark(false)).toBe(true);
 	});
 });
 
@@ -2720,9 +2831,20 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				...base,
 				event: { toolName: "edit", input: { path: filePath }, content: [] },
 			});
+			// #3763: both handlers' receipts reached their own (live) turn, so the
+			// file's next bash write in it is demoted too.
+			fs.writeFileSync(filePath, "let value = 3;\n");
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					input: { command: `echo y > "${filePath}"` },
+					content: [],
+				},
+			});
 			expect(
 				vi.mocked(runPipeline).mock.calls.map((call) => call[0].autofixMode),
-			).toEqual(["immediate", "deferred"]);
+			).toEqual(["immediate", "deferred", "deferred"]);
 			expect(runtime.consumeDeferredFormatFiles()[0].kinds).toEqual(
 				new Set(["format", "autofix"]),
 			);

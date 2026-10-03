@@ -12,12 +12,21 @@ export interface PendingRunnerFindings {
 	markedAtMs: number;
 	writeIndex?: number;
 	result?: RunnerResult;
+	/**
+	 * #3758/#3813: the producer's captured handle, carried through the drain so
+	 * a requeued, capacity-held answer stays fenced to the scope that owned it.
+	 * `| undefined` so an explicit `session: handle | undefined` at a dispatch
+	 * site stays assignable under `exactOptionalPropertyTypes`.
+	 */
+	session?: GenerationHandle | undefined;
 }
 
 interface PendingRunnerPromise extends Omit<PendingRunnerFindings, "result"> {
 	promise: Promise<RunnerResult>;
 	settled: boolean;
 	result?: RunnerResult;
+	/** #3758: the dispatch's session; a drain after it retired drops the result. */
+	session: GenerationHandle | undefined;
 }
 
 const pending: PendingRunnerPromise[] = [];
@@ -43,7 +52,7 @@ export function deferRunnerFindings(
 		void entry.promise.catch(() => undefined);
 		return;
 	}
-	const tracked: PendingRunnerPromise = { ...owned, settled: false };
+	const tracked: PendingRunnerPromise = { ...owned, session, settled: false };
 	// Attach exactly once at ownership time. Re-attaching at every turn end
 	// accumulates handlers on a promise that may never settle (#2122 F8).
 	void tracked.promise.then(
@@ -69,7 +78,10 @@ export function deferRunnerFindings(
  * #3813: hand a drained, settled result back for the next turn end because the
  * turn-end cap cut the part that carried it. It re-enters through the same
  * bounded store as a fresh deferral (same cap, same eviction record) and the
- * next drain re-gates it for freshness against its original `markedAtMs`.
+ * next drain re-gates it for freshness against its original `markedAtMs`. It
+ * carries the producer's captured handle, so the next drain still fences it to
+ * the scope that owned the result (#3758); a requeue after that scope retired
+ * is dropped with its counted `generation-guard-stale-write` row.
  */
 export function requeueRunnerFindings(
 	entry: PendingRunnerFindings & { result: RunnerResult },
@@ -77,6 +89,7 @@ export function requeueRunnerFindings(
 	const { result, ...owned } = entry;
 	track({
 		...owned,
+		session: entry.session,
 		promise: Promise.resolve(result),
 		settled: true,
 		result,
@@ -118,6 +131,17 @@ export async function drainPendingRunnerFindings(
 		});
 	}
 	for (const entry of current) {
+		// #3758: a turn end of another session (a concurrent secondary's, in
+		// the gap before the next session_start clears this store) must not
+		// deliver a retired session's result; the drop leaves the handle's row.
+		if (
+			entry.session !== undefined &&
+			entry.session.guardedWrite(
+				`turn-end:${entry.runnerId}:${entry.filePath}`,
+				() => true,
+			) === undefined
+		)
+			continue;
 		if (entry.settled && entry.result) {
 			results.push({
 				filePath: entry.filePath,
@@ -126,6 +150,7 @@ export async function drainPendingRunnerFindings(
 				runnerId: entry.runnerId,
 				markedAtMs: entry.markedAtMs,
 				writeIndex: entry.writeIndex,
+				session: entry.session,
 				result: entry.result,
 			});
 		} else {

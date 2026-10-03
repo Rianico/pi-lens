@@ -1,11 +1,17 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
 import { mapGeneratedLineToOriginal } from "./mutation-source-map.mjs";
 
 const IMPORT_SPECIFIER_RE =
 	/(?:from\s+|import\s*(?:\(\s*)?|require\(\s*)["']([^"']+)["']/g;
+// A test can reach a mutation source through `path.resolve(...)`/`path.join(...)`
+// instead of an import specifier (e.g. analyze-pi-lens-logs-detectors.test.ts).
+// The argument window runs to end of line, so a nested `path.dirname(...)` does
+// not hide the relative literal that follows it.
+const PATH_RESOLVER_LINE_RE =
+	/(?:\bpath\s*\.\s*)?\b(?:resolve|join)\s*\(([^\n]*)/g;
+const STRING_LITERAL_RE = /["']([^"']+)["']/g;
 const MUTATION_LANE_EXCLUSION_RE = /^\s*\/\/\s*mutation-lane:\s*exclude\s*$/m;
 const MUTATION_LANE_EXCLUSIONS_PATH =
 	"tests/config/stryker-diff-exclusions.json";
@@ -128,6 +134,17 @@ function extractRelativeSpecifiers(content) {
 		if (match[1].startsWith(".")) specifiers.push(match[1]);
 		match = IMPORT_SPECIFIER_RE.exec(content);
 	}
+	PATH_RESOLVER_LINE_RE.lastIndex = 0;
+	let call = PATH_RESOLVER_LINE_RE.exec(content);
+	while (call) {
+		STRING_LITERAL_RE.lastIndex = 0;
+		let literal = STRING_LITERAL_RE.exec(call[1]);
+		while (literal) {
+			if (literal[1].startsWith(".")) specifiers.push(literal[1]);
+			literal = STRING_LITERAL_RE.exec(call[1]);
+		}
+		call = PATH_RESOLVER_LINE_RE.exec(content);
+	}
 	return specifiers;
 }
 
@@ -138,11 +155,28 @@ function normalized(file) {
 		.replace(/\.(?:mjs|js|cjs|ts)$/, "");
 }
 
-export function capMutationFiles(files, maxFiles = DEFAULT_MAX_FILES) {
+/**
+ * The heaviest `maxFiles` files by changed-line weight (#3810, from the #3797
+ * review): the old alphabetical cut skipped the four files holding #3706's
+ * actual change and mutated its label plumbing and an oxfmt reflow. Equal
+ * weights fall back to the path so the choice stays deterministic.
+ *
+ * @param {string[]} files
+ * @param {number} [maxFiles]
+ * @param {Map<string, number>} [weights] changed lines per file (see changedLineWeights)
+ */
+export function capMutationFiles(
+	files,
+	maxFiles = DEFAULT_MAX_FILES,
+	weights = new Map(),
+) {
 	if (!Number.isInteger(maxFiles) || maxFiles < 0) {
 		throw new RangeError("maxFiles must be a non-negative integer");
 	}
-	const ordered = [...files].sort();
+	// Path order first, then a stable sort by weight: equal weights keep it.
+	const ordered = [...files]
+		.sort()
+		.sort((a, b) => (weights.get(b) ?? 0) - (weights.get(a) ?? 0));
 	return {
 		selected: ordered.slice(0, maxFiles),
 		skipped: ordered.slice(maxFiles),
@@ -179,6 +213,21 @@ export function parseChangedLineRanges(diffText) {
 		ranges.get(file).push([start, Math.max(start, newStart + count - 1)]);
 	}
 	return ranges;
+}
+
+/**
+ * Changed lines per file, from the ranges of `parseChangedLineRanges`.
+ *
+ * @param {Map<string, Array<[number, number]>>} rangesByFile
+ * @returns {Map<string, number>}
+ */
+export function changedLineWeights(rangesByFile) {
+	return new Map(
+		[...rangesByFile].map(([file, ranges]) => [
+			file,
+			ranges.reduce((sum, [start, end]) => sum + (1 + end - start), 0),
+		]),
+	);
 }
 
 /**
@@ -325,56 +374,6 @@ export function formatCapNotice(selectedCount, totalCount, skipped) {
 	return `capped: ${selectedCount} of ${totalCount} changed files mutated; skipped: ${skipped.join(", ")}`;
 }
 
-export function formatTestCapNotice(selectedCount, totalCount) {
-	return `capped: ${selectedCount} of ${totalCount} related tests selected; dropped: ${totalCount - selectedCount}`;
-}
-
-/**
- * Bound the test population without changing any under-cap selection. Sibling
- * tests are first, then tests with a direct import, then any future incidental
- * relations. Ties use the normalized path and then the original index for
- * exact duplicate paths, making a capped selection reproducible even when
- * directory enumeration changes.
- *
- * @param {string[]} tests
- * @param {number} maxTests
- * @param {Map<string, number>} [priorities]
- */
-export function capRelatedTests(
-	tests,
-	maxTests = DEFAULT_MAX_TESTS,
-	priorities = new Map(),
-) {
-	if (!Number.isInteger(maxTests) || maxTests < 0) {
-		throw new RangeError("maxTests must be a non-negative integer");
-	}
-	if (tests.length <= maxTests) return { selected: tests, dropped: [] };
-	const ranked = tests
-		.map((test, index) => ({
-			test,
-			index,
-			pathKey: normalizeEphemeralMapKey(test),
-			priority: priorities.get(test) ?? 2,
-		}))
-		.sort(
-			(a, b) =>
-				a.priority - b.priority ||
-				(a.pathKey < b.pathKey ? -1 : a.pathKey > b.pathKey ? 1 : 0) ||
-				a.index - b.index,
-		);
-	const selectedSet = new Set(
-		ranked.slice(0, maxTests).map(({ test }) => test),
-	);
-	return {
-		selected: ranked
-			.filter(({ test }) => selectedSet.has(test))
-			.map(({ test }) => test),
-		dropped: ranked
-			.filter(({ test }) => !selectedSet.has(test))
-			.map(({ test }) => test),
-	};
-}
-
 /**
  * The conventional test-file location a mutation source's basename maps to,
  * mirroring the file's top-level directory: `scripts/lib/ci-checks.mjs` ->
@@ -399,12 +398,14 @@ function conventionalTestSibling(file) {
 /**
  * Select tests that cover changed mutation sources (scripts/**\/*.mjs and
  * the compiled-source classes in isCompiledMutationSource) through one-hop
- * relative imports or the conventional tests/<dir>/<name>.test.ts sibling.
- * Compiled sources are matched the same way scripts are: test files import
- * them with a relative specifier (typically ending in `.js`, since that is
- * what TypeScript's `nodenext` resolution and the repo's own tests use to
- * reach a compiled `clients/*.ts` module -- e.g. `tests/index-wiring.test.ts`
- * imports `../index.js`), which `normalized()` compares extension-agnostically.
+ * relative imports, the conventional tests/<dir>/<name>.test.ts sibling, a
+ * `<name>-*.test.ts` sibling beside it, or a relative literal a test resolves
+ * by path (`path.resolve`/`path.join`). Compiled sources are matched the same
+ * way scripts are: test files import them with a relative specifier (typically
+ * ending in `.js`, since that is what TypeScript's `nodenext` resolution and
+ * the repo's own tests use to reach a compiled `clients/*.ts` module -- e.g.
+ * `tests/index-wiring.test.ts` imports `../index.js`), which `normalized()`
+ * compares extension-agnostically.
  *
  * @param {string[]} changedFiles
  * @param {{ testFiles?: string[], readFile?: (file: string) => string }} [options]
@@ -437,15 +438,18 @@ export function mapRelatedTests(
 
 	for (const file of sources) {
 		const sibling = conventionalTestSibling(file);
-		const siblingEntry = testContents.find(
-			([test]) => normalized(test) === normalized(sibling),
-		);
-		if (siblingEntry) {
-			const siblingExclusion = siblingEntry[2];
-			if (siblingExclusion) excluded.set(sibling, siblingExclusion);
+		const siblingKey = normalized(sibling);
+		const prefixKey = siblingKey.replace(/\.test$/, "") + "-";
+		for (const [test, , exclusion] of testContents) {
+			const testKey = normalized(test);
+			const isSibling =
+				testKey === siblingKey ||
+				(testKey.startsWith(prefixKey) && testKey.endsWith(".test"));
+			if (!isSibling) continue;
+			if (exclusion) excluded.set(test, exclusion);
 			else {
-				related.get(file).add(sibling);
-				priorities.set(sibling, 0);
+				related.get(file).add(test);
+				priorities.set(test, 0);
 			}
 		}
 		const target = normalized(file);
@@ -492,20 +496,25 @@ export function mapRelatedTests(
  * during sandbox init, BEFORE `buildCommand` runs, so the base config's
  * `"npm run build"` would silently discard every mutant for a compiled
  * target before a single test executes (see scripts/lib/mutation-touch-
- * build.mjs's own header). `force: true` keeps `incremental` enabled (so a
- * budget-killed run still saves a partial report, round 2 S2) while never
- * reading a STALE `.stryker/incremental.json` left by an earlier, unrelated
- * local run (round 2 T4) -- `force` makes Stryker treat any existing
- * incremental file as absent on the read side, without disabling the
- * write-on-interrupt behavior that depends on `options.incremental` alone.
+ * build.mjs's own header). `force` keeps `incremental` enabled (so a
+ * budget-killed run still saves a partial report, round 2 S2) while making
+ * Stryker treat any existing incremental file as absent on the read side,
+ * without disabling the write-on-interrupt behavior that depends on
+ * `options.incremental` alone. It is true unless the caller proved the file
+ * belongs to this run's tests and inputs (`reuse`, #3810): otherwise a STALE
+ * `.stryker/incremental.json` from an earlier, unrelated local run (round 2
+ * T4) or an earlier push with different tests would be read. `fileLogLevel`
+ * makes Stryker write its "N of M mutant result(s) are reused" line to
+ * `stryker.log`, the only place the reuse count exists.
  *
  * @param {object} baseConfig stryker.config.mjs's default export
- * @param {{command: string}} options the per-run test command
+ * @param {{command: string, reuse?: boolean}} options the per-run test command
  */
-export function buildRunConfig(baseConfig, { command }) {
+export function buildRunConfig(baseConfig, { command, reuse = false }) {
 	return {
 		...baseConfig,
-		force: true,
+		force: !reuse,
+		fileLogLevel: "info",
 		buildCommand: "node scripts/lib/mutation-touch-build.mjs",
 		commandRunner: { ...baseConfig.commandRunner, command },
 	};
@@ -542,8 +551,9 @@ export function parseDryRunCost(output) {
 /**
  * How many mutants the remaining budget affords, from a real measured dry
  * run. Vitest runners are CPU-bound in this lane: the #3649 measurement saw
- * only 1.11x wall-clock speedup at Stryker concurrency 2, so this estimator
- * deliberately models one effective worker. `safetyFactor` (< 1) reserves
+ * only 1.11x wall-clock speedup at Stryker concurrency 2 (#3810 measured the
+ * CI runner again: concurrency 3 and 4 ran the mutation phase 1.10x and 1.13x
+ * faster than 2), so this estimator deliberately models one effective worker. `safetyFactor` (< 1) reserves
  * headroom for timing variance and fixed run overhead.
  *
  * @param {{remainingMs: number, dryRunMs: number, fixedOverheadMs?: number, safetyFactor?: number}} args

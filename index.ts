@@ -1799,7 +1799,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// pi-lens's behavior before this feature existed.
 	const lazyTools = [
 		createAstGrepSearchTool(astGrepClient),
-		createAstGrepReplaceTool(astGrepClient),
+		createAstGrepReplaceTool(astGrepClient, () =>
+			runtime.captureSessionGeneration(),
+		),
 		createAstGrepOutlineTool(astGrepClient),
 		createLspNavigationTool((name, cwd) => getLensFlag(name, cwd), {
 			runtime,
