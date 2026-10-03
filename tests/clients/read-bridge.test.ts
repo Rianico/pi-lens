@@ -349,6 +349,13 @@ describe("read-bridge", () => {
 			);
 			expect(_guardFn).not.toHaveBeenCalled();
 		});
+
+		it("requestedLimit = -1 (below minimum) is silently dropped", () => {
+			(globalThis as any)[READ_BRIDGE_KEY].recordRead(
+				validEntry({ requestedLimit: -1 }),
+			);
+			expect(_guardFn).not.toHaveBeenCalled();
+		});
 	});
 
 	// ── Zero-line reads of empty files ───────────────────────────────────────
@@ -732,6 +739,37 @@ describe("read-bridge", () => {
 					requestedLimit: 0,
 				});
 				expect(guard.checkEdit(filePath, [1, 10]).action).toBe("allow");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("a negative-limit read records no evidence and does not authorize an edit", () => {
+			const dir = mkdtempSync(
+				join(tmpdir(), "pi-lens-read-bridge-negative-limit-"),
+			);
+			try {
+				const filePath = join(dir, "file.ts");
+				writeFileSync(filePath, "const value = 1;\n", "utf-8");
+				// Backdate mtime so the guard cannot attribute this fixture to the session:
+				// only a recorded read could authorize the later edit.
+				utimesSync(filePath, new Date(0), new Date(0));
+				const guard = new ReadGuard("bridge-negative-limit", { mode: "block" });
+				const forward = vi.fn((record: RecordReadArgs) =>
+					guard.recordRead(record),
+				);
+				_guardFn = forward;
+				(globalThis as any)[READ_BRIDGE_KEY].recordRead({
+					filePath,
+					requestedOffset: 1,
+					requestedLimit: -1,
+				});
+				// The invalid read never reaches the guard: no read evidence is recorded.
+				expect(forward).not.toHaveBeenCalled();
+				expect(guard.checkEdit(filePath, [1, 10]).action).toBe("block");
+				// A rejected read vouches for nothing: not even the single line the
+				// guard would otherwise treat a negative limit as covering.
+				expect(guard.checkEdit(filePath, [1, 1]).action).toBe("block");
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}
