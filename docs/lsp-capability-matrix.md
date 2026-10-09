@@ -161,7 +161,7 @@ carries the named admission until then.
 | prisma | @prisma/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | php | intelephense | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
 | zig | zls | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| vue | @vue/language-server | push-only | unknown | direct | 2/3? | dev+ci |
+| vue | @vue/language-server | push-only | unknown | unknown | 2/3? | dev+ci |
 | dart | dart language-server | push-only | publishes-unversioned | direct | 2* | ci |
 | gleam | gleam lsp | push-only | publishes-unversioned | direct | 2* | ci |
 | clojure | clojure-lsp | push-only | publishes-unversioned | direct | 2* | ci |
@@ -252,13 +252,3 @@ marker; a mismatch means the marker may need a human update (#529). `unknown`
 observations are never compared (a slow/absent server is not evidence either way).
 
 _None observed as of the last probe run._
-
-## Capability matrix refresh state (nightly-generated)
-
-Bookkeeping for the date-based `direct` `first-publish` expiry (#3401) and
-the two-run `clean-behavior` hysteresis. Regenerated every run; never a
-measurement.
-
-```json
-{"first-publish":{"vue":{"firstMissed":"2026-10-01"}}}
-```
